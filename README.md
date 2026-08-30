@@ -46,16 +46,6 @@
 | `Ctrl+Alt+C` | 手动隐藏 / 显示 |
 | `Ctrl+Alt+Q` | 退出 |
 
-## 🖥️ 命令行（可选）
-
-```bat
-RimeSkinOverlay.exe 图片.png right    :: 临时指定图片和贴边方向
-RimeSkinOverlay.exe --install          :: 安装开机自启
-RimeSkinOverlay.exe --uninstall        :: 移除开机自启
-```
-
-> ⚠️ 开机自启：**不会**偷偷装，只有主动执行 `--install` 才安装。
-
 ## 🧠 原理
 
 小狼毫的候选框是 TSF 框架窗口（类名 `ATL:` 前缀）。程序用 Win32 API 每 50ms 枚举可见窗口，找到候选框后把透明置顶小窗贴到其左/右侧；无候选框时自动隐藏。图片窗本体用 `tkinter` + `overrideredirect` + `-transparentcolor` 实现无边框透明置顶。
