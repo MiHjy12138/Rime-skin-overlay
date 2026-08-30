@@ -24,7 +24,7 @@ v0.7 配置向导（所见即所得）：
 依赖: 主程序仅 Python 标准库；预览/光环需 Pillow（可选）
 快捷键: Ctrl+Alt+C 隐藏/显示 | Ctrl+Alt+Q 退出 | 拖动微调 | 滚轮缩放 | 右键菜单
 """
-import sys, os, json
+import sys, os, json, time
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import ctypes
@@ -64,9 +64,27 @@ def _warn_already_running():
     except Exception:
         pass
 
+def _kill_existing():
+    """杀掉所有已运行的 RimeSkinOverlay 实例（排除当前进程）"""
+    import subprocess
+    my_pid = os.getpid()
+    killed = 0
+    try:
+        out = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             f"Get-CimInstance Win32_Process -Filter \"Name='RimeSkinOverlay.exe'\" | "
+             f"Where-Object {{ $_.ProcessId -ne {my_pid} }} | "
+             f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }}"],
+            capture_output=True, text=True, timeout=15)
+        if out.stdout and out.stdout.strip():
+            killed = len([x for x in out.stdout.strip().split() if x.isdigit()])
+    except Exception:
+        pass
+    return killed
+
 # ============ 自启管理 ============
 APP_NAME = 'RimeSkinOverlay'
-VERSION = 'v1.0'
+VERSION = 'v1.1'
 
 def _exe_dir():
     if getattr(sys, 'frozen', False):
@@ -475,23 +493,47 @@ class ConfigWizard:
                        text=self.LAYOUT_INFO[layout][0], fill='#888',
                        font=('Microsoft YaHei', 8))
 
-        # 图片（贴候选框侧边，应用缩放+微调；自适应缩放到预览框可见全貌）
+        # 图片（贴候选框侧边；缩放逻辑与运行时一致：高度 = base_height×scale）
         if self.cfg.get('image') and self.PIL:
             try:
                 img = self._Image.open(self.cfg['image']).convert('RGBA')
-                # 先自适应缩放：保证完整显示在预览区（宽 760 高 380，留边）
-                # 候选框可能占大部分宽度，图片自适应到不超过预览区高度的一半
-                max_pw, max_ph = 300, 170
-                fit = min(max_pw / img.width, max_ph / img.height, 1.0)
-                if fit < 1.0:
-                    img = img.resize((max(1, int(img.width * fit)),
-                                      max(1, int(img.height * fit))), self._Image.LANCZOS)
-                # 再应用用户缩放
-                if scale != 1.0:
-                    img = img.resize((max(1, int(img.width * scale)),
-                                      max(1, int(img.height * scale))), self._Image.LANCZOS)
+                # 与 FollowOverlay.load_char 完全相同的缩放逻辑
+                base_h = 300 * scale
+                if img.height > 0:
+                    ratio = base_h / img.height
+                    img = img.resize((max(1, int(img.width * ratio)),
+                                      max(1, int(base_h))), self._Image.LANCZOS)
                 new_w, new_h = img.size
-                # 贴边
+                # 若图片+候选框超出画布，整体等比缩小（保持相对位置比例）
+                total_w = new_w + 8 + cw
+                total_h = max(new_h, ch)
+                cv_w, cv_h = 760, 380
+                if total_w > cv_w - 30 or total_h > cv_h - 30:
+                    fit_all = min((cv_w - 30) / total_w, (cv_h - 30) / total_h, 1.0)
+                    if fit_all < 1.0:
+                        img = img.resize((max(1, int(new_w * fit_all)),
+                                          max(1, int(new_h * fit_all))), self._Image.LANCZOS)
+                        new_w, new_h = img.size
+                        cw_s, ch_s = int(cw * fit_all), int(ch * fit_all)
+                        base_x = (cv_w - cw_s) // 2
+                        base_y = (cv_h - ch_s) // 2
+                        cw, ch = cw_s, ch_s
+                        # 重画候选框（缩小后的尺寸）
+                        cv.delete('all')
+                        cv.create_rectangle(base_x, base_y, base_x + cw, base_y + ch,
+                                            fill='#f5f5f5', outline=hex_acc, width=2)
+                        if layout == 'vertical':
+                            cv.create_rectangle(base_x + 4, base_y + 4, base_x + cw - 4, base_y + 26,
+                                                fill=hex_acc)
+                            cv.create_text(base_x + cw // 2, base_y + 16, text='拼音', fill='white',
+                                           font=('Microsoft YaHei', 8))
+                        else:
+                            if layout == 'horizontal_double':
+                                cv.create_rectangle(base_x + 4, base_y + 4, base_x + cw - 4, base_y + 30,
+                                                    fill=hex_acc)
+                                cv.create_text(base_x + 12, base_y + 17, text='拼音编码', anchor='w',
+                                               fill='white', font=('Microsoft YaHei', 8))
+                # 贴边（偏移量与运行时一致）
                 gap = 8
                 if side == 'right':
                     ix = base_x + cw + gap + offx
@@ -521,8 +563,8 @@ class ConfigWizard:
         self.on_done(self.cfg)
 
     def _on_cancel(self):
+        # 只销毁窗口，让 mainloop 自然返回（不要 sys.exit，否则 Tk 清理会卡住）
         self.root.destroy()
-        sys.exit(0)
 
 # ============ 主窗口 ============
 class FollowOverlay:
@@ -706,21 +748,21 @@ def main():
                 _write_log(f'[启动] 使用现有配置: {cfg}')
                 FollowOverlay(cfg).run()
                 return
-            # 选「重新配置」→ 走向导（向导保存后覆盖 config.json 并启动）
+            # 选「重新配置」→ 走向导（保存后杀掉旧实例，用新配置启动）
             def start(cfg2):
-                # 重新配置保存后：检查单例再启动
+                # 用户主动重新配置：保存后替换旧实例
                 if _already_running():
-                    _warn_already_running()
-                    return
+                    _kill_existing()
+                    time.sleep(1)
                 FollowOverlay(cfg2).run()
             ConfigWizard(on_done=start).root.mainloop()
             return
 
-        # 无配置 → 直接弹向导（单例检查在保存后）
+        # 无配置 → 直接弹向导（保存后若已有实例则替换）
         def start(cfg):
             if _already_running():
-                _warn_already_running()
-                return
+                _kill_existing()
+                time.sleep(1)
             FollowOverlay(cfg).run()
         ConfigWizard(on_done=start).root.mainloop()
     except Exception as e:
