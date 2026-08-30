@@ -46,15 +46,16 @@
 | `Ctrl+Alt+C` | 手动隐藏 / 显示 |
 | `Ctrl+Alt+Q` | 退出 |
 
-## 🖥️ 命令行（可选）
+## 🖥️ 命令行（可选，exe 内置功能）
 
 ```bat
 RimeSkinOverlay.exe 图片.png right    :: 临时指定图片和贴边方向
-RimeSkinOverlay.exe --install          :: 安装开机自启
+RimeSkinOverlay.exe --install          :: 安装开机自启（exe 内置，无需额外脚本）
 RimeSkinOverlay.exe --uninstall        :: 移除开机自启
 ```
 
 > ⚠️ 开机自启：**不会**偷偷装，只有主动执行 `--install` 才安装。
+> 这些参数已内置在 exe 中，不需要任何额外文件。
 
 ## 🧠 原理
 
