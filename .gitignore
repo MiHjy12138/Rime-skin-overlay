@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 用户自备图片（不随仓库分发）
+char.png
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 测试残留
+test_skin_link.py
+_mklnk.vbs
+_run_overlay.cmd
+diag_*.py
+test_*.py
+overlay.log
+error.log
+config.json
