@@ -84,7 +84,7 @@ def _kill_existing():
 
 # ============ 自启管理 ============
 APP_NAME = 'RimeSkinOverlay'
-VERSION = 'v1.1'
+VERSION = 'v1.2'
 
 def _exe_dir():
     if getattr(sys, 'frozen', False):
@@ -280,6 +280,433 @@ def find_candidate_window(layout='horizontal_double'):
         return found[-1]
     return None
 
+# ============ 图片预处理（裁剪 / 镜像 / 抠图）============
+class ImagePreprocessDialog:
+    """图片预处理窗口：裁剪 / 镜像反转 / 纯色背景抠图。
+
+    应用后把处理结果保存为 exe 同目录 preprocessed.png，
+    self.result_path 返回该路径；取消则为 None。
+    交互：
+      - 裁剪框可整体拖动、拖四角调整；右侧可锁定比例（1:1 / 2:3 / 3:4 / 9:16）
+      - 镜像反转 = 水平翻转，实时预览
+      - 抠图：自动检测四角背景色，或点击图片上任意背景区域手动指定；容差滑块微调
+    """
+    PRESETS = [
+        ('原图', None),      # 初始 = 全图
+        ('自由', 'free'),    # 任意比例
+        ('1:1', 1.0),
+        ('2:3', 2.0 / 3),
+        ('3:4', 3.0 / 4),
+        ('9:16', 9.0 / 16),
+    ]
+
+    def __init__(self, master, image_path):
+        self.master = master
+        self.src_path = image_path
+        self.result_path = None
+        try:
+            from PIL import Image, ImageTk, ImageChops
+        except ImportError:
+            messagebox.showerror('缺少依赖', '图片预处理需要 Pillow 库，当前环境未安装。')
+            raise
+        self._Image, self._ImageTk = Image, ImageTk
+        self._Chops = ImageChops
+
+        self.orig = self._Image.open(image_path).convert('RGBA')
+        self.work = self.orig.copy()       # 当前工作图（应用镜像后的状态）
+        self.flipped = False
+        self.crop = (0, 0, self.orig.width, self.orig.height)  # 原图坐标 (x0,y0,x1,y1)
+        self.lock_ratio = None             # None=原图比例 / 'free'=自由 / float=锁定宽高比
+        self.use_key = tk.BooleanVar(value=True)
+        self.tol_var = tk.IntVar(value=20)
+        self.bg_color = None               # 抠图背景色 (r,g,b)，None=未检测
+        self.drag = None                   # 拖拽状态 (mode, ...)
+        self.tk_img = None
+
+        self.root = tk.Toplevel(master)
+        self.root.title('图片预处理 - 裁剪 / 镜像 / 抠图')
+        self.root.resizable(False, False)
+        self.root.transient(master)
+        self.root.protocol('WM_DELETE_WINDOW', self._cancel)
+        self._build_ui()
+        self._auto_detect_bg()
+        self._auto_crop()
+        self._draw()
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        main = tk.Frame(self.root)
+        main.pack(fill='both', expand=True, padx=10, pady=8)
+
+        # 左：画布
+        self.cv = tk.Canvas(main, width=640, height=600, bg='#2b2b2b',
+                            highlightthickness=1, highlightbackground='#666')
+        self.cv.pack(side='left')
+        self.cv.bind('<ButtonPress-1>', self._on_press)
+        self.cv.bind('<B1-Motion>', self._on_drag)
+        self.cv.bind('<ButtonRelease-1>', self._on_release)
+
+        # 右：控制面板
+        panel = tk.Frame(main, width=240)
+        panel.pack(side='right', fill='y', padx=(10, 0))
+        panel.pack_propagate(False)
+
+        tk.Label(panel, text=f'原图 {self.orig.width}×{self.orig.height}',
+                 font=('Microsoft YaHei', 9), fg='#888').pack(anchor='w')
+
+        # ① 裁剪比例
+        tk.Label(panel, text='① 裁剪比例:', font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(8, 2))
+        self.var_ratio = tk.IntVar(value=0)
+        for i, (txt, _) in enumerate(self.PRESETS):
+            tk.Radiobutton(panel, text=txt, variable=self.var_ratio, value=i,
+                           font=('Microsoft YaHei', 9),
+                           command=self._on_ratio).pack(anchor='w')
+        self.lbl_crop = tk.Label(panel, text='裁剪: 全图', fg='#888',
+                                 font=('Microsoft YaHei', 9))
+        self.lbl_crop.pack(anchor='w', pady=(4, 0))
+        tk.Button(panel, text='✂ 自动裁剪到内容', command=self._auto_crop,
+                  font=('Microsoft YaHei', 9)).pack(anchor='w', pady=(4, 0))
+
+        # ② 镜像反转
+        tk.Label(panel, text='② 镜像反转:', font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(10, 2))
+        self.btn_flip = tk.Button(panel, text='水平翻转（当前: 否）', command=self._toggle_flip,
+                                  font=('Microsoft YaHei', 9))
+        self.btn_flip.pack(anchor='w', fill='x')
+
+        # ③ 纯色背景抠图
+        tk.Label(panel, text='③ 纯色背景抠图:', font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(10, 2))
+        tk.Checkbutton(panel, text='启用抠图（背景变透明）', variable=self.use_key,
+                       font=('Microsoft YaHei', 9), command=self._draw).pack(anchor='w')
+        row_tol = tk.Frame(panel)
+        row_tol.pack(anchor='w', fill='x')
+        tk.Label(row_tol, text='容差', font=('Microsoft YaHei', 9)).pack(side='left')
+        tk.Scale(row_tol, from_=0, to=100, orient='horizontal', variable=self.tol_var,
+                 command=lambda _: self._draw(), length=130,
+                 font=('Microsoft YaHei', 8)).pack(side='left')
+        self.bg_box = tk.Label(panel, text='背景色: 未检测', bg='#eee', fg='#666',
+                               font=('Microsoft YaHei', 9), anchor='w')
+        self.bg_box.pack(anchor='w', fill='x', pady=(2, 0))
+        tk.Button(panel, text='重新自动检测', command=self._auto_detect_bg,
+                  font=('Microsoft YaHei', 9)).pack(anchor='w', pady=2)
+        tk.Label(panel, text='💡 也可点击图片上的背景区域\n手动指定背景色', fg='#e67e22',
+                 font=('Microsoft YaHei', 9)).pack(anchor='w')
+
+        # 按钮
+        btns = tk.Frame(panel)
+        btns.pack(anchor='w', fill='x', pady=(14, 0))
+        tk.Button(btns, text='应用', command=self._apply, bg='#4CAF50', fg='white',
+                  font=('Microsoft YaHei', 10, 'bold')).pack(side='left', padx=2)
+        tk.Button(btns, text='重置', command=self._reset,
+                  font=('Microsoft YaHei', 10)).pack(side='left', padx=2)
+        tk.Button(btns, text='取消', command=self._cancel,
+                  font=('Microsoft YaHei', 10)).pack(side='left', padx=2)
+
+    # ---------- 坐标换算 ----------
+    def _fit(self):
+        """返回 (缩放比, 画布偏移ox, 画布偏移oy)：工作图 fit 到画布"""
+        cw, ch = 640, 600
+        iw, ih = self.work.size
+        s = min(cw / iw, ch / ih)
+        ox, oy = (cw - iw * s) / 2, (ch - ih * s) / 2
+        return s, ox, oy
+
+    def _to_canvas(self, x, y):
+        s, ox, oy = self._fit()
+        return ox + x * s, oy + y * s
+
+    def _to_img(self, cx, cy):
+        s, ox, oy = self._fit()
+        return (cx - ox) / s, (cy - oy) / s
+
+    # ---------- 绘制 ----------
+    def _draw_checker(self, cv, ox, oy, w, h):
+        """透明棋盘格背景（画在图下层）"""
+        cell = 16
+        c = '#4a4a4a'
+        for i in range(int(w // cell) + 1):
+            for j in range(int(h // cell) + 1):
+                if (i + j) % 2 == 0:
+                    cv.create_rectangle(ox + i * cell, oy + j * cell,
+                                        ox + min((i + 1) * cell, w),
+                                        oy + min((j + 1) * cell, h),
+                                        fill=c, outline='')
+
+    def _draw(self):
+        cv = self.cv
+        cv.delete('all')
+        s, ox, oy = self._fit()
+        disp_w, disp_h = self.work.width * s, self.work.height * s
+
+        # 棋盘格 + 图片
+        self._draw_checker(cv, ox, oy, disp_w, disp_h)
+        disp = self.work
+        if self.use_key.get() and self.bg_color:
+            disp = self._chroma_key(self.work, self.bg_color, self.tol_var.get())
+        disp_s = disp.resize((max(1, int(disp.width * s)), max(1, int(disp.height * s))),
+                             self._Image.LANCZOS)
+        self.tk_img = self._ImageTk.PhotoImage(disp_s)
+        cv.create_image(ox, oy, anchor='nw', image=self.tk_img)
+
+        # 裁剪框
+        x0, y0, x1, y1 = self.crop
+        cx0, cy0 = self._to_canvas(x0, y0)
+        cx1, cy1 = self._to_canvas(x1, y1)
+        # 框外遮罩（四块半透明黑）
+        mask = '#000000'
+        cv.create_rectangle(ox, oy, ox + disp_w, cy0, fill=mask, stipple='gray50', outline='')
+        cv.create_rectangle(ox, cy1, ox + disp_w, oy + disp_h, fill=mask, stipple='gray50', outline='')
+        cv.create_rectangle(ox, cy0, cx0, cy1, fill=mask, stipple='gray50', outline='')
+        cv.create_rectangle(cx1, cy0, ox + disp_w, cy1, fill=mask, stipple='gray50', outline='')
+        # 框线 + 四角手柄
+        cv.create_rectangle(cx0, cy0, cx1, cy1, outline='#ffb300', width=2)
+        for hx, hy in [(cx0, cy0), (cx1, cy0), (cx0, cy1), (cx1, cy1)]:
+            cv.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5, fill='#ffb300', outline='white')
+        # 信息
+        cw, chh = int(x1 - x0), int(y1 - y0)
+        self.lbl_crop.config(text=f'裁剪: {cw}×{chh}')
+
+    # ---------- 裁剪交互 ----------
+    def _on_press(self, e):
+        x, y = self._to_img(e.x, e.y)
+        x0, y0, x1, y1 = self.crop
+        s, _, _ = self._fit()
+        handle = 12 / s  # 命中区（原图单位）
+        corners = {'tl': (x0, y0), 'tr': (x1, y0), 'bl': (x0, y1), 'br': (x1, y1)}
+        for name, (cx, cy) in corners.items():
+            if abs(x - cx) < handle and abs(y - cy) < handle:
+                self.drag = ('corner', name)
+                return
+        if x0 <= x <= x1 and y0 <= y <= y1:
+            self.drag = ('move', x, y)
+            return
+        # 框外点击：若启用抠图 → 手动指定背景色
+        if self.use_key.get():
+            ix, iy = int(x), int(y)
+            if 0 <= ix < self.work.width and 0 <= iy < self.work.height:
+                self.bg_color = self.work.getpixel((ix, iy))[:3]
+                self._update_bg_box()
+                self._draw()
+
+    def _on_drag(self, e):
+        if not self.drag:
+            return
+        x, y = self._to_img(e.x, e.y)
+        W, H = self.work.size
+        mode = self.drag[0]
+        if mode == 'move':
+            _, dx, dy = self.drag
+            x0, y0, x1, y1 = self.crop
+            mx, my = x - dx, y - dy
+            nx0, ny0 = x0 + mx, y0 + my
+            nx1, ny1 = x1 + mx, y1 + my
+            if nx0 < 0:
+                nx1 -= nx0; nx0 = 0
+            if ny0 < 0:
+                ny1 -= ny0; ny0 = 0
+            if nx1 > W:
+                nx0 -= nx1 - W; nx1 = W
+            if ny1 > H:
+                ny0 -= ny1 - H; ny1 = H
+            self.crop = (int(nx0), int(ny0), int(nx1), int(ny1))
+        elif mode == 'corner':
+            name = self.drag[1]
+            # 锚点 = 对角
+            x0, y0, x1, y1 = self.crop
+            ax, ay = {
+                'tl': (x1, y1), 'tr': (x0, y1),
+                'bl': (x1, y0), 'br': (x0, y0),
+            }[name]
+            self._set_crop_by_anchor(ax, ay, x, y, name)
+        self._draw()
+
+    def _on_release(self, _e):
+        self.drag = None
+
+    def _set_crop_by_anchor(self, ax, ay, cx, cy, name):
+        """锚点 (ax,ay) 固定，拖动点 (cx,cy)，按锁定比例计算新裁剪框"""
+        W, H = self.work.size
+        cx = min(max(cx, 0.0), float(W))
+        cy = min(max(cy, 0.0), float(H))
+        w = abs(cx - ax)
+        h = abs(cy - ay)
+        r = self.lock_ratio
+        if isinstance(r, float):
+            # 保持宽高比：优先以宽度为准，超界则回退以高度为准（最多两轮修正）
+            for _ in range(2):
+                h = w / r
+                if ay + h > H or ay - h < 0:
+                    h = abs(cy - ay)
+                    w = h * r
+                    if ax + w > W or ax - w < 0:
+                        w = abs(cx - ax)
+                        h = w / r
+                        break
+                else:
+                    break
+            cx = ax + w if cx >= ax else ax - w
+            cy = ay + h if cy >= ay else ay - h
+        x0, x1 = (ax, cx) if ax < cx else (cx, ax)
+        y0, y1 = (ay, cy) if ay < cy else (cy, ay)
+        self.crop = (int(x0), int(y0), int(x1), int(y1))
+
+    # ---------- 控件动作 ----------
+    def _on_ratio(self):
+        i = self.var_ratio.get()
+        _, r = self.PRESETS[i]
+        W, H = self.work.size
+        if r is None:  # 原图
+            self.lock_ratio = None
+            self.crop = (0, 0, W, H)
+        elif r == 'free':
+            self.lock_ratio = 'free'
+        else:
+            self.lock_ratio = r
+            # 以当前框中心为锚，调整为该比例（取图内最大内接）
+            x0, y0, x1, y1 = self.crop
+            cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+            w = min(float(W), float(H) * r)
+            h = w / r
+            if h > H:
+                h = float(H)
+                w = h * r
+            nx0, ny0 = cx - w / 2, cy - h / 2
+            nx1, ny1 = cx + w / 2, cy + h / 2
+            if nx0 < 0:
+                nx1 -= nx0; nx0 = 0
+            if ny0 < 0:
+                ny1 -= ny0; ny0 = 0
+            if nx1 > W:
+                nx0 -= nx1 - W; nx1 = W
+            if ny1 > H:
+                ny0 -= ny1 - H; ny1 = H
+            self.crop = (int(nx0), int(ny0), int(nx1), int(ny1))
+        self._draw()
+
+    def _toggle_flip(self):
+        self.work = self.work.transpose(self._Image.FLIP_LEFT_RIGHT)
+        self.flipped = not self.flipped
+        self.btn_flip.config(text=f'水平翻转（当前: {"是" if self.flipped else "否"}）')
+        # 裁剪框随镜像映射
+        W = self.work.width
+        x0, y0, x1, y1 = self.crop
+        self.crop = (W - x1, y0, W - x0, y1)
+        self._draw()
+
+    # ---------- 抠图 ----------
+    def _detect_bg(self, img):
+        """取四角 5×5 区域平均色作为背景色"""
+        w, h = img.size
+        px = img.load()
+        pts = [(4, 4), (w - 5, 4), (4, h - 5), (w - 5, h - 5)]
+        r = g = b = n = 0
+        for x, y in pts:
+            for dx in (-2, -1, 0, 1, 2):
+                for dy in (-2, -1, 0, 1, 2):
+                    pr, pg, pb, _ = px[x + dx, y + dy]
+                    r += pr; g += pg; b += pb; n += 1
+        return (r // n, g // n, b // n)
+
+    def _content_bbox(self, tol=24):
+        """检测与背景色差异明显的内容包围盒 (left, top, right, bottom)；纯背景返回 None"""
+        img = self.work
+        r, g, b = img.split()[:3]
+        L = self._Image.new
+        bg = self.bg_color or (0, 0, 0)
+        dr = self._Chops.difference(r, L('L', img.size, bg[0]))
+        dg = self._Chops.difference(g, L('L', img.size, bg[1]))
+        db = self._Chops.difference(b, L('L', img.size, bg[2]))
+        dist = self._Chops.lighter(self._Chops.lighter(dr, dg), db)
+        m = dist.point(lambda d, t=tol: 255 if d > t else 0)
+        return m.getbbox()
+
+    def _auto_crop(self):
+        """自动裁剪：内容包围盒 + 3% 留白；内容占图超 95% 则保持全图"""
+        W, H = self.work.size
+        bbox = self._content_bbox()
+        if not bbox:
+            self.crop = (0, 0, W, H)
+            self._draw()
+            return
+        l, t, r, b = bbox
+        # 内容占比
+        area_ratio = ((r - l) * (b - t)) / (W * H)
+        if area_ratio > 0.95:
+            self.crop = (0, 0, W, H)
+            self._draw()
+            return
+        # 3% 留白
+        pad_w, pad_h = int((r - l) * 0.03), int((b - t) * 0.03)
+        x0 = max(0, l - pad_w)
+        y0 = max(0, t - pad_h)
+        x1 = min(W, r + pad_w)
+        y1 = min(H, b + pad_h)
+        self.crop = (x0, y0, x1, y1)
+        self._draw()
+
+    def _auto_detect_bg(self):
+        self.bg_color = self._detect_bg(self.work)
+        self._update_bg_box()
+        self._draw()
+
+    def _update_bg_box(self):
+        if self.bg_color:
+            r, g, b = self.bg_color
+            self.bg_box.config(text=f'背景色: RGB({r},{g},{b})', bg='#%02x%02x%02x' % (r, g, b),
+                               fg='white' if (r * 0.299 + g * 0.587 + b * 0.114) < 140 else '#222')
+        else:
+            self.bg_box.config(text='背景色: 未检测', bg='#eee', fg='#666')
+
+    def _chroma_key(self, img, bg, tol):
+        """色键抠图：与背景色距离 < lo 的像素变全透明，> hi 保持不透明，中间渐变过渡"""
+        r, g, b = img.split()[:3]
+        L = self._Image.new
+        dr = self._Chops.difference(r, L('L', img.size, bg[0]))
+        dg = self._Chops.difference(g, L('L', img.size, bg[1]))
+        db = self._Chops.difference(b, L('L', img.size, bg[2]))
+        dist = self._Chops.lighter(self._Chops.lighter(dr, dg), db)  # 逐像素 max
+        lo = max(1, int(tol * 0.7))
+        hi = max(lo + 1, int(tol * 1.4))
+        alpha = dist.point(
+            lambda d, lo=lo, hi=hi: 0 if d < lo else (255 if d > hi else int((d - lo) * 255 / (hi - lo))))
+        out = img.copy()
+        out.putalpha(alpha)
+        return out
+
+    # ---------- 结果 ----------
+    def _reset(self):
+        self.work = self.orig.copy()
+        self.flipped = False
+        self.crop = (0, 0, self.orig.width, self.orig.height)
+        self.var_ratio.set(0)
+        self.lock_ratio = None
+        self.tol_var.set(20)
+        self.use_key.set(True)
+        self.btn_flip.config(text='水平翻转（当前: 否）')
+        self._auto_detect_bg()
+        self._auto_crop()
+
+    def _apply(self):
+        try:
+            x0, y0, x1, y1 = [int(v) for v in self.crop]
+            w, h = x1 - x0, y1 - y0
+            if w < 2 or h < 2:
+                messagebox.showwarning('提示', '裁剪区域太小！', parent=self.root)
+                return
+            out = self.work.crop((x0, y0, x1, y1))
+            if self.use_key.get() and self.bg_color:
+                out = self._chroma_key(out, self.bg_color, self.tol_var.get())
+            out_path = os.path.join(HERE, 'preprocessed.png')
+            out.save(out_path, 'PNG')
+            self.result_path = out_path
+            self.root.destroy()
+        except Exception as e:
+            messagebox.showerror('处理失败', str(e), parent=self.root)
+
+    def _cancel(self):
+        self.result_path = None
+        self.root.destroy()
+
+
 # ============ 配置向导（所见即所得）============
 class ConfigWizard:
     LAYOUT_INFO = {
@@ -313,8 +740,8 @@ class ConfigWizard:
 
         # 顶部提示：支持格式 + 建议分辨率
         tk.Label(frm,
-                 text='支持格式: PNG / JPG / WEBP / GIF / BMP    建议: 透明底 PNG，竖版 2:3（如 500x750）',
-                 fg='#e67e22', font=('Microsoft YaHei', 9)).pack(anchor='w', pady=(0, 4))
+                 text='支持格式: PNG / JPG / WEBP / GIF / BMP    建议: 竖版 2:3（如 500x750）\n💡 可选「图片预处理」：裁剪 / 镜像反转 / 纯色背景一键抠图',
+                 fg='#e67e22', font=('Microsoft YaHei', 9), justify='left').pack(anchor='w', pady=(0, 4))
 
         # ① 图片选择
         row1 = tk.Frame(frm)
@@ -323,6 +750,9 @@ class ConfigWizard:
         self.btn_img = tk.Button(row1, text='选择图片...', command=self._pick_image,
                                  font=('Microsoft YaHei', 10))
         self.btn_img.pack(side='left', padx=6)
+        self.btn_prep = tk.Button(row1, text='图片预处理', command=self._preprocess_image,
+                                  font=('Microsoft YaHei', 10), state='disabled')
+        self.btn_prep.pack(side='left', padx=2)
         self.lbl_img = tk.Label(row1, text='未选择', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_img.pack(side='left')
 
@@ -412,7 +842,26 @@ class ConfigWizard:
             return
         self.cfg['image'] = path
         self.lbl_img.config(text=os.path.basename(path), fg='#333')
+        self.btn_prep.config(state='normal')
         self._update_preview()
+
+    def _preprocess_image(self):
+        """打开图片预处理窗口：裁剪 / 镜像反转 / 纯色抠图"""
+        if not self.cfg.get('image'):
+            messagebox.showwarning('提示', '请先选择图片！')
+            return
+        if not self.PIL:
+            messagebox.showerror('缺少依赖', '图片预处理需要 Pillow 库，当前环境未安装。')
+            return
+        try:
+            dlg = ImagePreprocessDialog(self.root, self.cfg['image'])
+            self.root.wait_window(dlg.root)
+            if dlg.result_path:
+                self.cfg['image'] = dlg.result_path
+                self.lbl_img.config(text=os.path.basename(dlg.result_path) + '（已预处理）', fg='#2e7d32')
+                self._update_preview()
+        except Exception as e:
+            messagebox.showerror('预处理失败', str(e))
 
     def _read_rime(self):
         """读取当前 Rime 候选框配置并应用到向导"""
