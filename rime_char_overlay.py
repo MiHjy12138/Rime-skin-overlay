@@ -24,7 +24,7 @@ v0.7 配置向导（所见即所得）：
 依赖: 主程序仅 Python 标准库；预览/光环需 Pillow（可选）
 快捷键: Ctrl+Alt+C 隐藏/显示 | Ctrl+Alt+Q 退出 | 拖动微调 | 滚轮缩放 | 右键菜单
 """
-import sys, os, json, time
+import sys, os, json, time, threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import ctypes
@@ -1062,6 +1062,72 @@ class ConfigWizard:
         # 只销毁窗口，让 mainloop 自然返回（不要 sys.exit，否则 Tk 清理会卡住）
         self.root.destroy()
 
+# ============ 系统托盘 ============
+class TrayIcon:
+    """系统托盘图标：右键菜单 显示/隐藏、退出。
+
+    解决无边框透明窗口不好关闭的问题（不用再进任务管理器）。
+    图标用专属羽毛 icon.png，pystray 后台线程跑。
+    """
+    def __init__(self, overlay):
+        self.overlay = overlay
+        self.icon = None
+        self._thread = None
+
+    def start(self):
+        try:
+            import pystray
+            from PIL import Image
+            icon_path = _icon_path('icon.png')
+            if not os.path.exists(icon_path):
+                return
+            img = Image.open(icon_path).resize((64, 64), Image.LANCZOS)
+            menu = pystray.Menu(
+                pystray.MenuItem('重新配置…', self._reconfig, default=True),
+                pystray.MenuItem('显示 / 隐藏图片 (Ctrl+Alt+C)', self._toggle),
+                pystray.MenuItem('退出 (Ctrl+Alt+Q)', self._quit),
+            )
+            self.icon = pystray.Icon('RimeSkinOverlay', img, 'Rime 皮肤外挂', menu)
+            self._thread = threading.Thread(target=self.icon.run, daemon=True)
+            self._thread.start()
+        except Exception:
+            pass
+
+    def _reconfig(self, icon, item):
+        """重新配置：关闭当前实例，打开配置向导（保存后自动重启）"""
+        try:
+            icon.stop()
+        except Exception:
+            pass
+        try:
+            self.overlay.root.after(0, self.overlay.open_wizard)
+        except Exception:
+            pass
+
+    def _toggle(self, icon, item):
+        try:
+            self.overlay.toggle()
+        except Exception:
+            pass
+
+    def _quit(self, icon, item):
+        try:
+            icon.stop()
+        except Exception:
+            pass
+        try:
+            self.overlay.root.after(0, self.overlay.root.destroy)
+        except Exception:
+            pass
+
+    def stop(self):
+        try:
+            if self.icon:
+                self.icon.stop()
+        except Exception:
+            pass
+
+
 # ============ 主窗口 ============
 class FollowOverlay:
     def __init__(self, cfg):
@@ -1101,10 +1167,14 @@ class FollowOverlay:
         self.root.bind('<Control-Alt-Key-q>', lambda e: self.root.destroy())
 
         self.visible = False
+        self.pinned = False   # 手动固定显示（托盘/快捷键切换，不受候选框有无影响）
         self.root.withdraw()
         self.off_x, self.off_y = 0, 0
         self.poll_ms = 50
         self.skin_ms = 2000
+        # 系统托盘（方便退出，不用进任务管理器）
+        self.tray = TrayIcon(self)
+        self.tray.start()
 
     def load_char(self):
         img_path = self.cfg['image']
@@ -1157,11 +1227,29 @@ class FollowOverlay:
         self.menu.tk_popup(e.x_root, e.y_root)
 
     def toggle(self):
-        self.visible = not self.visible
-        if self.visible:
+        """手动切换显示/隐藏（托盘菜单 / Ctrl+Alt+C）。
+        手动显示后 pinned=True，poll 不再因无候选框自动隐藏；再次切换恢复自动模式。
+        """
+        self.pinned = not self.pinned
+        if self.pinned:
             self.root.deiconify()
+            self.visible = True
         else:
             self.root.withdraw()
+            self.visible = False
+
+    def open_wizard(self):
+        """关闭当前实例并打开配置向导（托盘「重新配置」入口）"""
+        def start(cfg2):
+            if _already_running():
+                _kill_existing()
+                time.sleep(1)
+            FollowOverlay(cfg2).run()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        ConfigWizard(on_done=start).root.mainloop()
 
     def poll(self):
         try:
@@ -1181,7 +1269,8 @@ class FollowOverlay:
                     self.root.deiconify()
                     self.visible = True
             else:
-                if self.visible:
+                # 无候选框：仅在非手动固定（pinned）时自动隐藏
+                if not self.pinned and self.visible:
                     self.root.withdraw()
                     self.visible = False
         except Exception:

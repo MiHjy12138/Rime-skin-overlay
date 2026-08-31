@@ -23,3 +23,8 @@ test_*.py
 overlay.log
 error.log
 config.json
+
+# PyInstaller 产物
+build/
+dist/
+*.spec
