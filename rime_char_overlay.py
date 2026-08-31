@@ -177,6 +177,7 @@ DEFAULT_CONFIG = {
     'image': '',
     'layout': 'horizontal_double',  # horizontal_single / horizontal_double / vertical
     'side': 'right',
+    'layer': 'above',    # above=图片在候选框上方 / below=候选框压住图片
     'scale': 1.0,      # 0.2 ~ 2.0，基准高度 300px
     'offset_x': 0,     # 水平微调
     'offset_y': 0,     # 垂直微调
@@ -358,9 +359,18 @@ class ImagePreprocessDialog:
         self._Chops = ImageChops
 
         self.orig = self._Image.open(image_path).convert('RGBA')
-        self.work = self.orig.copy()       # 当前工作图（应用镜像后的状态）
+        # 性能优化：交互基于缩略图（最长边 1200px），应用时映射回原图。
+        # 大图（如 3MB）不再每次拖拽/调容差时处理全分辨率，顺滑度大幅提升。
+        longest = max(self.orig.size)
+        self.scale = min(1.0, 1200.0 / longest)
+        if self.scale < 1.0:
+            self.work = self.orig.resize(
+                (max(1, int(self.orig.width * self.scale)),
+                 max(1, int(self.orig.height * self.scale))), self._Image.LANCZOS)
+        else:
+            self.work = self.orig.copy()
         self.flipped = False
-        self.crop = (0, 0, self.orig.width, self.orig.height)  # 原图坐标 (x0,y0,x1,y1)
+        self.crop = (0, 0, self.work.width, self.work.height)  # 缩略图坐标 (x0,y0,x1,y1)
         self.lock_ratio = None             # None=原图比例 / 'free'=自由 / float=锁定宽高比
         self.use_key = tk.BooleanVar(value=True)
         self.tol_var = tk.IntVar(value=20)
@@ -719,9 +729,15 @@ class ImagePreprocessDialog:
 
     # ---------- 结果 ----------
     def _reset(self):
-        self.work = self.orig.copy()
+        # 恢复为缩略图（大图时避免全分辨率交互）
+        if self.scale < 1.0:
+            self.work = self.orig.resize(
+                (max(1, int(self.orig.width * self.scale)),
+                 max(1, int(self.orig.height * self.scale))), self._Image.LANCZOS)
+        else:
+            self.work = self.orig.copy()
         self.flipped = False
-        self.crop = (0, 0, self.orig.width, self.orig.height)
+        self.crop = (0, 0, self.work.width, self.work.height)
         self.var_ratio.set(0)
         self.lock_ratio = None
         self.tol_var.set(20)
@@ -737,7 +753,18 @@ class ImagePreprocessDialog:
             if w < 2 or h < 2:
                 messagebox.showwarning('提示', '裁剪区域太小！', parent=self.root)
                 return
-            out = self.work.crop((x0, y0, x1, y1))
+            # 缩略图坐标 → 原图坐标
+            if self.scale < 1.0:
+                inv = 1.0 / self.scale
+                ox0 = int(x0 * inv)
+                oy0 = int(y0 * inv)
+                ox1 = int(min(self.orig.width, x1 * inv))
+                oy1 = int(min(self.orig.height, y1 * inv))
+            else:
+                ox0, oy0, ox1, oy1 = x0, y0, x1, y1
+            out = self.orig.crop((ox0, oy0, ox1, oy1))
+            if self.flipped:
+                out = out.transpose(self._Image.FLIP_LEFT_RIGHT)
             if self.use_key.get() and self.bg_color:
                 out = self._chroma_key(out, self.bg_color, self.tol_var.get())
             out_path = os.path.join(HERE, 'preprocessed.png')
@@ -771,6 +798,7 @@ class ConfigWizard:
         except ImportError:
             pass
         self.tk_img = None
+        self._cache = None   # 预览图片缓存 (path, mtime, Image)
 
         self.root = tk.Tk()
         self.root.title(f'Rime 皮肤外挂 {VERSION} - 配置')
@@ -787,7 +815,7 @@ class ConfigWizard:
 
         # 顶部提示：支持格式 + 建议分辨率
         tk.Label(frm,
-                 text='支持格式: PNG / JPG / WEBP / GIF / BMP    建议: 竖版 2:3（如 500x750）\n💡 可选「图片预处理」：裁剪 / 镜像反转 / 纯色背景一键抠图',
+                 text='支持格式: PNG / JPG / WEBP / GIF / BMP    建议: 竖版 2:3，图片 ≤ 2000×2000（约 2MB 内）\n💡 可选「图片预处理」：裁剪 / 镜像反转 / 纯色背景一键抠图',
                  fg='#e67e22', font=('Microsoft YaHei', 9), justify='left').pack(anchor='w', pady=(0, 4))
 
         # ① 图片选择
@@ -834,10 +862,20 @@ class ConfigWizard:
                            font=('Microsoft YaHei', 9),
                            command=self._update_preview).pack(side='left', padx=4)
 
+        # ⑤ 图层层级（图片相对候选框）
+        row4b = tk.Frame(frm)
+        row4b.pack(fill='x', pady=3)
+        tk.Label(row4b, text='④ 图层:', font=('Microsoft YaHei', 10)).pack(side='left')
+        self.var_layer = tk.StringVar(value='above')
+        for text, val in [('候选框上方', 'above'), ('候选框下方', 'below')]:
+            tk.Radiobutton(row4b, text=text, variable=self.var_layer, value=val,
+                           font=('Microsoft YaHei', 9),
+                           command=self._update_preview).pack(side='left', padx=4)
+
         # ⑤ 缩放（独立一行）
         row5 = tk.Frame(frm)
         row5.pack(fill='x', pady=3)
-        tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row5, text='⑤ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_scale = tk.DoubleVar(value=1.0)
         tk.Scale(row5, from_=0.2, to=2.0, resolution=0.1, orient='horizontal',
                  variable=self.var_scale, length=220,
@@ -849,7 +887,7 @@ class ConfigWizard:
         # ⑥ 水平微调（独立一行）
         row6 = tk.Frame(frm)
         row6.pack(fill='x', pady=3)
-        tk.Label(row6, text='⑤ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row6, text='⑥ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_offx = tk.IntVar(value=0)
         tk.Scale(row6, from_=-200, to=200, orient='horizontal',
                  variable=self.var_offx, length=220,
@@ -861,7 +899,7 @@ class ConfigWizard:
         # ⑦ 垂直微调（独立一行）
         row7 = tk.Frame(frm)
         row7.pack(fill='x', pady=3)
-        tk.Label(row7, text='⑥ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row7, text='⑦ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_offy = tk.IntVar(value=0)
         tk.Scale(row7, from_=-150, to=150, orient='horizontal',
                  variable=self.var_offy, length=220,
@@ -879,6 +917,27 @@ class ConfigWizard:
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
         tk.Label(row8, text='💡 保存后启动；下次双击可重新配置',
                  fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
+
+    def _get_preview_img(self):
+        """预览图片缓存：文件未变时复用已打开的图，避免每次滑块都重开大图"""
+        path = self.cfg.get('image')
+        if not path or not self.PIL:
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+            if self._cache and self._cache[0] == path and self._cache[1] == mtime:
+                return self._cache[2]
+            img = self._Image.open(path).convert('RGBA')
+            # 大图先缩到最长边 1600，减少后续预览缩放开销
+            longest = max(img.size)
+            if longest > 1600:
+                s = 1600.0 / longest
+                img = img.resize((max(1, int(img.width * s)),
+                                  max(1, int(img.height * s))), self._Image.LANCZOS)
+            self._cache = (path, mtime, img)
+            return img
+        except Exception:
+            return None
 
     def _pick_image(self):
         path = filedialog.askopenfilename(
@@ -992,13 +1051,15 @@ class ConfigWizard:
         # 图片（贴候选框侧边；缩放逻辑与运行时一致：高度 = base_height×scale）
         if self.cfg.get('image') and self.PIL:
             try:
-                img = self._Image.open(self.cfg['image']).convert('RGBA')
+                img = self._get_preview_img()
+                if img is None:
+                    raise ValueError('图片加载失败')
                 # 与 FollowOverlay.load_char 完全相同的缩放逻辑
                 base_h = 300 * scale
                 if img.height > 0:
                     ratio = base_h / img.height
                     img = img.resize((max(1, int(img.width * ratio)),
-                                      max(1, int(base_h))), self._Image.LANCZOS)
+                                      max(1, int(base_h))), self._Image.BILINEAR)
                 new_w, new_h = img.size
                 # 若图片+候选框超出画布，整体等比缩小（保持相对位置比例）
                 total_w = new_w + 8 + cw
@@ -1048,6 +1109,7 @@ class ConfigWizard:
     def _save_and_start(self):
         self.cfg['layout'] = self.var_layout.get()
         self.cfg['side'] = self.var_side.get()
+        self.cfg['layer'] = self.var_layer.get()
         self.cfg['scale'] = round(float(self.var_scale.get()), 2)
         self.cfg['offset_x'] = int(self.var_offx.get())
         self.cfg['offset_y'] = int(self.var_offy.get())
@@ -1141,6 +1203,10 @@ class FollowOverlay:
         self.root.attributes('-topmost', True)
         self.root.attributes('-transparentcolor', '#FF00FF')
         self.root.configure(bg='#FF00FF')
+        self.layer = self.cfg.get('layer', 'above')
+        if self.layer == 'below':
+            # 候选框压住图片：图片窗不能置顶
+            self.root.attributes('-topmost', False)
         if self.PIL:
             set_window_icon(self.root, (self._Image, self._ImageTk))
 
@@ -1274,6 +1340,7 @@ class FollowOverlay:
                     x = rect.right + gap + self.off_x + self.cfg.get('offset_x', 0)
                 y = rect.top + (ch - self.h) // 2 + self.off_y + self.cfg.get('offset_y', 0)
                 self.root.geometry(f'+{x}+{y}')
+                self._apply_layer(hwnd)
                 if not self.visible:
                     self.root.deiconify()
                     self.visible = True
@@ -1285,6 +1352,17 @@ class FollowOverlay:
         except Exception:
             pass
         self.root.after(self.poll_ms, self.poll)
+
+    def _apply_layer(self, cand_hwnd):
+        """图层层级：below 时把图片窗插到候选框窗口之后（下方）"""
+        if self.layer != 'below':
+            return
+        try:
+            my = self.root.winfo_id()
+            # SWP_NOSIZE(0x0001) | SWP_NOMOVE(0x0002) | SWP_NOACTIVATE(0x0010)
+            user32.SetWindowPos(my, cand_hwnd, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+        except Exception:
+            pass
 
     def run(self):
         self.root.after(self.poll_ms, self.poll)
