@@ -1383,6 +1383,11 @@ class FollowOverlay:
             if self.layer == 'above':
                 # 候选框的 z-order 前一个窗口作为锚（候选框在顶时用 HWND_TOP）
                 cand_prev = user32.GetWindow(cand_hwnd, 3)  # GW_HWNDPREV
+                # 锚点必须也是置顶窗口，否则图片窗插到普通窗口后面会失去 topmost（被活动窗口盖住）
+                if cand_prev:
+                    prev_ex = user32.GetWindowLongW(cand_prev, -20)
+                    if not (prev_ex & 0x00000008):
+                        cand_prev = None
                 insert_after = cand_prev if cand_prev else HWND_TOP
                 user32.SetWindowPos(my, insert_after, 0, 0, 0, 0, flags)
             else:
