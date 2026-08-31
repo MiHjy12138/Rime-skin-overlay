@@ -303,6 +303,12 @@ def add_glow(img_rgba, accent, radius_ratio=0.35, alpha=90):
 
 # ============ 候选框检测 ============
 user32 = ctypes.windll.user32
+# ctypes 64 位进程必须显式声明 Win32 API 签名，否则句柄参数被截断导致调用失败
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.SetWindowPos.restype = wintypes.BOOL
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
 
 def find_candidate_window(layout='horizontal_double'):
     found = []
@@ -358,15 +364,25 @@ class ImagePreprocessDialog:
         self._Chops = ImageChops
 
         self.orig = self._Image.open(image_path).convert('RGBA')
-        self.work = self.orig.copy()       # 当前工作图（应用镜像后的状态）
+        # 性能优化：交互基于缩略图（最长边 1200px），应用时映射回原图。
+        # 大图（如 3MB）不再每次拖拽/调容差时处理全分辨率，顺滑度大幅提升。
+        longest = max(self.orig.size)
+        self.scale = min(1.0, 1200.0 / longest)
+        if self.scale < 1.0:
+            self.work = self.orig.resize(
+                (max(1, int(self.orig.width * self.scale)),
+                 max(1, int(self.orig.height * self.scale))), self._Image.LANCZOS)
+        else:
+            self.work = self.orig.copy()
         self.flipped = False
-        self.crop = (0, 0, self.orig.width, self.orig.height)  # 原图坐标 (x0,y0,x1,y1)
+        self.crop = (0, 0, self.work.width, self.work.height)  # 缩略图坐标 (x0,y0,x1,y1)
         self.lock_ratio = None             # None=原图比例 / 'free'=自由 / float=锁定宽高比
         self.use_key = tk.BooleanVar(value=True)
         self.tol_var = tk.IntVar(value=20)
         self.bg_color = None               # 抠图背景色 (r,g,b)，None=未检测
         self.drag = None                   # 拖拽状态 (mode, ...)
         self.tk_img = None
+        self._photo_refs = []              # PhotoImage 引用保留，防 GC
 
         self.root = tk.Toplevel(master)
         self.root.title('图片预处理 - 裁剪 / 镜像 / 抠图')
@@ -490,6 +506,9 @@ class ImagePreprocessDialog:
         disp_s = disp.resize((max(1, int(disp.width * s)), max(1, int(disp.height * s))),
                              self._Image.LANCZOS)
         self.tk_img = self._ImageTk.PhotoImage(disp_s)
+        self._photo_refs.append(self.tk_img)
+        if len(self._photo_refs) > 3:
+            self._photo_refs.pop(0)
         cv.create_image(ox, oy, anchor='nw', image=self.tk_img)
 
         # 裁剪框
@@ -719,9 +738,15 @@ class ImagePreprocessDialog:
 
     # ---------- 结果 ----------
     def _reset(self):
-        self.work = self.orig.copy()
+        # 恢复为缩略图（大图时避免全分辨率交互）
+        if self.scale < 1.0:
+            self.work = self.orig.resize(
+                (max(1, int(self.orig.width * self.scale)),
+                 max(1, int(self.orig.height * self.scale))), self._Image.LANCZOS)
+        else:
+            self.work = self.orig.copy()
         self.flipped = False
-        self.crop = (0, 0, self.orig.width, self.orig.height)
+        self.crop = (0, 0, self.work.width, self.work.height)
         self.var_ratio.set(0)
         self.lock_ratio = None
         self.tol_var.set(20)
@@ -737,7 +762,18 @@ class ImagePreprocessDialog:
             if w < 2 or h < 2:
                 messagebox.showwarning('提示', '裁剪区域太小！', parent=self.root)
                 return
-            out = self.work.crop((x0, y0, x1, y1))
+            # 缩略图坐标 → 原图坐标
+            if self.scale < 1.0:
+                inv = 1.0 / self.scale
+                ox0 = int(x0 * inv)
+                oy0 = int(y0 * inv)
+                ox1 = int(min(self.orig.width, x1 * inv))
+                oy1 = int(min(self.orig.height, y1 * inv))
+            else:
+                ox0, oy0, ox1, oy1 = x0, y0, x1, y1
+            out = self.orig.crop((ox0, oy0, ox1, oy1))
+            if self.flipped:
+                out = out.transpose(self._Image.FLIP_LEFT_RIGHT)
             if self.use_key.get() and self.bg_color:
                 out = self._chroma_key(out, self.bg_color, self.tol_var.get())
             out_path = os.path.join(HERE, 'preprocessed.png')
@@ -771,6 +807,8 @@ class ConfigWizard:
         except ImportError:
             pass
         self.tk_img = None
+        self._cache = None   # 预览图片缓存 (path, mtime, Image)
+        self._photo_refs = []  # PhotoImage 引用保留，防 GC 回收导致 image doesn't exist
 
         self.root = tk.Tk()
         self.root.title(f'Rime 皮肤外挂 {VERSION} - 配置')
@@ -787,7 +825,7 @@ class ConfigWizard:
 
         # 顶部提示：支持格式 + 建议分辨率
         tk.Label(frm,
-                 text='支持格式: PNG / JPG / WEBP / GIF / BMP    建议: 竖版 2:3（如 500x750）\n💡 可选「图片预处理」：裁剪 / 镜像反转 / 纯色背景一键抠图',
+                 text='支持格式: PNG / JPG / WEBP / GIF / BMP    建议: 竖版 2:3，图片 ≤ 2000×2000（约 2MB 内）\n💡 可选「图片预处理」：裁剪 / 镜像反转 / 纯色背景一键抠图',
                  fg='#e67e22', font=('Microsoft YaHei', 9), justify='left').pack(anchor='w', pady=(0, 4))
 
         # ① 图片选择
@@ -829,12 +867,12 @@ class ConfigWizard:
         row4.pack(fill='x', pady=3)
         tk.Label(row4, text='③ 贴边方向:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_side = tk.StringVar(value='right')
-        for text, val in [('右侧', 'right'), ('左侧', 'left')]:
+        for text, val in [('右侧', 'right'), ('左侧', 'left'), ('中间', 'center')]:
             tk.Radiobutton(row4, text=text, variable=self.var_side, value=val,
                            font=('Microsoft YaHei', 9),
                            command=self._update_preview).pack(side='left', padx=4)
 
-        # ⑤ 缩放（独立一行）
+        # ④ 缩放（独立一行）
         row5 = tk.Frame(frm)
         row5.pack(fill='x', pady=3)
         tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
@@ -846,7 +884,7 @@ class ConfigWizard:
         self.lbl_scale = tk.Label(row5, text='1.0x', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_scale.pack(side='left')
 
-        # ⑥ 水平微调（独立一行）
+        # ⑤ 水平微调（独立一行）
         row6 = tk.Frame(frm)
         row6.pack(fill='x', pady=3)
         tk.Label(row6, text='⑤ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
@@ -858,7 +896,7 @@ class ConfigWizard:
         self.lbl_offx = tk.Label(row6, text='0px', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_offx.pack(side='left')
 
-        # ⑦ 垂直微调（独立一行）
+        # ⑥ 垂直微调（独立一行）
         row7 = tk.Frame(frm)
         row7.pack(fill='x', pady=3)
         tk.Label(row7, text='⑥ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
@@ -879,6 +917,27 @@ class ConfigWizard:
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
         tk.Label(row8, text='💡 保存后启动；下次双击可重新配置',
                  fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
+
+    def _get_preview_img(self):
+        """预览图片缓存：文件未变时复用已打开的图，避免每次滑块都重开大图"""
+        path = self.cfg.get('image')
+        if not path or not self.PIL:
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+            if self._cache and self._cache[0] == path and self._cache[1] == mtime:
+                return self._cache[2]
+            img = self._Image.open(path).convert('RGBA')
+            # 大图先缩到最长边 1600，减少后续预览缩放开销
+            longest = max(img.size)
+            if longest > 1600:
+                s = 1600.0 / longest
+                img = img.resize((max(1, int(img.width * s)),
+                                  max(1, int(img.height * s))), self._Image.LANCZOS)
+            self._cache = (path, mtime, img)
+            return img
+        except Exception:
+            return None
 
     def _pick_image(self):
         path = filedialog.askopenfilename(
@@ -992,13 +1051,15 @@ class ConfigWizard:
         # 图片（贴候选框侧边；缩放逻辑与运行时一致：高度 = base_height×scale）
         if self.cfg.get('image') and self.PIL:
             try:
-                img = self._Image.open(self.cfg['image']).convert('RGBA')
+                img = self._get_preview_img()
+                if img is None:
+                    raise ValueError('图片加载失败')
                 # 与 FollowOverlay.load_char 完全相同的缩放逻辑
                 base_h = 300 * scale
                 if img.height > 0:
                     ratio = base_h / img.height
                     img = img.resize((max(1, int(img.width * ratio)),
-                                      max(1, int(base_h))), self._Image.LANCZOS)
+                                      max(1, int(base_h))), self._Image.BILINEAR)
                 new_w, new_h = img.size
                 # 若图片+候选框超出画布，整体等比缩小（保持相对位置比例）
                 total_w = new_w + 8 + cw
@@ -1033,11 +1094,16 @@ class ConfigWizard:
                 gap = 8
                 if side == 'right':
                     ix = base_x + cw + gap + offx
-                else:
+                elif side == 'left':
                     ix = base_x - new_w - gap + offx
+                else:  # center：水平居中于候选框（配合图层选项叠放）
+                    ix = base_x + (cw - new_w) // 2 + offx
                 iy = base_y + (ch - new_h) // 2 + offy
                 # 预览不加光环（实际运行时有皮肤联动光环）
                 self.tk_img = self._ImageTk.PhotoImage(img)
+                self._photo_refs.append(self.tk_img)
+                if len(self._photo_refs) > 3:
+                    self._photo_refs.pop(0)
                 cv.create_image(ix, iy, anchor='nw', image=self.tk_img)
                 cv.create_rectangle(ix, iy, ix + new_w, iy + new_h,
                                     outline='#ff6a00', dash=(4, 2))
@@ -1084,7 +1150,6 @@ class TrayIcon:
             img = Image.open(icon_path).resize((64, 64), Image.LANCZOS)
             menu = pystray.Menu(
                 pystray.MenuItem('重新配置…', self._reconfig, default=True),
-                pystray.MenuItem('显示 / 隐藏图片 (Ctrl+Alt+C)', self._toggle),
                 pystray.MenuItem('退出 (Ctrl+Alt+Q)', self._quit),
             )
             self.icon = pystray.Icon('RimeSkinOverlay', img, 'Rime 皮肤外挂', menu)
@@ -1270,8 +1335,10 @@ class FollowOverlay:
                 gap = 8
                 if side == 'left':
                     x = rect.left - self.w - gap + self.off_x + self.cfg.get('offset_x', 0)
-                else:
+                elif side == 'right':
                     x = rect.right + gap + self.off_x + self.cfg.get('offset_x', 0)
+                else:  # center：水平居中于候选框（配合图层叠放）
+                    x = rect.left + (cw - self.w) // 2 + self.off_x + self.cfg.get('offset_x', 0)
                 y = rect.top + (ch - self.h) // 2 + self.off_y + self.cfg.get('offset_y', 0)
                 self.root.geometry(f'+{x}+{y}')
                 if not self.visible:
