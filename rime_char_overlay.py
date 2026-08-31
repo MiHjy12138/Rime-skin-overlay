@@ -304,6 +304,12 @@ def add_glow(img_rgba, accent, radius_ratio=0.35, alpha=90):
 
 # ============ 候选框检测 ============
 user32 = ctypes.windll.user32
+# ctypes 64 位进程必须显式声明 Win32 API 签名，否则句柄参数被截断导致调用失败
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.SetWindowPos.restype = wintypes.BOOL
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
 
 def find_candidate_window(layout='horizontal_double'):
     found = []
@@ -1204,9 +1210,6 @@ class FollowOverlay:
         self.root.attributes('-transparentcolor', '#FF00FF')
         self.root.configure(bg='#FF00FF')
         self.layer = self.cfg.get('layer', 'above')
-        if self.layer == 'below':
-            # 候选框压住图片：图片窗不能置顶
-            self.root.attributes('-topmost', False)
         if self.PIL:
             set_window_icon(self.root, (self._Image, self._ImageTk))
 
@@ -1354,13 +1357,28 @@ class FollowOverlay:
         self.root.after(self.poll_ms, self.poll)
 
     def _apply_layer(self, cand_hwnd):
-        """图层层级：below 时把图片窗插到候选框窗口之后（下方）"""
-        if self.layer != 'below':
-            return
+        """图层层级：在 topmost 组内调整图片窗与候选框的 z-order。
+
+        above = 图片窗提到 topmost 顶部（压住候选框）；
+        below = 若候选框也是 topmost，把图片窗插到其后（候选框压住图片重叠部分）；
+                若候选框非 topmost（普通窗口），保持图片窗 topmost 保底可见。
+        """
         try:
             my = self.root.winfo_id()
             # SWP_NOSIZE(0x0001) | SWP_NOMOVE(0x0002) | SWP_NOACTIVATE(0x0010)
-            user32.SetWindowPos(my, cand_hwnd, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+            flags = 0x0001 | 0x0002 | 0x0010
+            HWND_TOPMOST = -1
+            if self.layer == 'above':
+                user32.SetWindowPos(my, HWND_TOPMOST, 0, 0, 0, 0, flags)
+            else:
+                # 探测候选框是否置顶（WS_EX_TOPMOST = 0x00000008, GWL_EXSTYLE = -20）
+                ex = user32.GetWindowLongW(cand_hwnd, -20)
+                if ex & 0x00000008:
+                    # 候选框置顶：图片窗插到其后（下方），两者都保持可见
+                    user32.SetWindowPos(my, cand_hwnd, 0, 0, 0, 0, flags)
+                else:
+                    # 候选框非置顶：图片窗保持 topmost 保底（否则会被活动窗口盖住）
+                    user32.SetWindowPos(my, HWND_TOPMOST, 0, 0, 0, 0, flags)
         except Exception:
             pass
 
