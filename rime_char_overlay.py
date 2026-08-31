@@ -240,6 +240,26 @@ def get_rime_accent():
         pass
     return default
 
+def _flatten_alpha_for_tk(img_rgba, Image=None):
+    """tkinter 显示用：把 RGBA 转成「品红抠色」图。
+
+    tkinter 的 PhotoImage 不支持每像素 alpha，透明像素会露窗口底色；
+    而 -transparentcolor 只精确匹配 #FF00FF。所以：
+      1) alpha 二值化（>=128 不透明，<128 透明）——消除半透明像素（紫边根源）
+      2) 透明区域填精确品红 (255,0,255) —— 让 transparentcolor 抠干净
+      3) 输出 alpha 恒为 255（不保留原 alpha，避免 composite 泄漏半透明）
+    注意：图内不能有纯品红像素（已知限制）。
+    """
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
+    alpha = img_rgba.split()[3].point(lambda a: 255 if a >= 128 else 0)
+    rgb = img_rgba.convert('RGB')  # 丢弃原 alpha，只保留颜色
+    magenta = Image.new('RGB', img_rgba.size, (255, 0, 255))
+    out = Image.composite(rgb, magenta, alpha)
+    return out.convert('RGBA')  # alpha 全 255，无半透明
+
+
 def add_glow(img_rgba, accent, radius_ratio=0.35, alpha=90):
     try:
         from PIL import ImageDraw
@@ -1066,6 +1086,8 @@ class FollowOverlay:
                 ratio = base_h / img.height
                 new_w = max(1, int(img.width * ratio))
                 img = img.resize((new_w, max(1, int(base_h))), self._Image.LANCZOS)
+            # 修复紫边：缩放后 alpha 二值化 + 透明区填品红（配合 transparentcolor 抠色）
+            img = _flatten_alpha_for_tk(img, self._Image)
             self.raw_img = img.copy()
             self.img_mtime = os.path.getmtime(img_path)
             # 不画光环（纯图片）
