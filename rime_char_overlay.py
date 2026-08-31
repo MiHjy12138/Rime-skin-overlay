@@ -91,6 +91,31 @@ def _exe_dir():
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
+
+def _icon_path(name):
+    """图标文件路径：打包后从 _MEIPASS 取，源码模式取项目目录"""
+    if getattr(sys, 'frozen', False):
+        base = getattr(sys, '_MEIPASS', _exe_dir())
+    else:
+        base = _exe_dir()
+    return os.path.join(base, name)
+
+
+def set_window_icon(root, PIL=None):
+    """设置窗口/任务栏图标为专属羽毛图标（替换 tkinter 默认 Tcl/Tk 图标）"""
+    try:
+        if PIL is None:
+            from PIL import Image, ImageTk as _Tk
+            PIL = (Image, _Tk)
+        Image, ImageTk = PIL
+        p = _icon_path('icon.png')
+        if os.path.exists(p):
+            img = ImageTk.PhotoImage(Image.open(p).resize((64, 64), Image.LANCZOS))
+            root.iconphoto(True, img)
+            root._icon_ref = img  # 防 GC 回收
+    except Exception:
+        pass
+
 HERE = _exe_dir()
 CONFIG_PATH = os.path.join(HERE, 'config.json')
 RIME_DIR = os.path.join(os.environ.get('APPDATA', ''), 'Rime')
@@ -751,6 +776,8 @@ class ConfigWizard:
         self.root.title(f'Rime 皮肤外挂 {VERSION} - 配置')
         self.root.resizable(False, False)
         self.root.protocol('WM_DELETE_WINDOW', self._on_cancel)
+        if self.PIL:
+            set_window_icon(self.root, (self._Image, self._ImageTk))
         self._build_ui()
 
     def _build_ui(self):
@@ -1052,6 +1079,8 @@ class FollowOverlay:
         self.root.attributes('-topmost', True)
         self.root.attributes('-transparentcolor', '#FF00FF')
         self.root.configure(bg='#FF00FF')
+        if self.PIL:
+            set_window_icon(self.root, (self._Image, self._ImageTk))
 
         self.raw_img = None
         self.cur_accent = None
