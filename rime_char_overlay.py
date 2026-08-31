@@ -1083,12 +1083,24 @@ class TrayIcon:
                 return
             img = Image.open(icon_path).resize((64, 64), Image.LANCZOS)
             menu = pystray.Menu(
-                pystray.MenuItem('显示 / 隐藏 (Ctrl+Alt+C)', self._toggle, default=True),
+                pystray.MenuItem('重新配置…', self._reconfig, default=True),
+                pystray.MenuItem('显示 / 隐藏图片 (Ctrl+Alt+C)', self._toggle),
                 pystray.MenuItem('退出 (Ctrl+Alt+Q)', self._quit),
             )
             self.icon = pystray.Icon('RimeSkinOverlay', img, 'Rime 皮肤外挂', menu)
             self._thread = threading.Thread(target=self.icon.run, daemon=True)
             self._thread.start()
+        except Exception:
+            pass
+
+    def _reconfig(self, icon, item):
+        """重新配置：关闭当前实例，打开配置向导（保存后自动重启）"""
+        try:
+            icon.stop()
+        except Exception:
+            pass
+        try:
+            self.overlay.root.after(0, self.overlay.open_wizard)
         except Exception:
             pass
 
@@ -1225,6 +1237,19 @@ class FollowOverlay:
         else:
             self.root.withdraw()
             self.visible = False
+
+    def open_wizard(self):
+        """关闭当前实例并打开配置向导（托盘「重新配置」入口）"""
+        def start(cfg2):
+            if _already_running():
+                _kill_existing()
+                time.sleep(1)
+            FollowOverlay(cfg2).run()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        ConfigWizard(on_done=start).root.mainloop()
 
     def poll(self):
         try:
