@@ -1094,11 +1094,7 @@ class TrayIcon:
             pass
 
     def _reconfig(self, icon, item):
-        """重新配置：关闭当前实例，打开配置向导（保存后自动重启）"""
-        try:
-            icon.stop()
-        except Exception:
-            pass
+        """重新配置：打开配置向导（托盘与后台全程保持，取消关闭不影响）"""
         try:
             self.overlay.root.after(0, self.overlay.open_wizard)
         except Exception:
@@ -1239,17 +1235,30 @@ class FollowOverlay:
             self.visible = False
 
     def open_wizard(self):
-        """关闭当前实例并打开配置向导（托盘「重新配置」入口）"""
+        """打开配置向导（托盘与后台全程保持）。
+
+        向导作为独立窗口打开（双 Tk 嵌套 mainloop，overlay 的跟随/托盘不受影响）：
+        - 保存新配置 → 替换当前实例（停托盘、关窗口、启动新配置的 overlay）
+        - 取消/关闭向导 → 什么都不动，外挂继续后台运行
+        """
         def start(cfg2):
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
             if _already_running():
                 _kill_existing()
                 time.sleep(1)
             FollowOverlay(cfg2).run()
         try:
-            self.root.destroy()
+            wizard = ConfigWizard(on_done=start)
+            wizard.root.mainloop()
         except Exception:
             pass
-        ConfigWizard(on_done=start).root.mainloop()
 
     def poll(self):
         try:
