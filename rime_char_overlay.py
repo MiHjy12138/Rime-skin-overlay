@@ -1369,28 +1369,30 @@ class FollowOverlay:
         self.root.after(self.poll_ms, self.poll)
 
     def _apply_layer(self, cand_hwnd):
-        """图层层级：在 topmost 组内调整图片窗与候选框的 z-order。
+        """图层层级：图片窗锚定插到候选框正上方/正下方（每轮 poll 校正）。
 
-        above = 图片窗提到 topmost 顶部（压住候选框）；
-        below = 若候选框也是 topmost，把图片窗插到其后（候选框压住图片重叠部分）；
-                若候选框非 topmost（普通窗口），保持图片窗 topmost 保底可见。
+        实测：火绒 HipsTray 等安全悬浮窗是 topmost 组的"天花板"，候选框也在其下。
+        above = 以候选框的 z-order 前一个窗口为锚插入 → 图片窗稳定压在候选框上方；
+        below = 插到候选框之后 → 候选框压住图片重叠部分（两者都保持 topmost 可见）。
         """
         try:
             my = self.root.winfo_id()
             # SWP_NOSIZE(0x0001) | SWP_NOMOVE(0x0002) | SWP_NOACTIVATE(0x0010)
             flags = 0x0001 | 0x0002 | 0x0010
-            HWND_TOPMOST = -1
+            HWND_TOP = 0
             if self.layer == 'above':
-                user32.SetWindowPos(my, HWND_TOPMOST, 0, 0, 0, 0, flags)
+                # 候选框的 z-order 前一个窗口作为锚（候选框在顶时用 HWND_TOP）
+                cand_prev = user32.GetWindow(cand_hwnd, 3)  # GW_HWNDPREV
+                insert_after = cand_prev if cand_prev else HWND_TOP
+                user32.SetWindowPos(my, insert_after, 0, 0, 0, 0, flags)
             else:
                 # 探测候选框是否置顶（WS_EX_TOPMOST = 0x00000008, GWL_EXSTYLE = -20）
                 ex = user32.GetWindowLongW(cand_hwnd, -20)
                 if ex & 0x00000008:
-                    # 候选框置顶：图片窗插到其后（下方），两者都保持可见
                     user32.SetWindowPos(my, cand_hwnd, 0, 0, 0, 0, flags)
                 else:
-                    # 候选框非置顶：图片窗保持 topmost 保底（否则会被活动窗口盖住）
-                    user32.SetWindowPos(my, HWND_TOPMOST, 0, 0, 0, 0, flags)
+                    # 候选框非置顶：保持图片窗 topmost 保底可见
+                    user32.SetWindowPos(my, HWND_TOP, 0, 0, 0, 0, flags)
         except Exception:
             pass
 
