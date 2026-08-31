@@ -56,9 +56,8 @@
 ```
 RimeSkinOverlay/
 ├── RimeSkinOverlay.exe   # 主程序（免 Python）
-├── char.png              # 图片（自备，替换即换图）
 ├── config.json           # 配置（向导自动生成，无需手改）
-├── overlay.log           # 运行日志（正常启动也有记录，非错误）
+├── error.log             # 运行日志（正常启动也有记录，非错误）
 ├── README.md
 └── LICENSE
 ```
