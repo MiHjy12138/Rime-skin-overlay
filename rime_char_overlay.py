@@ -882,6 +882,8 @@ class ConfigWizard:
             tk.Radiobutton(row4b, text=text, variable=self.var_layer, value=val,
                            font=('Microsoft YaHei', 9),
                            command=self._update_preview).pack(side='left', padx=4)
+        tk.Label(row4b, text='（下方=候选框压住重叠部分）', fg='#999',
+                 font=('Microsoft YaHei', 8)).pack(side='left', padx=(6, 0))
 
         # ⑤ 缩放（独立一行）
         row5 = tk.Frame(frm)
@@ -1398,7 +1400,8 @@ class FollowOverlay:
                 else:
                     # 候选框非置顶：保持图片窗 topmost 保底可见
                     user32.SetWindowPos(my, HWND_TOP, 0, 0, 0, 0, flags)
-        except Exception:
+        except Exception as e:
+            _write_log(f'[图层] SetWindowPos 异常: {e}')
             pass
 
     def run(self):
