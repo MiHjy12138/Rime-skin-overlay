@@ -383,6 +383,7 @@ class ImagePreprocessDialog:
         self.bg_color = None               # 抠图背景色 (r,g,b)，None=未检测
         self.drag = None                   # 拖拽状态 (mode, ...)
         self.tk_img = None
+        self._photo_refs = []              # PhotoImage 引用保留，防 GC
 
         self.root = tk.Toplevel(master)
         self.root.title('图片预处理 - 裁剪 / 镜像 / 抠图')
@@ -506,6 +507,9 @@ class ImagePreprocessDialog:
         disp_s = disp.resize((max(1, int(disp.width * s)), max(1, int(disp.height * s))),
                              self._Image.LANCZOS)
         self.tk_img = self._ImageTk.PhotoImage(disp_s)
+        self._photo_refs.append(self.tk_img)
+        if len(self._photo_refs) > 3:
+            self._photo_refs.pop(0)
         cv.create_image(ox, oy, anchor='nw', image=self.tk_img)
 
         # 裁剪框
@@ -805,6 +809,7 @@ class ConfigWizard:
             pass
         self.tk_img = None
         self._cache = None   # 预览图片缓存 (path, mtime, Image)
+        self._photo_refs = []  # PhotoImage 引用保留，防 GC 回收导致 image doesn't exist
 
         self.root = tk.Tk()
         self.root.title(f'Rime 皮肤外挂 {VERSION} - 配置')
@@ -863,7 +868,7 @@ class ConfigWizard:
         row4.pack(fill='x', pady=3)
         tk.Label(row4, text='③ 贴边方向:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_side = tk.StringVar(value='right')
-        for text, val in [('右侧', 'right'), ('左侧', 'left')]:
+        for text, val in [('右侧', 'right'), ('左侧', 'left'), ('中间', 'center')]:
             tk.Radiobutton(row4, text=text, variable=self.var_side, value=val,
                            font=('Microsoft YaHei', 9),
                            command=self._update_preview).pack(side='left', padx=4)
@@ -1100,11 +1105,16 @@ class ConfigWizard:
                 gap = 8
                 if side == 'right':
                     ix = base_x + cw + gap + offx
-                else:
+                elif side == 'left':
                     ix = base_x - new_w - gap + offx
+                else:  # center：水平居中于候选框（配合图层选项叠放）
+                    ix = base_x + (cw - new_w) // 2 + offx
                 iy = base_y + (ch - new_h) // 2 + offy
                 # 预览不加光环（实际运行时有皮肤联动光环）
                 self.tk_img = self._ImageTk.PhotoImage(img)
+                self._photo_refs.append(self.tk_img)
+                if len(self._photo_refs) > 3:
+                    self._photo_refs.pop(0)
                 cv.create_image(ix, iy, anchor='nw', image=self.tk_img)
                 cv.create_rectangle(ix, iy, ix + new_w, iy + new_h,
                                     outline='#ff6a00', dash=(4, 2))
@@ -1339,8 +1349,10 @@ class FollowOverlay:
                 gap = 8
                 if side == 'left':
                     x = rect.left - self.w - gap + self.off_x + self.cfg.get('offset_x', 0)
-                else:
+                elif side == 'right':
                     x = rect.right + gap + self.off_x + self.cfg.get('offset_x', 0)
+                else:  # center：水平居中于候选框（配合图层叠放）
+                    x = rect.left + (cw - self.w) // 2 + self.off_x + self.cfg.get('offset_x', 0)
                 y = rect.top + (ch - self.h) // 2 + self.off_y + self.cfg.get('offset_y', 0)
                 self.root.geometry(f'+{x}+{y}')
                 self._apply_layer(hwnd)
