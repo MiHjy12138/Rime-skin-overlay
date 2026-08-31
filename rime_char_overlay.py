@@ -1155,6 +1155,7 @@ class FollowOverlay:
         self.root.bind('<Control-Alt-Key-q>', lambda e: self.root.destroy())
 
         self.visible = False
+        self.pinned = False   # 手动固定显示（托盘/快捷键切换，不受候选框有无影响）
         self.root.withdraw()
         self.off_x, self.off_y = 0, 0
         self.poll_ms = 50
@@ -1214,11 +1215,16 @@ class FollowOverlay:
         self.menu.tk_popup(e.x_root, e.y_root)
 
     def toggle(self):
-        self.visible = not self.visible
-        if self.visible:
+        """手动切换显示/隐藏（托盘菜单 / Ctrl+Alt+C）。
+        手动显示后 pinned=True，poll 不再因无候选框自动隐藏；再次切换恢复自动模式。
+        """
+        self.pinned = not self.pinned
+        if self.pinned:
             self.root.deiconify()
+            self.visible = True
         else:
             self.root.withdraw()
+            self.visible = False
 
     def poll(self):
         try:
@@ -1238,7 +1244,8 @@ class FollowOverlay:
                     self.root.deiconify()
                     self.visible = True
             else:
-                if self.visible:
+                # 无候选框：仅在非手动固定（pinned）时自动隐藏
+                if not self.pinned and self.visible:
                     self.root.withdraw()
                     self.visible = False
         except Exception:
