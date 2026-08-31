@@ -177,7 +177,6 @@ DEFAULT_CONFIG = {
     'image': '',
     'layout': 'horizontal_double',  # horizontal_single / horizontal_double / vertical
     'side': 'right',
-    'layer': 'above',    # above=图片在候选框上方 / below=候选框压住图片
     'scale': 1.0,      # 0.2 ~ 2.0，基准高度 300px
     'offset_x': 0,     # 水平微调
     'offset_y': 0,     # 垂直微调
@@ -873,22 +872,10 @@ class ConfigWizard:
                            font=('Microsoft YaHei', 9),
                            command=self._update_preview).pack(side='left', padx=4)
 
-        # ⑤ 图层层级（图片相对候选框）
-        row4b = tk.Frame(frm)
-        row4b.pack(fill='x', pady=3)
-        tk.Label(row4b, text='④ 图层:', font=('Microsoft YaHei', 10)).pack(side='left')
-        self.var_layer = tk.StringVar(value='above')
-        for text, val in [('候选框上方', 'above'), ('候选框下方', 'below')]:
-            tk.Radiobutton(row4b, text=text, variable=self.var_layer, value=val,
-                           font=('Microsoft YaHei', 9),
-                           command=self._update_preview).pack(side='left', padx=4)
-        tk.Label(row4b, text='（下方=候选框压住重叠部分）', fg='#999',
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=(6, 0))
-
-        # ⑤ 缩放（独立一行）
+        # ④ 缩放（独立一行）
         row5 = tk.Frame(frm)
         row5.pack(fill='x', pady=3)
-        tk.Label(row5, text='⑤ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_scale = tk.DoubleVar(value=1.0)
         tk.Scale(row5, from_=0.2, to=2.0, resolution=0.1, orient='horizontal',
                  variable=self.var_scale, length=220,
@@ -897,10 +884,10 @@ class ConfigWizard:
         self.lbl_scale = tk.Label(row5, text='1.0x', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_scale.pack(side='left')
 
-        # ⑥ 水平微调（独立一行）
+        # ⑤ 水平微调（独立一行）
         row6 = tk.Frame(frm)
         row6.pack(fill='x', pady=3)
-        tk.Label(row6, text='⑥ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row6, text='⑤ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_offx = tk.IntVar(value=0)
         tk.Scale(row6, from_=-200, to=200, orient='horizontal',
                  variable=self.var_offx, length=220,
@@ -909,10 +896,10 @@ class ConfigWizard:
         self.lbl_offx = tk.Label(row6, text='0px', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_offx.pack(side='left')
 
-        # ⑦ 垂直微调（独立一行）
+        # ⑥ 垂直微调（独立一行）
         row7 = tk.Frame(frm)
         row7.pack(fill='x', pady=3)
-        tk.Label(row7, text='⑦ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row7, text='⑥ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_offy = tk.IntVar(value=0)
         tk.Scale(row7, from_=-150, to=150, orient='horizontal',
                  variable=self.var_offy, length=220,
@@ -1127,7 +1114,6 @@ class ConfigWizard:
     def _save_and_start(self):
         self.cfg['layout'] = self.var_layout.get()
         self.cfg['side'] = self.var_side.get()
-        self.cfg['layer'] = self.var_layer.get()
         self.cfg['scale'] = round(float(self.var_scale.get()), 2)
         self.cfg['offset_x'] = int(self.var_offx.get())
         self.cfg['offset_y'] = int(self.var_offy.get())
@@ -1164,7 +1150,6 @@ class TrayIcon:
             img = Image.open(icon_path).resize((64, 64), Image.LANCZOS)
             menu = pystray.Menu(
                 pystray.MenuItem('重新配置…', self._reconfig, default=True),
-                pystray.MenuItem('显示 / 隐藏图片 (Ctrl+Alt+C)', self._toggle),
                 pystray.MenuItem('退出 (Ctrl+Alt+Q)', self._quit),
             )
             self.icon = pystray.Icon('RimeSkinOverlay', img, 'Rime 皮肤外挂', menu)
@@ -1221,7 +1206,6 @@ class FollowOverlay:
         self.root.attributes('-topmost', True)
         self.root.attributes('-transparentcolor', '#FF00FF')
         self.root.configure(bg='#FF00FF')
-        self.layer = self.cfg.get('layer', 'above')
         if self.PIL:
             set_window_icon(self.root, (self._Image, self._ImageTk))
 
@@ -1357,7 +1341,6 @@ class FollowOverlay:
                     x = rect.left + (cw - self.w) // 2 + self.off_x + self.cfg.get('offset_x', 0)
                 y = rect.top + (ch - self.h) // 2 + self.off_y + self.cfg.get('offset_y', 0)
                 self.root.geometry(f'+{x}+{y}')
-                self._apply_layer(hwnd)
                 if not self.visible:
                     self.root.deiconify()
                     self.visible = True
@@ -1369,40 +1352,6 @@ class FollowOverlay:
         except Exception:
             pass
         self.root.after(self.poll_ms, self.poll)
-
-    def _apply_layer(self, cand_hwnd):
-        """图层层级：图片窗锚定插到候选框正上方/正下方（每轮 poll 校正）。
-
-        实测：火绒 HipsTray 等安全悬浮窗是 topmost 组的"天花板"，候选框也在其下。
-        above = 以候选框的 z-order 前一个窗口为锚插入 → 图片窗稳定压在候选框上方；
-        below = 插到候选框之后 → 候选框压住图片重叠部分（两者都保持 topmost 可见）。
-        """
-        try:
-            my = self.root.winfo_id()
-            # SWP_NOSIZE(0x0001) | SWP_NOMOVE(0x0002) | SWP_NOACTIVATE(0x0010)
-            flags = 0x0001 | 0x0002 | 0x0010
-            HWND_TOP = 0
-            if self.layer == 'above':
-                # 候选框的 z-order 前一个窗口作为锚（候选框在顶时用 HWND_TOP）
-                cand_prev = user32.GetWindow(cand_hwnd, 3)  # GW_HWNDPREV
-                # 锚点必须也是置顶窗口，否则图片窗插到普通窗口后面会失去 topmost（被活动窗口盖住）
-                if cand_prev:
-                    prev_ex = user32.GetWindowLongW(cand_prev, -20)
-                    if not (prev_ex & 0x00000008):
-                        cand_prev = None
-                insert_after = cand_prev if cand_prev else HWND_TOP
-                user32.SetWindowPos(my, insert_after, 0, 0, 0, 0, flags)
-            else:
-                # 探测候选框是否置顶（WS_EX_TOPMOST = 0x00000008, GWL_EXSTYLE = -20）
-                ex = user32.GetWindowLongW(cand_hwnd, -20)
-                if ex & 0x00000008:
-                    user32.SetWindowPos(my, cand_hwnd, 0, 0, 0, 0, flags)
-                else:
-                    # 候选框非置顶：保持图片窗 topmost 保底可见
-                    user32.SetWindowPos(my, HWND_TOP, 0, 0, 0, 0, flags)
-        except Exception as e:
-            _write_log(f'[图层] SetWindowPos 异常: {e}')
-            pass
 
     def run(self):
         self.root.after(self.poll_ms, self.poll)
