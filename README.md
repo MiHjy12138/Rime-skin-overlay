@@ -1,4 +1,4 @@
-# Rime 皮肤外挂 (Rime Skin Overlay) v1.3
+# Rime 皮肤外挂器 (Rime Skin Overlay) v1.3
 
 让小狼毫 (Rime/Weasel) 输入时，候选框旁边跟随显示图片。纯外挂思路：不改输入法本体，像油猴脚本一样在旁边挂个透明小窗。
 
