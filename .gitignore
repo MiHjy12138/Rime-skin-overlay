@@ -28,3 +28,6 @@ config.json
 build/
 dist/
 *.spec
+
+# 用户皮肤档案（不随仓库分发）
+skins/
