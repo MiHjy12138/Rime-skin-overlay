@@ -12,8 +12,11 @@ v0.7 配置向导（所见即所得）：
   ⑥ 缩放、水平微调、垂直微调 三滑块实时预览
   配置保存到 config.json，下次启动直接生效
 
-原理：小狼毫候选框是 TSF 框架窗口（类名 ATL: 前缀），脚本每 50ms 枚举
-可见窗口找到候选框，把透明置顶小窗贴到其左/右侧；无候选框自动隐藏。
+原理：小狼毫候选框是 TSF 框架窗口（类名 ATL: 前缀）。脚本用 WinEventHook
+（LOCATIONCHANGE/DESTROY/SHOW/HIDE）事件驱动定位：后台守护线程监听事件，
+只对缓存候选框句柄置位；主线程消费后 O(1) GetWindowRect + SetWindowPos
+把透明置顶小窗贴到其左/右侧；无候选框自动隐藏（带 150ms 去抖防闪烁）。
+候选框销毁重建由 SHOW 事件/低频全扫自愈；hook 不可用时退化为心跳低频全扫。
 皮肤联动：每 2 秒读 weasel.custom.yaml，光环颜色跟随当前皮肤主色调。
 
 用法:
@@ -24,7 +27,7 @@ v0.7 配置向导（所见即所得）：
 依赖: 主程序仅 Python 标准库；预览/光环需 Pillow（可选）
 快捷键: Ctrl+Alt+C 隐藏/显示 | Ctrl+Alt+Q 退出 | 拖动微调 | 滚轮缩放 | 右键菜单
 """
-import sys, os, json, time, threading, re
+import sys, os, json, time, threading, re, queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 import ctypes
@@ -84,7 +87,7 @@ def _kill_existing():
 
 # ============ 自启管理 ============
 APP_NAME = 'RimeSkinOverlay'
-VERSION = 'v1.3'
+VERSION = 'v1.5'
 
 def _exe_dir():
     if getattr(sys, 'frozen', False):
@@ -177,6 +180,7 @@ DEFAULT_CONFIG = {
     'image': '',
     'layout': 'horizontal_double',  # horizontal_single / horizontal_double / vertical
     'side': 'right',
+    'layer': 'above',  # 图层：above=图片在候选框上方 / below=候选框压住图片（仅 贴边=中间 重叠时生效）
     'scale': 1.0,      # 0.2 ~ 2.0，基准高度 300px
     'offset_x': 0,     # 水平微调
     'offset_y': 0,     # 垂直微调
@@ -482,6 +486,58 @@ kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
 kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
+# ============ 事件驱动（路径 B）WinEventHook 绑定 ============
+# 仅在已 import 的 user32/kernel32 基础上补充；全部显式声明签名
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.IsWindow.restype = wintypes.BOOL
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.IsWindowVisible.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
+user32.GetWindow.argtypes = [wintypes.HWND, ctypes.c_uint]
+user32.GetWindow.restype = wintypes.HWND
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetClassNameW.restype = ctypes.c_int
+user32.EnumWindows.argtypes = [ctypes.c_void_p, wintypes.LPARAM]
+user32.EnumWindows.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
+user32.SetWinEventHook.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.HMODULE,
+                                   ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                   wintypes.DWORD]
+user32.SetWinEventHook.restype = wintypes.HANDLE
+user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+user32.UnhookWinEvent.restype = wintypes.BOOL
+user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                               wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = ctypes.c_long
+user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
+                                      wintypes.WPARAM, wintypes.LPARAM]
+user32.PostThreadMessageW.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = ctypes.c_longlong
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+# WinEventHook 事件常量
+EVENT_OBJECT_DESTROY = 0x8001
+EVENT_OBJECT_SHOW = 0x8002
+EVENT_OBJECT_HIDE = 0x8003
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+WINEVENT_OUTOFCONTEXT = 0x0002
+WINEVENT_SKIPOWNPROCESS = 0x0004
+OBJID_WINDOW = 0
+CHILDID_SELF = 0
+WM_QUIT = 0x0012
+GW_HWNDPREV = 3
+HWND_TOPMOST = -1
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+
 # 小狼毫相关进程名（候选框窗口可能属于这些进程——旧版架构/独立候选窗）
 _WEASEL_PROCESSES = ('weaselserver.exe', 'weaseltsf.exe', 'weaselime.exe', 'weasel.exe')
 
@@ -489,6 +545,9 @@ _WEASEL_PROCESSES = ('weaselserver.exe', 'weaseltsf.exe', 'weaselime.exe', 'weas
 _WS_POPUP = 0x80000000
 _WS_EX_TOOLWINDOW = 0x00000080
 _WS_EX_NOACTIVATE = 0x08000000
+# 图层（below）用：候选框是否置顶探测（WS_EX_TOPMOST）+ GWL_EXSTYLE 偏移
+WS_EX_TOPMOST = 0x00000008
+GWL_EXSTYLE = -20
 
 def _is_tsf_candidate_style(hwnd):
     """TSF 候选框样式识别：POPUP + TOOLWINDOW + NOACTIVATE（无标题、不抢焦点）。
@@ -522,15 +581,21 @@ def _window_belongs_to_weasel(hwnd):
     except Exception:
         return False
 
-def find_candidate_window(layout='horizontal_double'):
-    found = []
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(hwnd, lparam):
+# ---- EnumWindows 回调：模块级单例（改造后仅低频重扫才调用，一次创建反复使用，
+#      避免旧版每 50ms 重建 WINFUNCTYPE 闭包的浪费；结果放模块级缓冲 + 锁防重入）----
+_find_results = []
+_find_lock = threading.Lock()
+
+
+@ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+def _find_enum_proc(hwnd, lparam):
+    """EnumWindows 回调：收集类名 ATL: 前缀 + 尺寸 + TSF 样式/weasel 进程判定的候选框。"""
+    try:
         if not user32.IsWindowVisible(hwnd):
             return True
-        cls = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, cls, 256)
-        if cls.value.startswith('ATL:'):
+        _find_cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, _find_cls, 256)
+        if _find_cls.value.startswith('ATL:'):
             rect = wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect))
             w, h = rect.right - rect.left, rect.bottom - rect.top
@@ -539,13 +604,199 @@ def find_candidate_window(layout='horizontal_double'):
                 # 普通弹窗（火绒等）不满足样式组合且非 weasel 进程 → 排除
                 if not (_is_tsf_candidate_style(hwnd) or _window_belongs_to_weasel(hwnd)):
                     return True
-                found.append((hwnd, rect))
-        return True
-    user32.EnumWindows(cb, 0)
+                _find_results.append((hwnd, rect))
+    except Exception:
+        pass
+    return True
+
+
+def find_candidate_window(layout='horizontal_double'):
+    """低频兜底全扫：枚举可见窗口找候选框，返回 (hwnd, rect) 或 None。
+    （事件驱动主路径失效/缓存被销毁时才调用，受 FollowOverlay 节流控制。）
+    多候选框排序说明：EnumWindows 自 z-order 顶向下枚举，此处按原行为
+    取 rect.top 最大（最靠下）的一个 —— 单候选框场景无差异，见 B_AUDIT 清单 8。"""
+    global _find_results
+    with _find_lock:
+        _find_results = []
+        try:
+            user32.EnumWindows(_find_enum_proc, 0)
+        except Exception:
+            pass
+        found = list(_find_results)
     if found:
         found.sort(key=lambda f: f[1].top)
         return found[-1]
     return None
+
+
+# ============ 事件驱动（路径 B）：WinEventHook 后台线程 ============
+# 替代「每 50ms EnumWindows 全桌扫描」：
+#   · 守护线程 SetWinEventHook(OUTOFCONTEXT) + GetMessageW 消息循环
+#   · 回调只做极轻工作：hwnd 与缓存句柄比较，匹配才置标志（不调任何重 API）
+#   · 主线程（Tk）16ms 消费标志 → 立即重定位；200ms 心跳兜底校验缓存
+# 回调与主线程之间用「单调时钟时间戳」通信（GIL 保证 int/float 赋值原子，
+# 免锁免队列满问题；事件风暴时天然只保留「最近一次」，与去抖语义吻合）。
+_EVT_CACHE_HWND = 0        # 主线程维护的候选框句柄缓存（回调线程只读）
+# 事件信号：严格递增序号（int）+ 时间戳。用序号而非时间戳比较 ——
+# 系统时间戳精度可能 1ms，两次事件若同戳会被误判「已消费」而丢事件；
+# 单调递增计数则永不丢（慢 tick 会合并多次置位为一次处理，语义=只关心最新位置）。
+_EVT_MOVE_CNT = 0          # 候选框移动/显示 事件计数
+_EVT_GONE_CNT = 0          # 候选框销毁/隐藏 事件计数
+_EVT_SHOW_CNT = 0          # 任意窗口 SHOW 事件计数（缓存失效自愈重扫用）
+_EVT_MOVE_TS = 0.0         # 最近一次 MOVE 事件时刻（monotonic，perf 用）
+_EVT_GONE_TS = 0.0         # 最近一次 GONE 事件时刻
+_EVT_SHOW_TS = 0.0         # 最近一次 SHOW 事件时刻
+_EVT_SHOW_HWND = 0         # 与最近 SHOW 对应的窗口句柄（供主线程免全扫直挂候选）
+_EVT_HOOK = None           # WinEventHook 句柄
+_EVT_THREAD = None         # 事件线程
+_EVT_TID = 0               # 事件线程 id（退出用 PostThreadMessage）
+_EVT_REFS = 0              # 引用计数：多实例/重建（open_wizard）交错时避免误停线程
+_WIN_EVENT_PROC = None     # 保存 WINFUNCTYPE 实例引用，防 GC 导致回调失效
+
+
+@ctypes.WINFUNCTYPE(None, wintypes.HANDLE, wintypes.DWORD, wintypes.HWND,
+                    ctypes.c_long, ctypes.c_long, wintypes.DWORD, wintypes.DWORD)
+def _win_event_proc(hook, event, hwnd, idObject, idChild, dwEventThread, dwmsEventTime):
+    """WinEventHook 回调（事件线程上下文执行）：
+    只做 hwnd 比对 + 递增序号/置时间戳，绝不调用窗口查询/Tk 等重 API。"""
+    global _EVT_MOVE_CNT, _EVT_GONE_CNT, _EVT_SHOW_CNT
+    global _EVT_MOVE_TS, _EVT_GONE_TS, _EVT_SHOW_TS, _EVT_SHOW_HWND
+    try:
+        if not hwnd or idObject != OBJID_WINDOW or idChild != CHILDID_SELF:
+            return
+        if event == EVENT_OBJECT_SHOW:
+            # 任何窗口显示都可能包含重建后的候选框 → 置位供主线程按需低频重扫
+            _EVT_SHOW_CNT += 1
+            _EVT_SHOW_TS = time.monotonic()
+            _EVT_SHOW_HWND = int(hwnd)
+            return
+        if hwnd != _EVT_CACHE_HWND:
+            return
+        if event == EVENT_OBJECT_LOCATIONCHANGE:
+            _EVT_MOVE_CNT += 1
+            _EVT_MOVE_TS = time.monotonic()
+        elif event in (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE):
+            _EVT_GONE_CNT += 1
+            _EVT_GONE_TS = time.monotonic()
+    except Exception:
+        pass  # 回调必须零失败，任何异常都吞掉
+
+
+def set_candidate_hwnd(hwnd):
+    """主线程在缓存更新时调用：让事件回调只关心当前候选框句柄。"""
+    global _EVT_CACHE_HWND
+    _EVT_CACHE_HWND = hwnd or 0
+
+
+def _ensure_event_thread():
+    """幂等启动事件守护线程（引用计数 +1）；返回是否已启动/存活。"""
+    global _EVT_THREAD, _EVT_TID, _EVT_HOOK, _WIN_EVENT_PROC, _EVT_REFS
+    _EVT_REFS += 1
+    if _EVT_THREAD is not None and _EVT_THREAD.is_alive():
+        return True
+    _EVT_TID = 0
+    _EVT_HOOK = None
+    # 必须在有消息循环的线程调用 SetWinEventHook（OUTOFCONTEXT 回调由系统投递到该线程）
+    _WIN_EVENT_PROC = _win_event_proc  # 模块级持有，防 GC
+    _EVT_THREAD = threading.Thread(target=_event_thread_main,
+                                   name='rime-win-event-hook', daemon=True)
+    _EVT_THREAD.start()
+    return True
+
+
+def _release_event_thread():
+    """引用计数 -1；归零才真正停止事件线程（open_wizard 重建时新旧实例交错）。"""
+    global _EVT_REFS
+    if _EVT_REFS > 0:
+        _EVT_REFS -= 1
+    if _EVT_REFS == 0:
+        stop_event_thread()
+
+
+def _event_thread_main():
+    """事件线程：注册钩子 + GetMessageW 消息循环；收到 WM_QUIT 退出。"""
+    global _EVT_HOOK, _EVT_TID, _WIN_EVENT_PROC
+    try:
+        _EVT_TID = kernel32.GetCurrentThreadId()
+        # 确保本线程已有消息队列（GetMessage 前的 Peek 即可创建）
+        _m = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(_m), 0, 0, 0, 0)
+        hook = user32.SetWinEventHook(
+            EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,   # 0x8001..0x800B
+            0, _WIN_EVENT_PROC, 0, 0,
+            WINEVENT_OUTOFCONTEXT)  # 不加 SKIPOWNPROCESS：回调内已按缓存句柄过滤，自身窗口事件可忽略
+        if not hook:
+            _write_log('[event] SetWinEventHook 失败，将退化为心跳全扫兜底')
+            _EVT_HOOK = None
+            return
+        _EVT_HOOK = hook
+        while True:
+            r = user32.GetMessageW(ctypes.byref(_m), 0, 0, 0)
+            if r <= 0:  # 0=WM_QUIT, -1=错误
+                break
+            # OUTOFCONTEXT 回调以消息形式投递到本线程，必须 Translate+Dispatch 派发才会触发
+            user32.TranslateMessage(ctypes.byref(_m))
+            user32.DispatchMessageW(ctypes.byref(_m))
+    except Exception as e:
+        try:
+            import traceback as _tb
+            _write_log(f'[event] 事件线程异常: {e}\n{_tb.format_exc()}')
+        except Exception:
+            pass
+    finally:
+        # 退出清理：卸载钩子 + 释放回调引用
+        try:
+            if _EVT_HOOK:
+                user32.UnhookWinEvent(_EVT_HOOK)
+        except Exception:
+            pass
+        _EVT_HOOK = None
+        _WIN_EVENT_PROC = None
+
+
+def stop_event_thread():
+    """停止事件线程：UnhookWinEvent + 向线程队列投递 WM_QUIT。幂等，可重复调用。"""
+    global _EVT_HOOK, _EVT_TID, _EVT_THREAD
+    try:
+        if _EVT_HOOK:
+            user32.UnhookWinEvent(_EVT_HOOK)
+    except Exception:
+        pass
+    _EVT_HOOK = None
+    if _EVT_TID:
+        try:
+            user32.PostThreadMessageW(_EVT_TID, WM_QUIT, 0, 0)
+        except Exception:
+            pass
+        _EVT_TID = 0
+    t = _EVT_THREAD
+    _EVT_THREAD = None
+    if t is not None and t.is_alive():
+        t.join(timeout=1.0)
+
+
+def event_hook_alive():
+    """事件钩子是否正常工作中（供心跳判断是否需退化全扫兜底）。"""
+    return bool(_EVT_HOOK) and _EVT_THREAD is not None and _EVT_THREAD.is_alive()
+
+
+# ============ 性能日志（路径 B，任务 G：默认关，常量控制）============
+# 设为 1 打开：记录 事件到达→SetWindowPos 完成 延迟 / EnumWindows 次数 / 心跳次数，
+# 写入 exe 同目录 perf.log（与 error.log 分开，便于单独分析）
+PERF_LOG_ENABLED = os.environ.get('RIME_OVERLAY_PERF', '') == '1'
+_PERF_START = time.time()
+
+
+def _perf_log(msg):
+    """性能日志（perf.log）；开关关闭时零开销（一层布尔判断）。"""
+    if not PERF_LOG_ENABLED:
+        return
+    try:
+        with open(os.path.join(HERE, 'perf.log'), 'a', encoding='utf-8') as f:
+            f.write(f'{time.time() - _PERF_START:8.3f}s | {msg}\n')
+    except Exception:
+        pass
+
 
 # ============ 图片预处理（裁剪 / 镜像 / 抠图）============
 class ImagePreprocessDialog:
@@ -1081,7 +1332,7 @@ class ConfigWizard:
         tk.Button(row3, text='读取当前Rime配置(可选)', command=self._read_rime,
                   font=('Microsoft YaHei', 9)).pack(side='left', padx=12)
 
-        # ④ 贴边方向
+        # ③ 贴边方向
         row4 = tk.Frame(frm)
         row4.pack(fill='x', pady=3)
         tk.Label(row4, text='③ 贴边方向:', font=('Microsoft YaHei', 10)).pack(side='left')
@@ -1091,10 +1342,24 @@ class ConfigWizard:
                            font=('Microsoft YaHei', 9),
                            command=self._update_preview).pack(side='left', padx=4)
 
-        # ④ 缩放（独立一行）
+        # ④ 图层（图片相对候选框层级；v1.5 自 v1.2 恢复，事件驱动下重建可自愈）
+        row_layer = tk.Frame(frm)
+        row_layer.pack(fill='x', pady=3)
+        tk.Label(row_layer, text='④ 图层:', font=('Microsoft YaHei', 10)).pack(side='left')
+        self.var_layer = tk.StringVar(master=self.root, value='above')
+        for text, val in [('候选框上方', 'above'), ('候选框下方', 'below')]:
+            tk.Radiobutton(row_layer, text=text, variable=self.var_layer, value=val,
+                           font=('Microsoft YaHei', 9),
+                           command=self._update_preview).pack(side='left', padx=4)
+        # below 提示行（随 图层/贴边 选择动态更新；v1.3 教训：below 仅 贴边=中间 重叠时可见）
+        self.lbl_layer_hint = tk.Label(frm, text='', fg='#888', font=('Microsoft YaHei', 8),
+                                       justify='left')
+        self.lbl_layer_hint.pack(anchor='w', pady=(0, 2))
+
+        # ⑤ 缩放（独立一行）
         row5 = tk.Frame(frm)
         row5.pack(fill='x', pady=3)
-        tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row5, text='⑤ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_scale = tk.DoubleVar(master=self.root, value=1.0)
         tk.Scale(row5, from_=0.2, to=2.0, resolution=0.1, orient='horizontal',
                  variable=self.var_scale, length=220,
@@ -1103,10 +1368,10 @@ class ConfigWizard:
         self.lbl_scale = tk.Label(row5, text='1.0x', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_scale.pack(side='left')
 
-        # ⑤ 水平微调（独立一行）
+        # ⑥ 水平微调（独立一行）
         row6 = tk.Frame(frm)
         row6.pack(fill='x', pady=3)
-        tk.Label(row6, text='⑤ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row6, text='⑥ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_offx = tk.IntVar(master=self.root, value=0)
         tk.Scale(row6, from_=-200, to=200, orient='horizontal',
                  variable=self.var_offx, length=220,
@@ -1115,10 +1380,10 @@ class ConfigWizard:
         self.lbl_offx = tk.Label(row6, text='0px', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_offx.pack(side='left')
 
-        # ⑥ 垂直微调（独立一行）
+        # ⑦ 垂直微调（独立一行）
         row7 = tk.Frame(frm)
         row7.pack(fill='x', pady=3)
-        tk.Label(row7, text='⑥ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
+        tk.Label(row7, text='⑦ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_offy = tk.IntVar(master=self.root, value=0)
         tk.Scale(row7, from_=-150, to=150, orient='horizontal',
                  variable=self.var_offy, length=220,
@@ -1127,14 +1392,14 @@ class ConfigWizard:
         self.lbl_offy = tk.Label(row7, text='0px', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_offy.pack(side='left')
 
-        # ⑦ 预览区（候选框 + 图片 组合）
+        # ⑧ 预览区（候选框 + 图片 组合）
         tk.Label(frm, text='预览（候选框 + 图片组合样式，图片已自适应缩放）:',
                  font=('Microsoft YaHei', 9), fg='#555').pack(anchor='w', pady=(4, 0))
         self.canvas = tk.Canvas(frm, width=760, height=380, bg='#ffffff',
                                 highlightthickness=1, highlightbackground='#ccc')
         self.canvas.pack(pady=4)
 
-        # ⑧ 皮肤管理（独立分区，图片 + 全套参数整套切换）
+        # ⑨ 皮肤管理（独立分区，图片 + 全套参数整套切换）
         skin_box = tk.LabelFrame(frm, text='💾 皮肤管理（图片 + 全套参数，选中即应用）',
                                  font=('Microsoft YaHei', 9), fg='#555', padx=8, pady=4)
         skin_box.pack(fill='x', pady=(2, 0))
@@ -1153,7 +1418,7 @@ class ConfigWizard:
         self.lbl_skin_hint.pack(side='left', padx=6)
         self._refresh_skin_list()
 
-        # ⑨ 按钮
+        # ⑩ 按钮
         row8 = tk.Frame(frm)
         row8.pack(fill='x', pady=6)
         tk.Button(row8, text='保存并启动', command=self._save_and_start,
@@ -1268,6 +1533,7 @@ class ConfigWizard:
         self.cfg.update(cfg)
         self.var_layout.set(cfg.get('layout', 'horizontal_double'))
         self.var_side.set(cfg.get('side', 'right'))
+        self.var_layer.set(cfg.get('layer', 'above'))
         self.var_scale.set(cfg.get('scale', 1.0))
         self.var_offx.set(cfg.get('offset_x', 0))
         self.var_offy.set(cfg.get('offset_y', 0))
@@ -1307,6 +1573,7 @@ class ConfigWizard:
         tcfg = dict(self.cfg)
         tcfg['layout'] = self.var_layout.get()
         tcfg['side'] = self.var_side.get()
+        tcfg['layer'] = self.var_layer.get()
         tcfg['scale'] = round(float(self.var_scale.get()), 2)
         tcfg['offset_x'] = int(self.var_offx.get())
         tcfg['offset_y'] = int(self.var_offy.get())
@@ -1458,12 +1725,48 @@ class ConfigWizard:
                 except Exception:
                     pass
 
-        # 绘制：候选框在下层，图片叠在上层（贴边=中间时叠候选框上，其余贴边在侧面）
-        self._draw_candidate(cv, layout, base_x, base_y, cw, ch, hex_acc)
-        if img is not None:
-            cv.create_image(ix, iy, anchor='nw', image=self.tk_img)
-            cv.create_rectangle(ix, iy, ix + new_w, iy + new_h,
-                                outline='#ff6a00', dash=(4, 2))
+        # 绘制顺序按图层直观表现（v1.5）：
+        #   above            → 候选框在下、图片在上（重叠区图片盖候选框，现状）
+        #   below + 中间重叠 → 图片在下、候选框在上（候选框不透明背景压住图片重叠区）
+        #   below + 侧贴边   → 不重叠不生效，保持置顶语义 = 图片在上（同 above 顺序）
+        layer = self.var_layer.get()
+        below_overlap = (layer == 'below' and side == 'center')
+
+        def _draw_img_layer():
+            if img is not None:
+                cv.create_image(ix, iy, anchor='nw', image=self.tk_img)
+                cv.create_rectangle(ix, iy, ix + new_w, iy + new_h,
+                                    outline='#ff6a00', dash=(4, 2))
+
+        if below_overlap:
+            _draw_img_layer()  # 下层：图片（虚线框被候选框盖住部分自然不可见，更真实）
+            self._draw_candidate(cv, layout, base_x, base_y, cw, ch, hex_acc)  # 上层：候选框压图
+        else:
+            self._draw_candidate(cv, layout, base_x, base_y, cw, ch, hex_acc)
+            _draw_img_layer()
+        # 图层提示行随 图层/贴边 变化刷新
+        self._update_layer_hint()
+
+    def _update_layer_hint(self):
+        """图层提示行：below 选中时提示适用条件（v1.3 教训文案）；
+        当前 贴边≠中间 时额外提示该组合不会生效、将自动保持置顶。"""
+        if not hasattr(self, 'lbl_layer_hint'):
+            return
+        layer = self.var_layer.get()
+        if layer == 'above':
+            self.lbl_layer_hint.config(text='')
+        else:
+            side = self.var_side.get()
+            if side == 'center':
+                self.lbl_layer_hint.config(
+                    text='💡 下方效果仅在 贴边=中间(重叠) 时可见；左/右贴边时自动保持置顶',
+                    fg='#888')
+            else:
+                side_txt = {'left': '左', 'right': '右'}.get(side, side)
+                self.lbl_layer_hint.config(
+                    text=f'⚠ 当前 贴边={side_txt}侧（不与候选框重叠），「下方」不生效，将自动保持置顶；'
+                         f'切到 中间 才可见下方效果',
+                    fg='#e67e22')
 
     def _draw_candidate(self, cv, layout, base_x, base_y, cw, ch, hex_acc):
         """画预览候选框（主体 + 编码行 + 候选文字 + 类型名）。
@@ -1510,6 +1813,7 @@ class ConfigWizard:
     def _save_and_start(self):
         self.cfg['layout'] = self.var_layout.get()
         self.cfg['side'] = self.var_side.get()
+        self.cfg['layer'] = self.var_layer.get()
         self.cfg['scale'] = round(float(self.var_scale.get()), 2)
         self.cfg['offset_x'] = int(self.var_offx.get())
         self.cfg['offset_y'] = int(self.var_offy.get())
@@ -1668,6 +1972,7 @@ class FollowOverlay:
         self.cur_accent = None
         self.img_mtime = None
         self.key_rgb = MAGENTA          # 当前抠色键（动态，随图片变化）
+        self.layer = self.cfg.get('layer', 'above')  # 图层：above=图片置顶 / below=候选框压图（v1.5）
         self.load_char()
 
         self.label = tk.Label(self.root, image=self.img, bg=_key_hex(self.key_rgb), cursor='fleur')
@@ -1687,8 +1992,27 @@ class FollowOverlay:
         self.pinned = False   # 手动固定显示（托盘/快捷键切换，不受候选框有无影响）
         self.root.withdraw()
         self.off_x, self.off_y = 0, 0
-        self.poll_ms = 50
-        self.skin_ms = 2000
+        # ===== 路径 B：事件驱动状态（替代 50ms 全桌轮询）=====
+        self.event_ms = 16        # 事件消费节拍（只读标志位，开销可忽略）
+        self.heartbeat_ms = 200   # 兜底心跳：缓存有效性校验 + 位置脏检查（不做 EnumWindows）
+        self.skin_ms = 2000       # 图片热重载（保持原 2s）
+        self._cached_hwnd = 0     # 候选框句柄缓存（有效 → 定位 O(1) GetWindowRect）
+        self._x, self._y = 0, 0   # 镜像坐标：SetWindowPos/geometry 后的权威窗口位置
+        self._hide_since = None   # 候选框消失起始时刻（None=未消失）；<150ms 复现不 withdraw
+        self._need_rescan = False # 需要低频重扫（缓存被 DESTROY/SHOW 失效后置位）
+        self._last_scan_ts = 0.0  # 上次 EnumWindows 时刻（重扫节流）
+        self._rescan_min = 0.4    # 两次全扫最小间隔（秒），事件驱动下 EnumWindows 仅低频
+        self._pos_dirty = False   # 位置脏标志（收到移动事件后置位）
+        self._below_log_ts = 0.0  # below 保底(候选框非置顶)日志节流时间戳（monotonic）
+        # 事件消费游标：只处理快照之后的新事件（序号递增，永不丢事件）
+        self._last_move_cnt = _EVT_MOVE_CNT
+        self._last_gone_cnt = _EVT_GONE_CNT
+        self._last_show_cnt = _EVT_SHOW_CNT
+        self._last_move_ts = _EVT_MOVE_TS  # 镜像（仅 perf/诊断）
+        self._top_hwnd_cache = None  # 顶层窗口句柄缓存（SetWindowPos 目标）
+        self._n_scans = 0            # EnumWindows 全扫计数（perf/诊断）
+        self._n_heartbeats = 0       # 心跳计数（perf/诊断）
+        set_candidate_hwnd(0)        # 让事件回调忽略旧句柄
         # 系统托盘（方便退出，不用进任务管理器）
         self.tray = TrayIcon(self)
         self.tray.start()
@@ -1733,6 +2057,7 @@ class FollowOverlay:
         else:
             self.img = tk.PhotoImage(file=img_path, master=self.root)
         self.w, self.h = self.img.width(), self.img.height()
+        self.layer = self.cfg.get('layer', 'above')  # 热重载/切皮肤/缩放重载后同步图层配置
 
     # ---------- 多皮肤 ----------
     def apply_skin(self, name):
@@ -1742,11 +2067,9 @@ class FollowOverlay:
             return False
         self.cfg = cfg
         self.load_char()
-        try:
-            x, y = self.root.winfo_x(), self.root.winfo_y()
-            self.root.geometry(f'{self.w}x{self.h}+{x}+{y}')
-        except Exception:
-            pass
+        self._sync_tk_geometry()  # 尺寸变化：低频 geometry 同步镜像坐标（与 SetWindowPos 镜像一致）
+        # 图层同步：切皮肤后候选框在场 → 重插层级（layer/side 可能已随皮肤变化）
+        self._sync_layer_with_candidate()
         # S1 修复：切换后持久化，重启仍用当前皮肤
         try:
             save_config(self.cfg)
@@ -1792,7 +2115,9 @@ class FollowOverlay:
                 try:
                     self.load_char()
                     self.label.configure(image=self.img)
-                    self.root.geometry(f'{self.w}x{self.h}+{self.root.winfo_x()}+{self.root.winfo_y()}')
+                    self._sync_tk_geometry()  # 热重载尺寸变化：低频 geometry 同步镜像
+                    # 热重载后候选框在场 → 补一次图层同步（图片尺寸变化可能影响叠放观感）
+                    self._sync_layer_with_candidate()
                 except Exception as e:
                     # 图片被删/损坏时不能崩主线程（B2 修复）：记录日志后继续轮询
                     try:
@@ -1802,10 +2127,16 @@ class FollowOverlay:
         self.root.after(self.skin_ms, self.check_skin)
 
     def on_press(self, e):
-        self._dx, self._dy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
+        # 基准用镜像坐标（SetWindowPos 直移后 Tk 的 winfo_x/y 可能过时）
+        self._dx, self._dy = e.x_root - self._x, e.y_root - self._y
 
     def on_drag(self, e):
-        self.root.geometry(f'+{e.x_root - self._dx}+{e.y_root - self._dy}')
+        # 拖拽低频 → 仍用 geometry 移动，但同步镜像，避免与事件定位两套坐标打架
+        nx, ny = e.x_root - self._dx, e.y_root - self._dy
+        self.root.geometry(f'+{nx}+{ny}')
+        self._x, self._y = nx, ny
+        # 手动拖拽后候选框在场 → 同步图层（below 时保持候选框压图，避免拖完层级漂移）
+        self._sync_layer_with_candidate()
 
     def on_wheel(self, e):
         """滚轮缩放：修改缩放因子后重走加载管线。
@@ -1823,7 +2154,7 @@ class FollowOverlay:
         try:
             self.load_char()
             self.label.configure(image=self.img)
-            self.root.geometry(f'{self.w}x{self.h}+{self.root.winfo_x()}+{self.root.winfo_y()}')
+            self._sync_tk_geometry()  # 缩放后尺寸变化：低频 geometry 同步镜像
         except Exception:
             pass
 
@@ -1832,14 +2163,16 @@ class FollowOverlay:
 
     def toggle(self):
         """手动切换显示/隐藏（托盘菜单 / Ctrl+Alt+C）。
-        手动显示后 pinned=True，poll 不再因无候选框自动隐藏；再次切换恢复自动模式。
+        手动显示后 pinned=True，不再因无候选框自动隐藏；再次切换恢复自动模式。
         """
         self.pinned = not self.pinned
         if self.pinned:
             self.root.deiconify()
             self.visible = True
             try:
-                self._position_once()  # S4：立即重定位到候选框，不等下一拍轮询
+                # S4 语义保持：手动显示立即定位（允许低频重扫找候选框）
+                self._hide_since = None
+                self._position_once(allow_scan=True)
             except Exception:
                 pass
         else:
@@ -1872,61 +2205,395 @@ class FollowOverlay:
         except Exception:
             pass
 
-    def _position_once(self):
-        """单次定位逻辑（poll 每 50ms 调用；toggle 手动显示时触发一次）"""
-        try:
-            win = find_candidate_window(self.cfg.get('layout', 'horizontal_double'))
-            if win:
-                hwnd, rect = win
-                cw, ch = rect.right - rect.left, rect.bottom - rect.top
-                side = self.cfg.get('side', 'right')
-                gap = 8
-                if side == 'left':
-                    x = rect.left - self.w - gap + self.off_x + self.cfg.get('offset_x', 0)
-                elif side == 'right':
-                    x = rect.right + gap + self.off_x + self.cfg.get('offset_x', 0)
-                else:  # center：水平居中于候选框（配合图层叠放）
-                    x = rect.left + (cw - self.w) // 2 + self.off_x + self.cfg.get('offset_x', 0)
-                y = rect.top + (ch - self.h) // 2 + self.off_y + self.cfg.get('offset_y', 0)
-                self.root.geometry(f'+{x}+{y}')
-                self._keep_topmost()
-                if not self.visible:
-                    self.root.deiconify()
-                    self.visible = True
-            else:
-                # 无候选框：仅在非手动固定（pinned）时自动隐藏
-                if not self.pinned and self.visible:
-                    self.root.withdraw()
-                    self.visible = False
-        except Exception:
-            pass
-
-    def _keep_topmost(self):
-        """保持置顶：图片窗每拍压回 topmost 组顶部。
-
-        候选框（TSF）偶发自带 WS_EX_TOPMOST 或抢占 z-order 时会把图片窗压到下面
-        （表现为「图片偶发跑到候选框下」）；无条件 SetWindowPos(HWND_TOPMOST)
-        保证图片窗始终在 topmost 组最上层。SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE
-        不动位置尺寸、不重绘，无闪烁。
-        """
+    # ---------- 路径 B：事件驱动定位（替代 50ms 全桌轮询）----------
+    def _top_hwnd(self):
+        """取 Tk 窗口的真实顶层 HWND（SetWindowPos 目标）。
+        winfo_id 返回的是 TkChild 子窗口句柄，SetWindowPos 必须作用在真正的
+        顶层 TkTopLevel 上（否则只移动子窗口、父窗不动，层级插序失效）。
+        沿 GetParent 链向上取到 parent=0 的窗口即顶层；窗口未 map（withdraw）
+        时 GetParent 可能返回 0 → 退回 winfo_id（此时不可见，无碍）。
+        缓存仅保存「非 winfo_id 的真实顶层」，避免把子窗口句柄缓存死。"""
         try:
             my = self.root.winfo_id()
-            top = user32.GetAncestor(my, 2)  # GA_ROOT 顶层窗口
-            if not top:
-                top = my
-            # HWND_TOPMOST(-1) + SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE
-            user32.SetWindowPos(top, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
+            if not my:
+                return self._top_hwnd_cache or None
+            if (self._top_hwnd_cache and self._top_hwnd_cache != my
+                    and user32.IsWindow(self._top_hwnd_cache)):
+                return self._top_hwnd_cache
+            top = my
+            while True:
+                p = user32.GetParent(top)
+                if not p:
+                    break
+                top = p
+            if top != my:
+                self._top_hwnd_cache = top
+            return top
+        except Exception:
+            return self._top_hwnd_cache or None
+
+    def _sync_tk_geometry(self):
+        """低频（尺寸变化/手动交互后）把镜像坐标同步回 Tk：
+        SetWindowPos 直移后 Tk 内部 winfo_x/y 可能过时，凡 w/h 变化
+        （切皮肤/滚轮缩放/热重载）都必须用一次 geometry 校正，否则 Tk
+        下次布局/update 会把窗口拉回旧位置，与事件定位打架。
+        geometry 仅在此类低频路径使用；高频跟随一律 SetWindowPos。"""
+        try:
+            self.root.geometry(f'{self.w}x{self.h}+{int(self._x)}+{int(self._y)}')
         except Exception:
             pass
 
-    def poll(self):
+    def _cached_hwnd_ok(self):
+        """缓存句柄仍有效：窗口存在且可见（O(1)，无枚举）。"""
+        try:
+            return bool(self._cached_hwnd) and bool(user32.IsWindow(self._cached_hwnd)) \
+                and bool(user32.IsWindowVisible(self._cached_hwnd))
+        except Exception:
+            return False
+
+    def _calc_target(self, rect):
+        """候选框 rect → 贴边目标 (x, y)（逻辑与改造前一致，含用户微调偏移）。"""
+        cw, ch = rect.right - rect.left, rect.bottom - rect.top
+        side = self.cfg.get('side', 'right')
+        gap = 8
+        if side == 'left':
+            x = rect.left - self.w - gap + self.off_x + self.cfg.get('offset_x', 0)
+        elif side == 'right':
+            x = rect.right + gap + self.off_x + self.cfg.get('offset_x', 0)
+        else:  # center：水平居中于候选框（配合图层叠放）
+            x = rect.left + (cw - self.w) // 2 + self.off_x + self.cfg.get('offset_x', 0)
+        y = rect.top + (ch - self.h) // 2 + self.off_y + self.cfg.get('offset_y', 0)
+        return int(x), int(y)
+
+    def _move_to(self, x, y):
+        """主定位路径：SetWindowPos 一次完成「移动 + HWND_TOPMOST」，
+        顺带 SWP_NOACTIVATE。窗口显示/隐藏统一由 deiconify/withdraw 管理
+        （避免 Tk withdraw 状态与 SWP_SHOWWINDOW 状态机打架）。
+        维护 _x/_y 镜像（Tk 的 winfo 在此之后可能过时，以镜像为准）。"""
+        top = self._top_hwnd()
+        if not top:
+            return False
+        try:
+            ok = user32.SetWindowPos(top, HWND_TOPMOST, int(x), int(y), 0, 0,
+                                     SWP_NOACTIVATE | SWP_NOSIZE)
+        except Exception:
+            return False
+        if ok:
+            self._x, self._y = int(x), int(y)
+        return bool(ok)
+
+    def _read_cached_rect(self):
+        """O(1) 读取缓存候选框的矩形；失败返回 None。"""
+        try:
+            if not self._cached_hwnd:
+                return None
+            rect = wintypes.RECT()
+            if user32.GetWindowRect(self._cached_hwnd, ctypes.byref(rect)):
+                return rect
+        except Exception:
+            pass
+        return None
+
+    def _position_once(self, allow_scan=False):
+        """事件驱动单次定位：
+        · 缓存句柄有效 → 只 GetWindowRect(缓存) O(1) → 死区判断 → SetWindowPos；
+        · 缓存失效 → 仅当 allow_scan/需要时低频全扫重建缓存。
+        返回 True=已贴到候选框 / False=当前无可用候选框。"""
+        try:
+            if self._cached_hwnd_ok():
+                rect = self._read_cached_rect()
+                if rect is not None:
+                    cw = rect.right - rect.left
+                    ch = rect.bottom - rect.top
+                    if cw > 0 and ch > 0 and ch < cw * 4 and cw < 1300 and ch < 1000:
+                        x, y = self._calc_target(rect)
+                        # 死区：窗口已显示且位置变化 <2px 不移动（省一次系统调用与重绘）
+                        if self.visible and abs(x - self._x) < 2 and abs(y - self._y) < 2:
+                            self._apply_layer(self._cached_hwnd)  # 成功定位后同步图层（事件驱动，频率低）
+                            return True
+                        moved = self._move_to(x, y)
+                        self._pos_dirty = False
+                        if not self.visible:
+                            self.root.deiconify()
+                            self.visible = True
+                        if PERF_LOG_ENABLED and moved:
+                            _perf_log(f'  ├ SetWindowPos -> ({x},{y})')
+                        self._apply_layer(self._cached_hwnd)  # 移动/首显后同步图层（above=无操作）
+                        return True
+                    # 矩形异常（非候选框尺寸）→ 缓存失效
+                    self._cached_hwnd = 0
+                    set_candidate_hwnd(0)
+                else:
+                    self._cached_hwnd = 0
+                    set_candidate_hwnd(0)
+            # 缓存失效：低频兜底重扫（受 _rescan_min 节流，不随 tick 全扫）
+            if allow_scan and time.time() - self._last_scan_ts >= self._rescan_min:
+                return self._rescan_candidate()
+            return False
+        except Exception as e:
+            try:
+                _write_log(f'[_position_once] 定位异常: {e}')
+            except Exception:
+                pass
+            return False
+
+    def _try_attach_show_hwnd(self, hwnd):
+        """SHOW 事件候选句柄直挂（免全扫）：校验可见 + TSF 样式 + 尺寸合理后缓存并定位。"""
+        try:
+            if not hwnd or not user32.IsWindowVisible(hwnd):
+                return False
+            if not _is_tsf_candidate_style(hwnd) and not _window_belongs_to_weasel(hwnd):
+                return False
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return False
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            if not (0 < w < 1300 and 0 < h < 1000 and h < w * 4):
+                return False
+            self._cached_hwnd = hwnd
+            set_candidate_hwnd(hwnd)
+            self._hide_since = None
+            self._pos_dirty = True
+            self._position_once()
+            # SHOW 直挂后补一次图层插序：候选框重建自愈（v1.4 相对 v1.2 的关键优势）
+            if self.visible:
+                self._apply_layer(hwnd)
+            return True
+        except Exception:
+            return False
+
+    def _rescan_candidate(self):
+        """低频兜底全扫：find_candidate_window + 命中即缓存并定位。返回是否命中。"""
+        now = time.time()
+        if now - self._last_scan_ts < self._rescan_min:
+            return False
+        self._last_scan_ts = now
+        self._n_scans += 1
+        if PERF_LOG_ENABLED:
+            _perf_log(f'EnumWindows scan #{self._n_scans}')
+        try:
+            win = find_candidate_window(self.cfg.get('layout', 'horizontal_double'))
+        except Exception as e:
+            try:
+                _write_log(f'[_rescan_candidate] 扫描异常: {e}')
+            except Exception:
+                pass
+            return False
+        if not win:
+            return False
+        hwnd, _rect = win
+        if hwnd != self._cached_hwnd:
+            self._cached_hwnd = hwnd
+            set_candidate_hwnd(hwnd)
+        self._hide_since = None
+        self._need_rescan = False
         self._position_once()
-        self.root.after(self.poll_ms, self.poll)
+        return True
+
+    # ---------- 图层（v1.5：自 v1.2 恢复，事件驱动下候选框重建可自愈）----------
+    def _apply_layer(self, cand_hwnd):
+        """图层层级（事件驱动调用，频率低，不再每拍无条件执行）：
+        above：移动路径已自带 HWND_TOPMOST = 天然在候选框上方，不做任何额外动作；
+        below：仅在 贴边=中间（图片与候选框重叠）时有意义（v1.3 教训）：
+          - 候选框是置顶(WS_EX_TOPMOST) → 把图片窗插到其正下方（已紧贴则不重插）；
+          - 候选框非置顶 → below 不可用，保持图片窗 topmost 保底可见（节流记日志）。
+        左/右贴边（与候选框不重叠）时执行任何插序都是纯副作用 → 保持 topmost。"""
+        try:
+            if self.layer != 'below':
+                return  # above：回归 v1.4，无任何额外 z-order 操作
+            if self.cfg.get('side', 'right') != 'center':
+                return  # 侧贴边不重叠：below 无意义，保持 topmost
+            if not cand_hwnd or not self.visible:
+                return
+            top = self._top_hwnd()
+            if not top:
+                return
+            # 探测候选框是否置顶（GWL_EXSTYLE & WS_EX_TOPMOST）
+            ex = user32.GetWindowLongPtrW(cand_hwnd, GWL_EXSTYLE)
+            if not (ex & WS_EX_TOPMOST):
+                # 候选框非置顶：插序无法稳定生效且会让图片被活动窗口盖住 → 保底置顶
+                self._log_below_unavailable(cand_hwnd)
+                return
+            # 已紧贴候选框正下方（图片窗上方第一窗 == 候选框）→ 无需重复插序
+            if user32.GetWindow(top, GW_HWNDPREV) == cand_hwnd:
+                return
+            user32.SetWindowPos(top, cand_hwnd, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        except Exception:
+            pass
+
+    def _log_below_unavailable(self, cand_hwnd):
+        """节流日志：below+center 但候选框非置顶 → below 不可用，保持置顶。
+        事件驱动下定位调用较频繁，同一状态 5s 内最多记一条，避免刷屏 error.log。"""
+        try:
+            now = time.monotonic()
+            if now - self._below_log_ts < 5.0:
+                return
+            self._below_log_ts = now
+            _write_log(f'[layer] below 不可用：候选框(0x{cand_hwnd:X})非置顶，'
+                       f'保持图片窗 topmost 保底可见')
+        except Exception:
+            pass
+
+    def _sync_layer_with_candidate(self):
+        """切皮肤/手动拖拽/热重载后的图层补同步：候选框在场且图片可见才重插层级。"""
+        try:
+            if self.visible and self._cached_hwnd_ok():
+                self._apply_layer(self._cached_hwnd)
+        except Exception:
+            pass
+
+    def _ensure_topmost_if_needed(self):
+        """低频 z-order 兜底（心跳调用，不做任何枚举）：
+        · layer=above 或 侧贴边：维持 v1.4 语义 —— 仅当被候选框压住
+          （GetWindow 向上找 24 层内出现缓存句柄）才补一次 HWND_TOPMOST；
+        · layer=below 且 贴边=中间：改检「图片窗是否仍紧贴候选框正下方」，
+          漂了才由 _apply_layer 重插，绝不补 topmost（否则破坏 below 插序）。"""
+        try:
+            if not self._cached_hwnd or not self.visible:
+                return
+            top = self._top_hwnd()
+            if not top:
+                return
+            if self.layer == 'below' and self.cfg.get('side', 'right') == 'center':
+                # below+center：只维护「紧贴候选框下方」，不把图片拉回 topmost
+                self._apply_layer(self._cached_hwnd)
+                return
+            w = user32.GetWindow(top, GW_HWNDPREV)  # 向 z-order 上方走
+            steps = 0
+            while w and steps < 24:
+                if w == self._cached_hwnd:
+                    user32.SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0,
+                                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                    return
+                w = user32.GetWindow(w, GW_HWNDPREV)
+                steps += 1
+        except Exception:
+            pass
+
+    def _hide_if_gone(self, now):
+        """候选框消失去抖：_hide_since 起 150ms 内复现则不 withdraw（防闪烁）；
+        超阈值且非 pinned 才隐藏。"""
+        if self._hide_since is None or self.pinned or not self.visible:
+            return
+        if now - self._hide_since >= 0.150:
+            self.root.withdraw()
+            self.visible = False
+            self._hide_since = None
+            if PERF_LOG_ENABLED:
+                _perf_log('hide (gone>150ms)')
+
+    def _event_tick(self):
+        """事件消费节拍（~16ms）：读取线程安全序号，仅在有新事件时做事。"""
+        try:
+            now = time.time()
+            # 1) 候选框销毁/隐藏事件 → 清缓存 + 去抖计时（重建由 SHOW/心跳自愈）
+            if _EVT_GONE_CNT > self._last_gone_cnt:
+                self._last_gone_cnt = _EVT_GONE_CNT
+                if self._cached_hwnd:
+                    if PERF_LOG_ENABLED:
+                        _perf_log(f'GONE hwnd=0x{self._cached_hwnd:X}')
+                    self._cached_hwnd = 0
+                    set_candidate_hwnd(0)
+                if self.visible and not self.pinned:
+                    self._hide_since = now
+                self._need_rescan = True
+            # 2) 候选框移动事件 → 立即定位（无延迟）
+            if _EVT_MOVE_CNT > self._last_move_cnt:
+                self._last_move_cnt = _EVT_MOVE_CNT
+                self._last_move_ts = _EVT_MOVE_TS
+                if self._cached_hwnd_ok():
+                    if PERF_LOG_ENABLED:
+                        _perf_log(f'MOVE hwnd=0x{self._cached_hwnd:X}')
+                    t_lat = _EVT_MOVE_TS
+                    self._position_once()
+                    if PERF_LOG_ENABLED:
+                        # 事件到达 → 定位完成 的端到端延迟（含本 tick 调度等待）
+                        _perf_log(f'  ├ follow latency {(time.monotonic() - t_lat) * 1000:.1f} ms')
+            # 3) SHOW 事件 → 无缓存时优先直挂候选句柄，失败再低频全扫
+            if _EVT_SHOW_CNT > self._last_show_cnt:
+                self._last_show_cnt = _EVT_SHOW_CNT
+                if not self._cached_hwnd:
+                    if _EVT_SHOW_HWND and self._try_attach_show_hwnd(_EVT_SHOW_HWND):
+                        self._hide_since = None
+                    else:
+                        self._need_rescan = True
+            # 4) 需要重扫（缓存曾失效）→ 低频全扫自愈（受节流）
+            if self._need_rescan and not self._cached_hwnd:
+                self._rescan_candidate()
+            # 5) 消失去抖隐藏（150ms 复现保护）
+            self._hide_if_gone(now)
+        except Exception as e:
+            try:
+                _write_log(f'[_event_tick] 异常: {e}')
+            except Exception:
+                pass
+        try:
+            self.root.after(self.event_ms, self._event_tick)
+        except Exception:
+            pass  # root 已销毁（open_wizard 重建场景），停止节拍
+
+    def _heartbeat(self):
+        """200ms 兜底心跳：只做轻量校验，不做 EnumWindows——
+        · 缓存有效性（IsWindow/IsWindowVisible O(1)）；失效→标记重扫（交给低频全扫）
+        · 缓存有效但位置脏 → 只用缓存 rect 补一次定位（事件丢失兜底）
+        · 极低频 z-order 兜底置顶
+        例外：事件钩子安装失败时（SetWinEventHook 不可用）退化本模式 ——
+        心跳充当低频全扫（受 _rescan_min 节流），保证「已有功能不坏」。"""
+        try:
+            now = time.time()
+            self._n_heartbeats += 1
+            if not event_hook_alive():
+                # 退化：事件驱动不可用 → 心跳低频全扫定位（≈0.4s 一次，CPU 可接受）
+                if self._cached_hwnd and not self._cached_hwnd_ok():
+                    self._cached_hwnd = 0
+                    set_candidate_hwnd(0)
+                self._rescan_candidate()
+                self._hide_if_gone(now)
+                return
+            if self._cached_hwnd and not self._cached_hwnd_ok():
+                if PERF_LOG_ENABLED:
+                    _perf_log(f'heartbeat: cache 失效 0x{self._cached_hwnd:X}')
+                self._cached_hwnd = 0
+                set_candidate_hwnd(0)
+                self._need_rescan = True
+                if self.visible and not self.pinned:
+                    self._hide_since = now
+            if self._cached_hwnd_ok():
+                if self._pos_dirty:
+                    self._position_once()
+                    self._pos_dirty = False
+                self._ensure_topmost_if_needed()
+            elif self._need_rescan:
+                # 兜底：心跳允许在「缓存失效待重扫」时低频触发全扫（受节流）
+                self._rescan_candidate()
+            self._hide_if_gone(now)
+        except Exception as e:
+            try:
+                _write_log(f'[_heartbeat] 异常: {e}')
+            except Exception:
+                pass
+        try:
+            self.root.after(self.heartbeat_ms, self._heartbeat)
+        except Exception:
+            pass  # root 已销毁，停止心跳
 
     def run(self):
-        self.root.after(self.poll_ms, self.poll)
+        """启动事件守护线程 + 三个定时循环：事件 tick（16ms）/ 心跳（200ms）/
+        皮肤热重载（2s，保持）。mainloop 结束（退出/重建）时清理事件线程。"""
+        _ensure_event_thread()
+        # 启动先做一次定位：候选框可能已在屏幕上（事件线程就绪前的窗口不丢）
+        try:
+            self._rescan_candidate()
+        except Exception:
+            pass
+        self.root.after(self.event_ms, self._event_tick)
+        self.root.after(self.heartbeat_ms, self._heartbeat)
         self.root.after(self.skin_ms, self.check_skin)
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            _release_event_thread()
 
 # ============ 入口 ============
 def _write_log(msg):
