@@ -25,7 +25,7 @@ Image.open → RGBA → 等比缩放(base_height×scale) → 品红合成抠色(
 - 每帧走现有品红管线 → 预生成 PhotoImage 帧列表 → `after(帧间隔)` 循环换帧
 - 滚轮缩放：对帧列表批量 zoom/subsample，逻辑不变
 - `_photo_refs` 防 GC 机制已有；mtime 热重载天然支持换动图
-- 改动量：~150 行
+- 改动量：约 150 行
 
 **方案 B（保护措施，与 A 一起做）**：
 - 帧 > 100：`img.seek(i)` 按需解码当前帧 + 预解下两帧（防 500×800 RGBA 200 帧 = 320MB 内存爆炸）
