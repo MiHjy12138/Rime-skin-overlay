@@ -21,6 +21,12 @@ B_test_layer_sim.py —— v1.5 图层(below/above)功能验证（模拟窗口�
 import sys, os, time, ctypes
 import ctypes.wintypes as wintypes
 
+# GBK 控制台兼容：断言详情含 emoji，直接 print 会 UnicodeEncodeError（2026-09-06 修）
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(BASE, 'rime_char_overlay.py')
 

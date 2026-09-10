@@ -24,6 +24,10 @@ overlay.log
 error.log
 config.json
 
+# 备份 / 诊断残留（本地留档，不入库）
+*.bak-*
+diag_misdetect.log
+
 # PyInstaller 产物
 build/
 dist/
@@ -34,3 +38,10 @@ release/
 
 # 用户皮肤档案（不随仓库分发）
 skins/
+# 备用打包目录 / 原型 / 预处理临时产物
+build_v16b/
+dist_v16b/
+build_*/
+dist_*/
+spike_*.py
+preprocessed_*.png

@@ -4,7 +4,7 @@ rime_char_overlay.py —— Rime 皮肤外挂 v0.7
 让小狼毫 (Rime/Weasel) 输入时，候选框旁边跟随显示图片。
 
 v0.7 配置向导（所见即所得）：
-  ① 选择图片（png/jpg/webp/gif/bmp）
+  ① 选择图片（png/jpg/webp/gif/bmp，GIF/动图WebP/APNG 支持动图播放）
   ② 预览区实时显示「候选框 + 图片」组合样式（按候选框类型变化）
   ③ 可一键「读取当前 Rime 候选框配置」自动识别布局类型
   ④ 候选框类型：单行横排 / 双行横排 / 竖排
@@ -22,12 +22,12 @@ v0.7 配置向导（所见即所得）：
 用法:
   双击 exe / python rime_char_overlay.py   → 有配置直接跑，无配置弹向导
   RimeSkinOverlay.exe 图片.png right        → 命令行模式（兼容）
-  RimeSkinOverlay.exe --install/--uninstall → 自启管理
+  RimeSkinOverlay.exe --install/--uninstall → 自启管理（CLI；也可在向导勾选/托盘开关）
 
 依赖: 主程序仅 Python 标准库；预览/光环需 Pillow（可选）
 快捷键: Ctrl+Alt+C 隐藏/显示 | Ctrl+Alt+Q 退出 | 拖动微调 | 滚轮缩放 | 右键菜单
 """
-import sys, os, json, time, threading, re, queue
+import sys, os, json, time, threading, re, queue, collections
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, simpledialog
 import ctypes
@@ -67,27 +67,122 @@ def _warn_already_running():
     except Exception:
         pass
 
-def _kill_existing():
-    """杀掉所有已运行的 RimeSkinOverlay 实例（排除当前进程）"""
-    import subprocess
-    my_pid = os.getpid()
-    killed = 0
+def _enum_other_instance_windows(my_pid, exe_name='rimeskinoverlay.exe'):
+    """枚举顶层窗口，返回属于「同名 exe 的其他进程」的 (hwnd, pid) 列表（S8）。
+
+    纯 ctypes 实现（GetWindowThreadProcessId + OpenProcess/QueryFullProcessImageNameW），
+    不 spawn powershell —— 这是 WM_CLOSE 精确投递的目标来源。
+    """
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _cb(hwnd, _lparam):
+        try:
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if not pid.value or pid.value == my_pid or pid.value in (0, 4):
+                return True
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+            if not h:
+                return True
+            try:
+                buf = ctypes.create_unicode_buffer(32768)
+                size = wintypes.DWORD(len(buf))
+                if (k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+                        and os.path.basename(buf.value).lower() == exe_name):
+                    found.append((int(hwnd), int(pid.value)))
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            pass
+        return True
+
     try:
-        out = subprocess.run(
-            ['powershell', '-NoProfile', '-Command',
-             f"Get-CimInstance Win32_Process -Filter \"Name='RimeSkinOverlay.exe'\" | "
-             f"Where-Object {{ $_.ProcessId -ne {my_pid} }} | "
-             f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; $_.ProcessId }}"],
-            capture_output=True, text=True, timeout=15)
-        if out.stdout and out.stdout.strip():
-            killed = len([x for x in out.stdout.strip().split() if x.isdigit()])
+        u32.EnumWindows(_cb, 0)
     except Exception:
         pass
-    return killed
+    return found
+
+
+def _pid_alive(pid):
+    """进程是否真在运行（GetExitCodeProcess == STILL_ACTIVE）。
+
+    只用 OpenProcess 判句柄是不够的：已退出但句柄未释放的进程（我们持有
+    Popen 句柄时）OpenProcess 仍会成功。用退出码区分，等待循环才不会被
+    "僵尸"拖满 timeout。"""
+    STILL_ACTIVE = 259
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, int(pid))
+        if not h:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return True
+
+
+def _terminate_pid(pid):
+    """强杀兜底：TerminateProcess（纯 ctypes，比 powershell 强杀快得多）"""
+    try:
+        h = ctypes.windll.kernel32.OpenProcess(0x0001, False, int(pid))  # PROCESS_TERMINATE
+        if not h:
+            return False
+        try:
+            ctypes.windll.kernel32.TerminateProcess(h, 1)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+        return True
+    except Exception:
+        return False
+
+
+def _kill_existing(timeout=3.0):
+    """关掉已运行的旧实例（排除当前进程）：先 WM_CLOSE 请它自己退，超时才强杀（S8）。
+
+    历史：powershell Get-CimInstance + Stop-Process 强杀，实测 5-15s 且进程被硬切。
+    现在：
+      1) 纯 ctypes 枚举同名进程的顶层窗口（顺带拿到 pid）；
+      2) 每个窗口 PostMessage(WM_CLOSE)：新版本注册了 WM_DELETE_WINDOW 协议，
+         Tk 收到后正常走 mainloop 退出 + 释放 WinEventHook 线程 / 托盘图标；
+         （旧版本没注册协议：窗口会被销毁但进程可能残留 → 第 3 步兜底）
+      3) 等 timeout 秒，仍存活的 pid 用 TerminateProcess 强杀，
+         保证「旧实例一定会被换掉」的既有语义不变。
+    返回：本次处理的目标进程数（0 = 没有别的实例）。
+    """
+    my_pid = os.getpid()
+    targets = _enum_other_instance_windows(my_pid)
+    if not targets:
+        return 0
+    pids = sorted({pid for _hwnd, pid in targets})
+    u32 = ctypes.windll.user32
+    WM_CLOSE = 0x0010
+    for hwnd, _pid in targets:
+        try:
+            u32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        if not any(_pid_alive(p) for p in pids):
+            break
+        time.sleep(0.15)
+    for p in pids:
+        if _pid_alive(p):
+            _terminate_pid(p)
+    return len(pids)
 
 # ============ 自启管理 ============
 APP_NAME = 'RimeSkinOverlay'
-VERSION = 'v1.5'
+VERSION = 'v1.6'
 
 def _exe_dir():
     if getattr(sys, 'frozen', False):
@@ -130,30 +225,50 @@ def _startup_lnk():
                         r'Microsoft\Windows\Start Menu\Programs\Startup',
                         f'{APP_NAME}.lnk')
 
-def install_autostart():
+
+def _autostart_target():
+    """自启目标三元组 (target, arguments, workdir)。
+
+    exe 版：直接用自己；源码版：用同目录 pythonw.exe（无控制台窗口）+ 脚本路径，
+    这样开发时也能试自启（旧版直接拒绝源码模式，只支持 exe）。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.abspath(sys.executable), '--tray', HERE
+    script = os.path.abspath(__file__)
+    pyw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+    exe = pyw if os.path.exists(pyw) else sys.executable
+    return exe, f'"{script}" --tray', HERE
+
+
+def autostart_installed():
+    """启动文件夹里是否存在本程序的自启快捷方式（GUI/托盘勾选态的唯一真相）"""
+    return os.path.exists(_startup_lnk())
+
+
+def install_autostart(quiet=False):
     import subprocess, tempfile
-    exe = sys.argv[0]
-    if not exe.lower().endswith('.exe'):
-        print('自启仅支持 exe 版（请使用 RimeSkinOverlay.exe --install）')
-        return 1
+    target, args, wd = _autostart_target()
     lnk = _startup_lnk()
     vbs = os.path.join(tempfile.gettempdir(), '_skov_mklnk.vbs')
     with open(vbs, 'w', encoding='gbk') as f:
         f.write(
             'Set ws = CreateObject("WScript.Shell")\n'
             f'Set sc = ws.CreateShortcut("{lnk}")\n'
-            f'sc.TargetPath = "{exe}"\n'
-            'sc.WorkingDirectory = "' + HERE + '"\n'
+            f'sc.TargetPath = "{target}"\n'
+            f'sc.Arguments = "{args}"\n'
+            f'sc.WorkingDirectory = "{wd}"\n'
             'sc.WindowStyle = 7\n'
             'sc.Description = "Rime Skin Overlay"\n'
             'sc.Save()\n'
         )
     try:
         subprocess.run(['cscript', '//nologo', vbs], check=True, timeout=15)
-        print(f'已安装开机自启: {lnk}')
+        if not quiet:
+            print(f'已安装开机自启: {lnk}')
         return 0
     except Exception as e:
-        print(f'安装自启失败: {e}')
+        if not quiet:
+            print(f'安装自启失败: {e}')
         return 1
     finally:
         try:
@@ -161,14 +276,43 @@ def install_autostart():
         except OSError:
             pass
 
-def uninstall_autostart():
+
+def uninstall_autostart(quiet=False):
     lnk = _startup_lnk()
     if os.path.exists(lnk):
-        os.remove(lnk)
-        print(f'已移除开机自启: {lnk}')
-    else:
+        try:
+            os.remove(lnk)
+        except OSError as e:
+            if not quiet:
+                print(f'移除自启失败: {e}')
+            return 1
+        if not quiet:
+            print(f'已移除开机自启: {lnk}')
+        return 0
+    if not quiet:
         print('未找到自启项（可能未安装）')
     return 0
+
+
+def set_autostart(enabled, quiet=True, force=False):
+    """GUI/托盘用开关（幂等）：返回 (ok, msg)。只动启动文件夹快捷方式，
+    不碰 config.json（配置写入由调用方负责，避免半截配置覆盖）。
+    """
+    try:
+        cur = autostart_installed()
+        if enabled and ((not cur) or force):
+            ok = install_autostart(quiet=quiet) == 0
+        elif (not enabled) and cur:
+            ok = uninstall_autostart(quiet=quiet) == 0
+        else:
+            ok = True
+        _write_log(f'[自启] {"开启" if enabled else "关闭"} ok={ok} '
+                   f'（已装={cur} force={force}）')
+    except Exception as e:
+        return False, f'操作异常: {e}'
+    if not ok:
+        return False, '操作失败（启动文件夹可能被安全软件拦截，可手动检查）'
+    return True, ('已开启开机自启' if enabled else '已关闭开机自启')
 
 if '--install' in sys.argv:
     sys.exit(install_autostart())
@@ -185,6 +329,15 @@ DEFAULT_CONFIG = {
     'offset_x': 0,     # 水平微调
     'offset_y': 0,     # 垂直微调
     'base_height': 300,
+    'autostart': False,  # 开机自启意图（真相为启动文件夹快捷方式是否存在，见 autostart_installed）
+    'flip_h': False,     # 水平翻转（显示期，不修改图片文件；动图同样生效）
+    # 显示期特效（只影响外挂显示，不改图片文件本身；皮肤档案一并保存）
+    'corner_enabled': False,   # 圆角
+    'corner_radius': 24,       # 圆角半径（px，按缩放后的显示尺寸）
+    'blur_enabled': False,     # 整体模糊（高斯，作用于整张图）
+    'blur_radius': 6,          # 模糊半径（px，0~30）
+    'feather_enabled': False,  # 点阵羽化（边缘 alpha 用有序抖动近似成渐变）
+    'feather_radius': 24,      # 羽化带宽（px，0~80）
 }
 
 def load_config():
@@ -395,6 +548,8 @@ def pick_key_color(images, Image=None, preferred=MAGENTA):
             cnt = None
         if cnt:
             for _n, c in cnt:
+                if len(c) > 3 and c[3] < 128:
+                    continue   # 全透明像素的 RGB 不参与统计（最终会被键色覆盖）
                 colors.add(c[:3])
         else:
             # 异常兜底：逐像素采样
@@ -446,6 +601,116 @@ def _flatten_alpha_for_tk(img_rgba, Image=None, key=MAGENTA):
     key_img = Image.new('RGB', img_rgba.size, key)
     out = Image.composite(rgb, key_img, alpha)
     return out.convert('RGBA')  # alpha 全 255，无半透明
+
+
+# ============ 动图支持（v1.6）============
+ANIM_CACHE_MAX = 6          # LRU 帧缓存上限（张 PhotoImage），足够顺序播放 + 预取
+ANIM_KEY_SAMPLE = 48        # 统计抠色键色的最大采样帧数（帧多时均匀采样，含首帧）
+ANIM_PREPROCESS_MAX = 300   # 预处理动图最多处理的帧数（超了均匀采样，防一次处理几千帧卡死）
+ANIM_HIDDEN_POLL_MS = 200   # 窗口隐藏时动画暂停，仅按此间隔探活（最大 CPU 省钱点）
+ANIM_MIN_MS, ANIM_MAX_MS = 20, 1000   # 单帧时长钳位（防异常 duration 把 UI 抳死）
+
+
+def _sample_frame_indices(n, limit):
+    """均匀采样帧号（含首帧、末帧）：n<=limit 时全取（不丢帧）。"""
+    n = int(n)
+    if n <= 1:
+        return [0]
+    if n <= limit:
+        return list(range(n))
+    step = n / float(limit)
+    idx = sorted({int(i * step) for i in range(limit)} | {0, n - 1})
+    return idx
+
+
+def _frame_duration(img, default=100):
+    """当前帧时长(ms)：GIF/WebP 在 img.info['duration']（需先 seek 到该帧），
+    钳到 [ANIM_MIN_MS, ANIM_MAX_MS]，缺失/异常回退 default。"""
+    try:
+        d = int(img.info.get('duration') or default)
+    except Exception:
+        d = default
+    return max(ANIM_MIN_MS, min(ANIM_MAX_MS, d))
+
+
+BAYER4 = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
+
+
+def _tile_bayer(size, Image):
+    """拼一块 4×4 有序抖动阈值图（0~255）：把羽化渐变近似成「点阵半透明」"""
+    w, h = size
+    small = Image.new('L', (4, 4))
+    small.putdata([BAYER4[y][x] * 16 + 8 for y in range(4) for x in range(4)])
+    out = Image.new('L', (w, h))
+    for y in range(0, h, 4):
+        for x in range(0, w, 4):
+            out.paste(small, (x, y))
+    return out
+
+
+def apply_display_effects(img_rgba, cfg, Image=None):
+    """显示期特效：水平翻转 + 整体模糊（RGB）+ 点阵羽化（alpha）+ 圆角遮罩（alpha）。
+
+    ⚠️ 透明机制上限（README「已知限制」同步写明）：tkinter 的 -transparentcolor
+    只支持「全透明 / 全不透明」两档，做不出真正的半透明渐变。所以：
+      · 水平翻转：显示期镜像（不动文件，动图同样生效，随时可逆）；
+      · 整体模糊：作用在 RGB 上（柔化画面本身），不受 alpha 二值化影响；
+      · 点阵羽化：用 4×4 有序抖动把羽化带内的 alpha 近似成渐变
+        （远看像边缘渐隐，贴近看是细点阵——真羽化要等 2.0 分层窗）；
+      · 圆角：作用在 alpha 上，4× 超采样绘制后缩回，让硬边尽量贴合轮廓。
+    与预处理抠图共存：alpha 相乘关系，抠图得出的透明区不受影响。
+    """
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
+    out = img_rgba
+    try:
+        if cfg.get('flip_h'):
+            out = out.transpose(Image.FLIP_LEFT_RIGHT)
+    except Exception:
+        pass
+    try:
+        br = int(cfg.get('blur_radius', 0) or 0)
+        if cfg.get('blur_enabled') and br > 0:
+            from PIL import ImageFilter
+            out = out.filter(ImageFilter.GaussianBlur(float(min(br, 60))))
+    except Exception:
+        pass
+    try:
+        fr = int(cfg.get('feather_radius', 0) or 0)
+        on = bool(cfg.get('feather_enabled')) or bool(cfg.get('feather_dither'))  # 兼容旧配置
+        if on and fr > 0:
+            from PIL import ImageDraw, ImageFilter, ImageChops
+            w, h = out.size
+            band = max(2, min(fr, min(w, h) // 2))
+            # 内部掩膜：带内 0 → 内部 255（高斯过渡），作为抖动用的渐变坡度
+            inner = Image.new('L', (w, h), 0)
+            ImageDraw.Draw(inner).rectangle((band, band, w - band - 1, h - band - 1),
+                                            fill=255)
+            inner = inner.filter(ImageFilter.GaussianBlur(band * 0.5))
+            ramp = ImageChops.add(inner, _tile_bayer((w, h), Image), 1.0, -128)
+            alpha = ImageChops.multiply(out.split()[3],
+                                        ramp.point(lambda v: 255 if v > 128 else 0))
+            out = out.copy()
+            out.putalpha(alpha)
+    except Exception:
+        pass
+    try:
+        cr = int(cfg.get('corner_radius', 0) or 0)
+        if cfg.get('corner_enabled') and cr > 0:
+            from PIL import ImageDraw, ImageChops
+            w, h = out.size
+            r = max(1, min(cr, min(w, h) // 2))
+            s = 4
+            mask = Image.new('L', (w * s, h * s), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * s - 1, h * s - 1),
+                                                   radius=r * s, fill=255)
+            mask = mask.resize((w, h), Image.LANCZOS)
+            out = out.copy()
+            out.putalpha(ImageChops.multiply(out.split()[3], mask))
+    except Exception:
+        pass
+    return out
 
 
 def add_glow(img_rgba, accent, radius_ratio=0.35, alpha=90):
@@ -581,6 +846,43 @@ def _window_belongs_to_weasel(hwnd):
     except Exception:
         return False
 
+def _is_candidate_window(hwnd):
+    """候选框统一判定（v1.6 起 直挂/全扫 共用；2026-09-06 实机诊断修复误贴）：
+    1) 类名必须 ATL: 前缀 —— TSF 注入候选框类名恒为 ATL:；Electron/Edge 菜单与
+       网址提示浮层（Chrome_WidgetWin_1）、explorer TaskListOverlayWnd、tooltip
+       等非 ATL: 弹层一律排除（原 SHOW 直挂路径缺此约束是误贴根因）；
+    2) 样式 TSF 三件套（POPUP+TOOLWINDOW+NOACTIVATE）为主，weasel 进程兜底
+       （兼容旧架构独立候选窗）；
+    3) 尺寸合理；其中属 weasel 进程的窗口若宽高均 <120（如 32×32 大小写/状态
+       切换指示窗）判定为非候选框 —— weasel 进程内不会出现微缩候选框，
+       真实候选框恒为「注入应用进程（et/electron/msedge…）内的 ATL: 窗」。"""
+    try:
+        cls = ctypes.create_unicode_buffer(256)
+        if not user32.GetClassNameW(hwnd, cls, 256):
+            return False
+        if not cls.value.startswith('ATL:'):
+            return False
+        weasel = False
+        if not _is_tsf_candidate_style(hwnd):
+            weasel = _window_belongs_to_weasel(hwnd)
+            if not weasel:
+                return False
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if not (0 < w < 1300 and 0 < h < 1000 and h < w * 4):
+            return False
+        # weasel 微缩窗排除：32×32 大小写/状态切换指示窗同样满足
+        # 「ATL:+TSF 样式+weasel 进程」，仅凭样式/进程区分不了候选框 →
+        # 对「小到可疑」的窗补查一次进程归属（低频路径，可接受），属 weasel 即排除。
+        if w < 120 and h < 120 and _window_belongs_to_weasel(hwnd):
+            return False
+        return True
+    except Exception:
+        return False
+
 # ---- EnumWindows 回调：模块级单例（改造后仅低频重扫才调用，一次创建反复使用，
 #      避免旧版每 50ms 重建 WINFUNCTYPE 闭包的浪费；结果放模块级缓冲 + 锁防重入）----
 _find_results = []
@@ -589,22 +891,14 @@ _find_lock = threading.Lock()
 
 @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 def _find_enum_proc(hwnd, lparam):
-    """EnumWindows 回调：收集类名 ATL: 前缀 + 尺寸 + TSF 样式/weasel 进程判定的候选框。"""
+    """EnumWindows 回调：统一候选框判定（v1.6 _is_candidate_window），命中即收集。"""
     try:
         if not user32.IsWindowVisible(hwnd):
             return True
-        _find_cls = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, _find_cls, 256)
-        if _find_cls.value.startswith('ATL:'):
+        if _is_candidate_window(hwnd):
             rect = wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w, h = rect.right - rect.left, rect.bottom - rect.top
-            if 0 < w < 1300 and 0 < h < 1000 and h < w * 4:
-                # 候选框判定：TSF 样式为主，小狼毫进程兜底（兼容旧架构）；
-                # 普通弹窗（火绒等）不满足样式组合且非 weasel 进程 → 排除
-                if not (_is_tsf_candidate_style(hwnd) or _window_belongs_to_weasel(hwnd)):
-                    return True
-                _find_results.append((hwnd, rect))
+            _find_results.append((hwnd, rect))
     except Exception:
         pass
     return True
@@ -799,6 +1093,233 @@ def _perf_log(msg):
 
 
 # ============ 图片预处理（裁剪 / 镜像 / 抠图）============
+# ============ 清理垃圾（向导 / 托盘共用）============
+KEEP_FILES = {'config.json', 'error.log', 'readme.md', 'changelog.md', 'license',
+              'icon.png', 'icon.ico'}
+# 受保护扩展名：源码/脚本/图标/文档/程序本体一律不算垃圾，永不删
+# （.png 不保护 —— cfg_image_*.png / preprocessed_*.png 才是要清的垃圾；
+#   icon.png 靠 KEEP_FILES 名字保护）
+PROTECTED_EXT = {'.py', '.spec', '.ico', '.lnk', '.bat', '.cmd', '.ps1', '.vbs',
+                 '.exe', '.dll', '.pyd', '.md', '.json', '.yml', '.yaml', '.ini', '.cfg'}
+
+
+def _referenced_images():
+    """当前配置 + 所有皮肤档案引用的图片（绝对路径）——这些绝不能当垃圾删"""
+    paths = set()
+    try:
+        cfg = load_config()
+        if cfg and cfg.get('image'):
+            paths.add(os.path.abspath(cfg['image']))
+    except Exception:
+        pass
+    try:
+        for _name, scfg in list_skins():
+            if scfg.get('image'):
+                paths.add(os.path.abspath(scfg['image']))
+    except Exception:
+        pass
+    return paths
+
+
+def _file_hash(path):
+    import hashlib
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 16), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _managed_copy_dup(path):
+    """若 path 是「配置托管副本」（cfg_image_* / preprocessed_*）且 skins/ 下有
+    字节完全相同的副本，返回那个皮肤副本路径（清理时用它顶上），否则 None。
+
+    背景：向导保存预处理图时会复制成 cfg_image_*.png 副本；若用户又存了皮肤，
+    skins/<名>/image.png 就是同一张图 —— 这种重复副本应当可以清掉，
+    删除前把 config 指向改到皮肤那份，不影响使用。
+    """
+    name = os.path.basename(path or '')
+    if not (name.startswith('cfg_image_') or name.startswith('preprocessed_')):
+        return None
+    try:
+        sz = os.path.getsize(path)
+        h = _file_hash(path)
+    except OSError:
+        return None
+    for _n, scfg in list_skins():
+        sp = scfg.get('image')
+        if not sp or os.path.abspath(sp) == os.path.abspath(path) or not os.path.exists(sp):
+            continue
+        try:
+            if os.path.getsize(sp) == sz and _file_hash(sp) == h:
+                return sp
+        except OSError:
+            continue
+    return None
+
+
+def collect_junk_files(folder=None, extra_keep=()):
+    """列出「清理垃圾」的目标：程序目录下的普通文件（不含子目录），
+    排除白名单（skins/ config error.log README CHANGELOG LICENSE icon.*）、受保护类型、
+    当前正在使用的图片。
+    特例：config 指向的「托管副本」若在 skins/ 下有字节完全相同的副本 → 算冗余副本，
+    可清理（删除前会把 config 指向改到皮肤那份，不影响使用）。
+    返回 [(path, size), ...]。
+    """
+    folder = folder or HERE
+    keep = set(KEEP_FILES)
+    for p in list(extra_keep):
+        if p:
+            keep.add(os.path.basename(p).lower())
+    for p in _referenced_images():
+        if not p:
+            continue
+        if _managed_copy_dup(p):
+            continue                      # 冗余副本：不保护，交给下面当垃圾收走
+        keep.add(os.path.basename(p).lower())
+    out = []
+    try:
+        for name in os.listdir(folder):
+            p = os.path.join(folder, name)
+            if not os.path.isfile(p):
+                continue                      # 目录（skins/ build/ …）一律不动
+            low = name.lower()
+            if low.startswith('.'):
+                continue                      # 点文件（.gitignore 等）一律不碰
+            if low in keep or os.path.splitext(low)[1] in PROTECTED_EXT:
+                continue
+            try:
+                out.append((p, os.path.getsize(p)))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return out
+
+
+def _send_to_recycle_bin(paths):
+    """送进回收站（SHFileOperation + FOF_ALLOWUNDO）——宁回收站不永久删。
+    返回是否成功（整体失败返回 False，由调用方决定怎么办）。"""
+    if not paths:
+        return True
+    try:
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [('hwnd', wintypes.HWND), ('wFunc', wintypes.UINT),
+                        ('pFrom', wintypes.LPCWSTR), ('pTo', wintypes.LPCWSTR),
+                        ('fFlags', ctypes.c_ushort), ('fAnyOperationsAborted', wintypes.BOOL),
+                        ('hNameMappings', ctypes.c_void_p),
+                        ('lpszProgressTitle', wintypes.LPCWSTR)]
+        FO_DELETE = 3
+        FOF_SILENT, FOF_NOCONFIRMATION = 0x0004, 0x0010
+        FOF_ALLOWUNDO, FOF_NOERRORUI = 0x0040, 0x0400
+        buf = '\0'.join(os.path.abspath(p) for p in paths) + '\0\0'
+        op = SHFILEOPSTRUCTW()
+        op.wFunc = FO_DELETE
+        op.pFrom = buf
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+        return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0
+    except Exception:
+        return False
+
+
+def cleanup_junk_files(extra_keep=(), parent=None, confirm=True, folder=None):
+    """清理程序目录垃圾（向导按钮 / 托盘菜单共用）。返回 (清理数, 总字节)。
+
+    folder=None 时清理程序自身目录（生产用法）；显式传路径便于测试/其他目录。
+    安全设计：只删「本目录下的普通文件」，目录一律不碰；白名单与受保护类型不碰；
+    config.json/皮肤正在引用的图片不碰；优先进回收站（可还原）。
+    """
+    items = collect_junk_files(folder, extra_keep=extra_keep)
+    if not items:
+        if confirm:
+            messagebox.showinfo('清理垃圾', '程序目录很干净，没有可清理的文件。', parent=parent)
+        return 0, 0
+    total = sum(s for _p, s in items)
+    # 删除前处理「配置指向的冗余副本」：把 config 指向改到 skins/ 里的同一张图
+    repoint = {}
+    for p, _s in items:
+        dup = _managed_copy_dup(p)
+        if dup:
+            repoint[os.path.abspath(p)] = dup
+    if repoint:
+        try:
+            cfg0 = load_config()
+            cur = os.path.abspath(cfg0['image']) if (cfg0 and cfg0.get('image')) else None
+            if cur and cur in repoint:
+                cfg1 = dict(cfg0)
+                cfg1['image'] = repoint[cur]
+                save_config(cfg1)
+                _write_log(f'[清理] config 指向改到皮肤副本: {cfg1["image"]}')
+        except Exception as e:
+            try:
+                _write_log(f'[清理] 改指向失败，跳过冗余副本: {e}')
+            except Exception:
+                pass
+            items = [(p, s) for p, s in items if os.path.abspath(p) not in repoint]
+            total = sum(s for _p, s in items)
+            if not items:
+                if confirm:
+                    messagebox.showinfo('清理垃圾', '没有可安全清理的文件（冗余副本改指向失败）。',
+                                        parent=parent)
+                return 0, 0
+    if confirm:
+        names = '\n'.join(f'· {os.path.basename(p)}（{_human_size(s)}）' for p, s in items[:20])
+        if len(items) > 20:
+            names += f'\n… 等共 {len(items)} 个'
+        extra = ('\n其中「配置正在使用的副本」在皮肤档案里有同一张图，清理后会自动改指向皮肤，不影响使用。'
+                 if repoint else '')
+        ok = messagebox.askyesno(
+            '清理垃圾',
+            f'将清理程序目录下的 {len(items)} 个文件（共 {_human_size(total)}）：\n\n{names}\n\n'
+            f'skins/、config、error.log、README、CHANGELOG、LICENSE、正在使用的图片都不会动；\n'
+            f'删除进回收站，可还原。{extra}', parent=parent)
+        if not ok:
+            return 0, 0
+    if _send_to_recycle_bin([p for p, _s in items]):
+        n = len(items)
+    else:
+        n = 0
+        for p, _s in items:
+            try:
+                os.remove(p)
+                n += 1
+            except OSError:
+                pass
+    _write_log(f'[清理] 清理垃圾文件 {n}/{len(items)} 个（共 {_human_size(total)}）')
+    if confirm:
+        messagebox.showinfo('清理垃圾',
+                            f'已清理 {n} 个文件（{_human_size(total)}），可在回收站还原。',
+                            parent=parent)
+    return n, total
+
+
+def _describe_window(hwnd):
+    """窗口指纹（类名 + 尺寸 + 进程名）：候选框命中的日志靠它复现"""
+    try:
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        rect = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        name = ''
+        try:
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid.value)
+            if h:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(len(buf))
+                if ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                        h, 0, buf, ctypes.byref(size)):
+                    name = os.path.basename(buf.value)
+                ctypes.windll.kernel32.CloseHandle(h)
+        except Exception:
+            pass
+        return (f'类名={cls.value} {rect.right - rect.left}x{rect.bottom - rect.top} '
+                f'进程={name or pid.value}')
+    except Exception:
+        return '(窗口信息读取失败)'
+
+
 class ImagePreprocessDialog:
     """图片预处理窗口：裁剪 / 镜像反转 / 纯色背景抠图。
 
@@ -830,7 +1351,16 @@ class ImagePreprocessDialog:
         self._Image, self._ImageTk = Image, ImageTk
         self._Chops = ImageChops
 
-        self.orig = self._Image.open(image_path).convert('RGBA')
+        self._src = self._Image.open(image_path)   # 源图（动图可 seek 逐帧）
+        try:
+            self.n_frames = int(getattr(self._src, 'n_frames', 1) or 1)
+        except Exception:
+            self.n_frames = 1
+        try:
+            self._src.seek(0)
+        except Exception:
+            pass
+        self.orig = self._src.convert('RGBA')
         # 性能优化：交互基于缩略图（最长边 1200px），应用时映射回原图。
         # 大图（如 3MB）不再每次拖拽/调容差时处理全分辨率，顺滑度大幅提升。
         longest = max(self.orig.size)
@@ -841,7 +1371,6 @@ class ImagePreprocessDialog:
                  max(1, int(self.orig.height * self.scale))), self._Image.LANCZOS)
         else:
             self.work = self.orig.copy()
-        self.flipped = False
         self.crop = (0, 0, self.work.width, self.work.height)  # 缩略图坐标 (x0,y0,x1,y1)
         self.lock_ratio = None             # None=原图比例 / 'free'=自由 / float=锁定宽高比
         self.use_key = tk.BooleanVar(master=master, value=True)
@@ -852,7 +1381,7 @@ class ImagePreprocessDialog:
         self._photo_refs = []              # PhotoImage 引用保留，防 GC
 
         self.root = tk.Toplevel(master)
-        self.root.title('图片预处理 - 裁剪 / 镜像 / 抠图')
+        self.root.title('图片预处理 - 裁剪 / 抠图')
         self.root.resizable(False, False)
         self.root.transient(master)
         self.root.protocol('WM_DELETE_WINDOW', self._cancel)
@@ -879,7 +1408,8 @@ class ImagePreprocessDialog:
         panel.pack(side='right', fill='y', padx=(10, 0))
         panel.pack_propagate(False)
 
-        tk.Label(panel, text=f'原图 {self.orig.width}×{self.orig.height}',
+        anim_txt = f'（动图 {self.n_frames} 帧，处理完仍是动图）' if self.n_frames > 1 else ''
+        tk.Label(panel, text=f'原图 {self.orig.width}×{self.orig.height}{anim_txt}',
                  font=('Microsoft YaHei', 9), fg='#888').pack(anchor='w')
 
         # ① 裁剪比例
@@ -895,14 +1425,8 @@ class ImagePreprocessDialog:
         tk.Button(panel, text='✂ 自动裁剪到内容', command=self._auto_crop,
                   font=('Microsoft YaHei', 9)).pack(anchor='w', pady=(4, 0))
 
-        # ② 镜像反转
-        tk.Label(panel, text='② 镜像反转:', font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(10, 2))
-        self.btn_flip = tk.Button(panel, text='水平翻转（当前: 否）', command=self._toggle_flip,
-                                  font=('Microsoft YaHei', 9))
-        self.btn_flip.pack(anchor='w', fill='x')
-
-        # ③ 纯色背景抠图
-        tk.Label(panel, text='③ 纯色背景抠图:', font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(10, 2))
+        # ② 纯色背景抠图
+        tk.Label(panel, text='② 纯色背景抠图:', font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(10, 2))
         tk.Checkbutton(panel, text='启用抠图（背景变透明）', variable=self.use_key,
                        font=('Microsoft YaHei', 9), command=self._draw).pack(anchor='w')
         row_tol = tk.Frame(panel)
@@ -1114,16 +1638,10 @@ class ImagePreprocessDialog:
         self._draw()
 
     def _toggle_flip(self):
-        self.work = self.work.transpose(self._Image.FLIP_LEFT_RIGHT)
-        self.flipped = not self.flipped
-        self.btn_flip.config(text=f'水平翻转（当前: {"是" if self.flipped else "否"}）')
-        # 裁剪框随镜像映射
-        W = self.work.width
-        x0, y0, x1, y1 = self.crop
-        self.crop = (W - x1, y0, W - x0, y1)
-        self._draw()
+        """（已移出：水平翻转现为向导里的显示期开关，见 ConfigWizard 的「水平翻转」）"""
+        return
 
-    # ---------- 抠图 ----------
+    # ---------- 抠图 ----------    # ---------- 抠图 ----------
     def _detect_bg(self, img):
         """取四角 5×5 区域平均色作为背景色"""
         w, h = img.size
@@ -1212,39 +1730,80 @@ class ImagePreprocessDialog:
                  max(1, int(self.orig.height * self.scale))), self._Image.LANCZOS)
         else:
             self.work = self.orig.copy()
-        self.flipped = False
         self.crop = (0, 0, self.work.width, self.work.height)
         self.var_ratio.set(0)
         self.lock_ratio = None
         self.tol_var.set(20)
         self.use_key.set(True)
-        self.btn_flip.config(text='水平翻转（当前: 否）')
         self._auto_detect_bg()
         self._auto_crop()
+
+    def _frame_transform(self):
+        """把当前 UI 状态固化成「单帧变换」函数（裁剪框 / 镜像 / 抠图参数）。
+
+        预览基于缩略图，这里统一映射回原图坐标；动图逐帧复用同一个变换，
+        保证每帧处理一致、结果仍是动图。
+        """
+        x0, y0, x1, y1 = [int(v) for v in self.crop]
+        if self.scale < 1.0:
+            inv = 1.0 / self.scale
+            box = (int(x0 * inv), int(y0 * inv),
+                   int(min(self.orig.width, x1 * inv)), int(min(self.orig.height, y1 * inv)))
+        else:
+            box = (x0, y0, x1, y1)
+        flip = False   # 水平翻转已移到外挂配置（显示期），预处理不再烘入
+        keying = bool(self.use_key.get() and self.bg_color)
+        bg, tol = self.bg_color, self.tol_var.get()
+
+        def _tf(img):
+            out = img.crop(box)
+            if flip:
+                out = out.transpose(self._Image.FLIP_LEFT_RIGHT)
+            if keying:
+                out = self._chroma_key(out, bg, tol)
+            return out
+        return _tf
+
+    def _shrink_frame(self, img, limit=1200):
+        """动图输出限幅：皮肤最大按 base_height 缩放显示，1200 足够且 APNG 体积可控"""
+        longest = max(img.size)
+        if longest <= limit:
+            return img
+        s = limit / float(longest)
+        return img.resize((max(1, int(img.width * s)), max(1, int(img.height * s))),
+                          self._Image.LANCZOS)
 
     def _apply(self):
         try:
             x0, y0, x1, y1 = [int(v) for v in self.crop]
-            w, h = x1 - x0, y1 - y0
-            if w < 2 or h < 2:
+            if (x1 - x0) < 2 or (y1 - y0) < 2:
                 messagebox.showwarning('提示', '裁剪区域太小！', parent=self.root)
                 return
-            # 缩略图坐标 → 原图坐标
-            if self.scale < 1.0:
-                inv = 1.0 / self.scale
-                ox0 = int(x0 * inv)
-                oy0 = int(y0 * inv)
-                ox1 = int(min(self.orig.width, x1 * inv))
-                oy1 = int(min(self.orig.height, y1 * inv))
-            else:
-                ox0, oy0, ox1, oy1 = x0, y0, x1, y1
-            out = self.orig.crop((ox0, oy0, ox1, oy1))
-            if self.flipped:
-                out = out.transpose(self._Image.FLIP_LEFT_RIGHT)
-            if self.use_key.get() and self.bg_color:
-                out = self._chroma_key(out, self.bg_color, self.tol_var.get())
+            tf = self._frame_transform()
             out_path = os.path.join(HERE, f'preprocessed_{int(time.time() * 1000)}.png')
-            out.save(out_path, 'PNG')
+            if self.n_frames > 1:
+                # 动图：逐帧同一变换 → 存 APNG（多帧 + 每帧时长），皮肤保持会动
+                idxs = _sample_frame_indices(self.n_frames, ANIM_PREPROCESS_MAX)
+                outs, durs = [], []
+                try:
+                    self.root.config(cursor='watch')
+                except Exception:
+                    pass
+                for k, i in enumerate(idxs):
+                    self._src.seek(i)
+                    durs.append(_frame_duration(self._src))
+                    outs.append(self._shrink_frame(tf(self._src.convert('RGBA'))))
+                    if k % 10 == 0:
+                        try:
+                            self.lbl_crop.config(text=f'处理中 {k + 1}/{len(idxs)} 帧...')
+                            self.root.update_idletasks()
+                        except Exception:
+                            pass
+                outs[0].save(out_path, 'PNG', save_all=True, append_images=outs[1:],
+                             duration=durs, loop=0)
+            else:
+                self._src.seek(0)
+                tf(self.orig).save(out_path, 'PNG')
             self.result_path = out_path
             for p in self._photo_refs:
                 _release_photo(p)
@@ -1268,6 +1827,7 @@ class ConfigWizard:
         'horizontal_double': ('双行横排', 460, 84),
         'vertical': ('竖排', 96, 320),
     }
+    CV_W, CV_H = 620, 260     # 预览画布尺寸（调小给窗口减高，绘制逻辑自动等比适配）
 
     def __init__(self, on_done, overlay=None):
         self.on_done = on_done
@@ -1283,6 +1843,11 @@ class ConfigWizard:
         self.tk_img = None
         self._cache = None   # 预览图片缓存 (path, mtime, Image)
         self._photo_refs = []  # PhotoImage 引用保留，防 GC 回收导致 image doesn't exist
+        # 动图预览（v1.6）：默认只显示首帧，点「预览动画」才播
+        self._anim_n = 0
+        self._anim_idx = 0
+        self._anim_on = False
+        self._anim_after = None
 
         self.root = tk.Tk()
         self.root.title(f'Rime 皮肤外挂 {VERSION} - 配置')
@@ -1293,19 +1858,20 @@ class ConfigWizard:
         self._build_ui()
 
     def _build_ui(self):
+        """两栏布局：左=普通设置（含预览），右=高级设置（省竖向空间）"""
         pad = {'padx': 12, 'pady': 4}
         frm = tk.Frame(self.root)
         frm.pack(**pad)
 
-        # 顶部提示：支持格式 + 建议分辨率
+        # 顶部提示（一行，省竖向空间）
         tk.Label(frm,
-                 text='支持格式: PNG / JPG / WEBP / GIF / BMP    建议: 竖版 2:3，图片 ≤ 2000×2000（约 2MB 内）\n💡 可选「图片预处理」：裁剪 / 镜像反转 / 纯色背景一键抠图',
-                 fg='#e67e22', font=('Microsoft YaHei', 9), justify='left').pack(anchor='w', pady=(0, 2))
+                 text='支持 PNG/JPG/WEBP/GIF/BMP（动图保持会动）　建议竖版 2:3、≤2000×2000　💡 预处理 = 裁剪 / 纯色背景抠图',
+                 fg='#e67e22', font=('Microsoft YaHei', 9), justify='left').pack(anchor='w', pady=(0, 1))
         # 品红冲突提示（动态抠色键）：图片含品红时显示，提示已自动切换
         self.lbl_keyhint = tk.Label(frm, text='', fg='#e67e22', font=('Microsoft YaHei', 9), justify='left')
         self.lbl_keyhint.pack(anchor='w', pady=(0, 2))
 
-        # ① 图片选择
+        # ① 图片选择（整行）
         row1 = tk.Frame(frm)
         row1.pack(fill='x', pady=3)
         tk.Label(row1, text='① 图片:', font=('Microsoft YaHei', 10)).pack(side='left')
@@ -1315,139 +1881,305 @@ class ConfigWizard:
         self.btn_prep = tk.Button(row1, text='图片预处理', command=self._preprocess_image,
                                   font=('Microsoft YaHei', 10), state='disabled')
         self.btn_prep.pack(side='left', padx=2)
+        # 动图预览（按需播放，不点就是静态首帧 —— 不卡 UI）
+        self.btn_anim = tk.Button(row1, text='▶ 预览动画', command=self._toggle_anim_preview,
+                                  font=('Microsoft YaHei', 10), state='disabled')
+        self.btn_anim.pack(side='left', padx=2)
         self.lbl_img = tk.Label(row1, text='未选择', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_img.pack(side='left')
 
+        # ==== 左右分栏：左=普通设置（含预览） / 右=高级设置 ====
+        cols = tk.Frame(frm)
+        cols.pack(fill='x', pady=(2, 0))
+        left = tk.Frame(cols)
+        left.pack(side='left', anchor='n')
+        adv = tk.LabelFrame(cols, text='⚙ 高级设置', font=('Microsoft YaHei', 9),
+                            fg='#555', padx=8, pady=6)
+        adv.pack(side='left', anchor='n', fill='y', padx=(14, 0))
+
         # ② 候选框类型（读取 Rime 配置按钮放这一行）
-        row3 = tk.Frame(frm)
-        row3.pack(fill='x', pady=3)
+        row3 = tk.Frame(left)
+        row3.pack(fill='x', pady=1)
         tk.Label(row3, text='② 候选框类型:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_layout = tk.StringVar(master=self.root, value='horizontal_double')
-        for text, val in [('单行横排', 'horizontal_single'),
-                          ('双行横排', 'horizontal_double'),
+        for text, val in [('单行', 'horizontal_single'),
+                          ('双行', 'horizontal_double'),
                           ('竖排', 'vertical')]:
             tk.Radiobutton(row3, text=text, variable=self.var_layout, value=val,
                            font=('Microsoft YaHei', 9),
-                           command=self._update_preview).pack(side='left', padx=4)
-        tk.Button(row3, text='读取当前Rime配置(可选)', command=self._read_rime,
-                  font=('Microsoft YaHei', 9)).pack(side='left', padx=12)
+                           command=self._update_preview).pack(side='left', padx=2)
+        tk.Button(row3, text='读取当前Rime配置', command=self._read_rime,
+                  font=('Microsoft YaHei', 9)).pack(side='left', padx=8)
 
-        # ③ 贴边方向
-        row4 = tk.Frame(frm)
-        row4.pack(fill='x', pady=3)
+        # ③ 贴边方向 + 水平翻转（翻转已从预处理搬到这里：显示期、动图同样生效）
+        row4 = tk.Frame(left)
+        row4.pack(fill='x', pady=1)
         tk.Label(row4, text='③ 贴边方向:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_side = tk.StringVar(master=self.root, value='right')
         for text, val in [('右侧', 'right'), ('左侧', 'left'), ('中间', 'center')]:
             tk.Radiobutton(row4, text=text, variable=self.var_side, value=val,
                            font=('Microsoft YaHei', 9),
-                           command=self._update_preview).pack(side='left', padx=4)
+                           command=self._update_preview).pack(side='left', padx=2)
+        self.var_flip = tk.BooleanVar(master=self.root, value=False)
+        tk.Checkbutton(row4, text='水平翻转', variable=self.var_flip,
+                       font=('Microsoft YaHei', 9),
+                       command=self._update_preview).pack(side='left', padx=(12, 0))
 
-        # ④ 图层（图片相对候选框层级；v1.5 自 v1.2 恢复，事件驱动下重建可自愈）
-        row_layer = tk.Frame(frm)
-        row_layer.pack(fill='x', pady=3)
-        tk.Label(row_layer, text='④ 图层:', font=('Microsoft YaHei', 10)).pack(side='left')
+        # ④⑤⑥ 缩放 / 水平 / 垂直（合一行，紧凑）
+        row5 = tk.Frame(left)
+        row5.pack(fill='x', pady=1)
+        tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
+        self.var_scale = tk.DoubleVar(master=self.root, value=1.0)
+        tk.Scale(row5, from_=0.2, to=2.0, resolution=0.1, orient='horizontal',
+                 variable=self.var_scale, length=140, sliderlength=13,
+                 command=lambda _: self._update_preview(),
+                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
+        self.lbl_scale = tk.Label(row5, text='1.0x', fg='#888', font=('Microsoft YaHei', 9),
+                                  width=4)
+        self.lbl_scale.pack(side='left')
+        tk.Label(row5, text='⑤ 水平:', font=('Microsoft YaHei', 10)).pack(side='left', padx=(8, 0))
+        self.var_offx = tk.IntVar(master=self.root, value=0)
+        tk.Scale(row5, from_=-200, to=200, orient='horizontal',
+                 variable=self.var_offx, length=140, sliderlength=13,
+                 command=lambda _: self._update_preview(),
+                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
+        self.lbl_offx = tk.Label(row5, text='0px', fg='#888', font=('Microsoft YaHei', 9),
+                                 width=5)
+        self.lbl_offx.pack(side='left')
+        tk.Label(row5, text='⑥ 垂直:', font=('Microsoft YaHei', 10)).pack(side='left', padx=(8, 0))
+        self.var_offy = tk.IntVar(master=self.root, value=0)
+        tk.Scale(row5, from_=-150, to=150, orient='horizontal',
+                 variable=self.var_offy, length=140, sliderlength=13,
+                 command=lambda _: self._update_preview(),
+                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
+        self.lbl_offy = tk.Label(row5, text='0px', fg='#888', font=('Microsoft YaHei', 9),
+                                 width=5)
+        self.lbl_offy.pack(side='left')
+
+        # ⑦ 预览区（候选框 + 图片 组合）
+        tk.Label(left, text='⑦ 预览（候选框 + 图片组合样式）:', font=('Microsoft YaHei', 9),
+                 fg='#555').pack(anchor='w', pady=(2, 0))
+        self.canvas = tk.Canvas(left, width=self.CV_W, height=self.CV_H, bg='#ffffff',
+                                highlightthickness=1, highlightbackground='#ccc')
+        self.canvas.pack(pady=2)
+
+        # ==== 高级设置栏 ====
+        # ⑧ 图层（图片相对候选框层级；below 仅重叠居中可见）
+        tk.Label(adv, text='⑧ 图层:', font=('Microsoft YaHei', 10)).pack(anchor='w')
+        row_layer = tk.Frame(adv)
+        row_layer.pack(anchor='w', pady=(0, 2))
         self.var_layer = tk.StringVar(master=self.root, value='above')
         for text, val in [('候选框上方', 'above'), ('候选框下方', 'below')]:
             tk.Radiobutton(row_layer, text=text, variable=self.var_layer, value=val,
                            font=('Microsoft YaHei', 9),
-                           command=self._update_preview).pack(side='left', padx=4)
-        # below 提示行（随 图层/贴边 选择动态更新；v1.3 教训：below 仅 贴边=中间 重叠时可见）
-        self.lbl_layer_hint = tk.Label(frm, text='', fg='#888', font=('Microsoft YaHei', 8),
-                                       justify='left')
-        self.lbl_layer_hint.pack(anchor='w', pady=(0, 2))
+                           command=self._update_preview).pack(side='left', padx=2)
+        self.lbl_layer_hint = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8),
+                                       justify='left', wraplength=300)
+        self.lbl_layer_hint.pack(anchor='w', pady=(0, 4))
 
-        # ⑤ 缩放（独立一行）
-        row5 = tk.Frame(frm)
-        row5.pack(fill='x', pady=3)
-        tk.Label(row5, text='⑤ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
-        self.var_scale = tk.DoubleVar(master=self.root, value=1.0)
-        tk.Scale(row5, from_=0.2, to=2.0, resolution=0.1, orient='horizontal',
-                 variable=self.var_scale, length=220,
-                 command=lambda _: self._update_preview(),
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=4)
-        self.lbl_scale = tk.Label(row5, text='1.0x', fg='#888', font=('Microsoft YaHei', 9))
-        self.lbl_scale.pack(side='left')
+        # ⑨ 特效（显示期：圆角 / 整体模糊；只影响外挂显示，不改图片文件）
+        tk.Label(adv, text='⑨ 特效（只影响显示）:', font=('Microsoft YaHei', 10)).pack(anchor='w')
+        row_fx = tk.Frame(adv)
+        row_fx.pack(anchor='w', pady=(0, 2))
+        self.var_corner = tk.BooleanVar(master=self.root, value=False)
+        tk.Checkbutton(row_fx, text='圆角', variable=self.var_corner,
+                       font=('Microsoft YaHei', 9),
+                       command=self._update_preview).pack(side='left')
+        self.var_corner_r = tk.IntVar(master=self.root, value=24)
+        tk.Scale(row_fx, from_=0, to=120, orient='horizontal', variable=self.var_corner_r,
+                 length=110, command=lambda _: self._update_preview(),
+                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
+        row_fx2 = tk.Frame(adv)
+        row_fx2.pack(anchor='w', pady=(0, 4))
+        self.var_blur = tk.BooleanVar(master=self.root, value=False)
+        tk.Checkbutton(row_fx2, text='整体模糊', variable=self.var_blur,
+                       font=('Microsoft YaHei', 9),
+                       command=self._update_preview).pack(side='left')
+        self.var_blur_r = tk.IntVar(master=self.root, value=6)
+        tk.Scale(row_fx2, from_=0, to=30, orient='horizontal', variable=self.var_blur_r,
+                 length=110, command=lambda _: self._update_preview(),
+                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
 
-        # ⑥ 水平微调（独立一行）
-        row6 = tk.Frame(frm)
-        row6.pack(fill='x', pady=3)
-        tk.Label(row6, text='⑥ 水平微调:', font=('Microsoft YaHei', 10)).pack(side='left')
-        self.var_offx = tk.IntVar(master=self.root, value=0)
-        tk.Scale(row6, from_=-200, to=200, orient='horizontal',
-                 variable=self.var_offx, length=220,
-                 command=lambda _: self._update_preview(),
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=4)
-        self.lbl_offx = tk.Label(row6, text='0px', fg='#888', font=('Microsoft YaHei', 9))
-        self.lbl_offx.pack(side='left')
+        # ⑩ 点阵羽化（用 4×4 有序抖动把边缘 alpha 近似成渐变）
+        tk.Label(adv, text='⑩ 点阵羽化:', font=('Microsoft YaHei', 10)).pack(anchor='w')
+        row_fe = tk.Frame(adv)
+        row_fe.pack(anchor='w')
+        self.var_feather = tk.BooleanVar(master=self.root, value=False)
+        tk.Checkbutton(row_fe, text='启用', variable=self.var_feather,
+                       font=('Microsoft YaHei', 9),
+                       command=self._update_preview).pack(side='left')
+        self.var_feather_r = tk.IntVar(master=self.root, value=24)
+        tk.Scale(row_fe, from_=0, to=80, orient='horizontal', variable=self.var_feather_r,
+                 length=110, command=lambda _: self._update_preview(),
+                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
+        tk.Label(adv, text='带宽 px；远看像半透明，近看是点阵', fg='#888',
+                 font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(0, 4))
 
-        # ⑦ 垂直微调（独立一行）
-        row7 = tk.Frame(frm)
-        row7.pack(fill='x', pady=3)
-        tk.Label(row7, text='⑦ 垂直微调:', font=('Microsoft YaHei', 10)).pack(side='left')
-        self.var_offy = tk.IntVar(master=self.root, value=0)
-        tk.Scale(row7, from_=-150, to=150, orient='horizontal',
-                 variable=self.var_offy, length=220,
-                 command=lambda _: self._update_preview(),
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=4)
-        self.lbl_offy = tk.Label(row7, text='0px', fg='#888', font=('Microsoft YaHei', 9))
-        self.lbl_offy.pack(side='left')
-
-        # ⑧ 预览区（候选框 + 图片 组合）
-        tk.Label(frm, text='预览（候选框 + 图片组合样式，图片已自适应缩放）:',
-                 font=('Microsoft YaHei', 9), fg='#555').pack(anchor='w', pady=(4, 0))
-        self.canvas = tk.Canvas(frm, width=760, height=380, bg='#ffffff',
-                                highlightthickness=1, highlightbackground='#ccc')
-        self.canvas.pack(pady=4)
-
-        # ⑨ 皮肤管理（独立分区，图片 + 全套参数整套切换）
-        skin_box = tk.LabelFrame(frm, text='💾 皮肤管理（图片 + 全套参数，选中即应用）',
-                                 font=('Microsoft YaHei', 9), fg='#555', padx=8, pady=4)
+        # ⑪ 皮肤管理（图片 + 全套参数整套切换）
+        skin_box = tk.LabelFrame(adv, text='💾 ⑪ 皮肤管理',
+                                 font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=4)
         skin_box.pack(fill='x', pady=(2, 0))
         self.skin_var = tk.StringVar(master=self.root)
         self.skin_cb = ttk.Combobox(skin_box, textvariable=self.skin_var, state='readonly',
-                                    width=18, font=('Microsoft YaHei', 9))
-        self.skin_cb.pack(side='left', padx=(0, 4))
+                                    width=16, font=('Microsoft YaHei', 9))
+        self.skin_cb.pack(anchor='w')
         # 选中即应用：预览 + 立即切换到运行中的外挂（若有）
         self.skin_cb.bind('<<ComboboxSelected>>', lambda _e: self._apply_skin_to_wizard())
-        tk.Button(skin_box, text='💾 保存当前为皮肤…', command=self._save_as_skin,
-                  font=('Microsoft YaHei', 9)).pack(side='left', padx=2)
-        tk.Button(skin_box, text='🗑 删除…', command=self._delete_skin,
-                  font=('Microsoft YaHei', 9)).pack(side='left', padx=2)
-        self.lbl_skin_hint = tk.Label(skin_box, text='选中即应用（含正在运行的外挂），可随时整套切换',
+        skin_btns = tk.Frame(skin_box)
+        skin_btns.pack(anchor='w', pady=(2, 0))
+        tk.Button(skin_btns, text='💾 存为皮肤', command=self._save_as_skin,
+                  font=('Microsoft YaHei', 9)).pack(side='left', padx=(0, 2))
+        tk.Button(skin_btns, text='🗑 删除', command=self._delete_skin,
+                  font=('Microsoft YaHei', 9)).pack(side='left')
+        self.lbl_skin_hint = tk.Label(skin_box, text='选中即应用，可整套切换',
                                       fg='#999', font=('Microsoft YaHei', 8))
-        self.lbl_skin_hint.pack(side='left', padx=6)
+        self.lbl_skin_hint.pack(anchor='w', pady=(2, 0))
         self._refresh_skin_list()
 
-        # ⑩ 按钮
+        # ⑫ 开机自启（真相 = 启动文件夹快捷方式，勾选态直接读实际状态）
+        row_start = tk.Frame(adv)
+        row_start.pack(anchor='w', pady=(6, 0))
+        self.var_autostart = tk.BooleanVar(master=self.root, value=autostart_installed())
+        tk.Checkbutton(row_start, text='⑫ 开机自启（静默到托盘）',
+                       variable=self.var_autostart,
+                       font=('Microsoft YaHei', 10)).pack(side='left')
+        self.lbl_autostart = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8))
+        self.lbl_autostart.pack(anchor='w', pady=(0, 2))
+
+        # ⑬ 按钮行（整行）
         row8 = tk.Frame(frm)
         row8.pack(fill='x', pady=6)
         tk.Button(row8, text='保存并启动', command=self._save_and_start,
                   bg='#4CAF50', fg='white', font=('Microsoft YaHei', 10, 'bold')).pack(side='left', padx=4)
         tk.Button(row8, text='取消', command=self._on_cancel,
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
+        tk.Button(row8, text='🧹 清理垃圾…', command=self._cleanup_junk,
+                  font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
         tk.Label(row8, text='💡 保存后启动；下次双击可重新配置',
                  fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
 
+    def _effects_cfg(self):
+        """向导里的特效参数（与 config 同名字段，可直接喂给 apply_display_effects）"""
+        try:
+            return {'corner_enabled': bool(self.var_corner.get()),
+                    'corner_radius': int(self.var_corner_r.get()),
+                    'blur_enabled': bool(self.var_blur.get()),
+                    'blur_radius': int(self.var_blur_r.get()),
+                    'feather_enabled': bool(self.var_feather.get()),
+                    'feather_radius': int(self.var_feather_r.get()),
+                    'flip_h': bool(self.var_flip.get())}
+        except Exception:
+            return {}
+
+    def _image_effects(self, img):
+        try:
+            return apply_display_effects(img, self._effects_cfg(), self._Image)
+        except Exception:
+            return img
+
+    def _cleanup_junk(self):
+        """🧹 清理程序目录垃圾（白名单之外、非保护类型、非正在使用的图片；走回收站）"""
+        cleanup_junk_files(extra_keep=[self.cfg.get('image', '')], parent=self.root)
+
     def _get_preview_img(self):
-        """预览图片缓存：文件未变时复用已打开的图，避免每次滑块都重开大图"""
+        """预览图片缓存：文件未变时复用已打开的图，避免每次滑块都重开大图。
+
+        动图（n_frames>1）：缓存保持可 seek 的源图，每次返回 self._anim_idx
+        对应帧的 RGBA（预览动画就是改 _anim_idx 后重绘）。
+        静态图：缓存直接存缩好的 RGBA（与原行为一致）。
+        """
         path = self.cfg.get('image')
         if not path or not self.PIL:
             return None
         try:
             mtime = os.path.getmtime(path)
-            if self._cache and self._cache[0] == path and self._cache[1] == mtime:
-                return self._cache[2]
-            img = self._Image.open(path).convert('RGBA')
-            # 大图先缩到最长边 1600，减少后续预览缩放开销
-            longest = max(img.size)
-            if longest > 1600:
-                s = 1600.0 / longest
-                img = img.resize((max(1, int(img.width * s)),
-                                  max(1, int(img.height * s))), self._Image.LANCZOS)
-            self._cache = (path, mtime, img)
+            if not (self._cache and self._cache[0] == path and self._cache[1] == mtime):
+                img = self._Image.open(path)
+                if int(getattr(img, 'n_frames', 1) or 1) <= 1:
+                    # 大图先缩到最长边 1600，减少后续预览缩放开销
+                    longest = max(img.size)
+                    if longest > 1600:
+                        s = 1600.0 / longest
+                        img = img.resize((max(1, int(img.width * s)),
+                                          max(1, int(img.height * s))), self._Image.LANCZOS)
+                    img = img.convert('RGBA')
+                self._cache = (path, mtime, img)
+            img = self._cache[2]
+            n = int(getattr(img, 'n_frames', 1) or 1)
+            if n > 1:
+                try:
+                    img.seek(int(self._anim_idx) % n)   # 同帧 seek 不重解
+                except Exception:
+                    pass
+                return img.convert('RGBA')   # 每帧转一次，不缓存转换结果（否则丢帧）
             return img
         except Exception:
             return None
+
+    def _refresh_anim_state(self):
+        """按当前 cfg['image'] 重新检测动图帧数（选图 / 预处理后共用）。
+
+        返回帧数；>1 才点亮「预览动画」按钮。
+        """
+        self._anim_after_stop()
+        self._anim_on = False
+        self._anim_idx = 0
+        self._anim_n = 0
+        path = self.cfg.get('image')
+        if self.PIL and path:
+            try:
+                with self._Image.open(path) as probe:
+                    self._anim_n = int(getattr(probe, 'n_frames', 1) or 1)
+            except Exception:
+                self._anim_n = 0
+        if self._anim_n > 1:
+            self.btn_anim.config(state='normal', text=f'▶ 预览动画({self._anim_n}帧)')
+        else:
+            self.btn_anim.config(state='disabled', text='▶ 预览动画')
+        return self._anim_n
+
+    # ---------- 向导内动图预览（v1.6）----------
+    def _anim_after_stop(self):
+        if self._anim_after:
+            try:
+                self.root.after_cancel(self._anim_after)
+            except Exception:
+                pass
+            self._anim_after = None
+
+    def _toggle_anim_preview(self):
+        """▶ 预览动画 / ⏸ 停止预览：按需播放，不播时只显示首帧"""
+        if self._anim_n <= 1:
+            return
+        self._anim_on = not self._anim_on
+        if self._anim_on:
+            self.btn_anim.config(text='⏸ 停止预览')
+            self._anim_idx = 0
+            self._anim_step()
+        else:
+            self._anim_after_stop()
+            self._anim_idx = 0
+            self.btn_anim.config(text=f'▶ 预览动画({self._anim_n}帧)')
+            self._update_preview()
+
+    def _anim_step(self):
+        """预览动图节拍：推进一帧后重绘预览，按该帧时长重排"""
+        self._anim_after = None
+        if not self._anim_on or self._anim_n <= 1:
+            return
+        self._anim_idx = (self._anim_idx + 1) % self._anim_n
+        self._update_preview()
+        dur = 100
+        try:
+            src = self._cache[2] if self._cache else None
+            if src is not None and int(getattr(src, 'n_frames', 1) or 1) > 1:
+                dur = _frame_duration(src)   # _update_preview 已 seek 到当前帧
+        except Exception:
+            dur = 100
+        try:
+            self._anim_after = self.root.after(int(dur), self._anim_step)
+        except Exception:
+            self._anim_after = None
 
     def _pick_image(self):
         path = filedialog.askopenfilename(
@@ -1459,6 +2191,8 @@ class ConfigWizard:
         self.cfg['image'] = path
         self.lbl_img.config(text=os.path.basename(path), fg='#333')
         self.btn_prep.config(state='normal')
+        # 动图检测：n_frames>1 才亮出「预览动画」按钮
+        self._refresh_anim_state()
         self._update_preview()
         self._update_key_hint()
 
@@ -1476,6 +2210,7 @@ class ConfigWizard:
             if dlg.result_path:
                 self.cfg['image'] = dlg.result_path
                 self.lbl_img.config(text=os.path.basename(dlg.result_path) + '（已预处理）', fg='#2e7d32')
+                self._refresh_anim_state()   # 预处理产物可能是动图（APNG）：重新点亮「预览动画」
                 self._update_preview()
                 self._update_key_hint()
         except Exception as e:
@@ -1537,6 +2272,14 @@ class ConfigWizard:
         self.var_scale.set(cfg.get('scale', 1.0))
         self.var_offx.set(cfg.get('offset_x', 0))
         self.var_offy.set(cfg.get('offset_y', 0))
+        # 特效参数随皮肤整套恢复
+        self.var_corner.set(bool(cfg.get('corner_enabled', False)))
+        self.var_corner_r.set(int(cfg.get('corner_radius', 24) or 0))
+        self.var_blur.set(bool(cfg.get('blur_enabled', False)))
+        self.var_blur_r.set(int(cfg.get('blur_radius', 6) or 0))
+        self.var_feather.set(bool(cfg.get('feather_enabled', False)))
+        self.var_feather_r.set(int(cfg.get('feather_radius', 24) or 0))
+        self.var_flip.set(bool(cfg.get('flip_h', False)))
         img = cfg.get('image', '')
         self.lbl_img.config(text=os.path.basename(img) + f'（皮肤: {name}）', fg='#2e7d32')
         self.btn_prep.config(state='normal' if img else 'disabled')
@@ -1639,7 +2382,7 @@ class ConfigWizard:
 
         # 候选框（居中于画布）——先算几何，实际绘制按图层顺序统一进行
         cw, ch = self.LAYOUT_INFO[layout][1], self.LAYOUT_INFO[layout][2]
-        base_x = (760 - cw) // 2
+        base_x = (self.CV_W - cw) // 2
         base_y = (360 - ch) // 2
         # 候选框配色（用 Rime 皮肤主色，简单示意）
         accent = get_rime_accent() if self.PIL else (0, 137, 123)
@@ -1660,11 +2403,13 @@ class ConfigWizard:
                     ratio = base_h / img.height
                     img = img.resize((max(1, int(img.width * ratio)),
                                       max(1, int(base_h))), self._Image.BILINEAR)
+                # 特效与运行时一致（圆角 / 模糊按显示尺寸套）
+                img = self._image_effects(img)
                 new_w, new_h = img.size
                 # 若图片+候选框超出画布，整体等比缩小（保持相对位置比例）
                 total_w = new_w + 8 + cw
                 total_h = max(new_h, ch)
-                cv_w, cv_h = 760, 380
+                cv_w, cv_h = self.CV_W, self.CV_H
                 if total_w > cv_w - 30 or total_h > cv_h - 30:
                     fit_all = min((cv_w - 30) / total_w, (cv_h - 30) / total_h, 1.0)
                     if fit_all < 1.0:
@@ -1841,13 +2586,36 @@ class ConfigWizard:
                             pass
             except Exception:
                 pass
+        # 显示期特效（圆角 / 高斯模糊）：写进配置，随皮肤一起保存
+        self.cfg['corner_enabled'] = bool(self.var_corner.get())
+        self.cfg['corner_radius'] = int(self.var_corner_r.get())
+        self.cfg['blur_enabled'] = bool(self.var_blur.get())
+        self.cfg['blur_radius'] = int(self.var_blur_r.get())
+        self.cfg['feather_enabled'] = bool(self.var_feather.get())
+        self.cfg['feather_radius'] = int(self.var_feather_r.get())
+        self.cfg['flip_h'] = bool(self.var_flip.get())
+        self.cfg.pop('feather_dither', None)   # 旧字段清理（点阵羽化已成为唯一实现）
+        # 开机自启（真相 = 启动文件夹快捷方式；勾选态与实际同步后才算完成）
+        want_start = bool(self.var_autostart.get())
+        ok, msg = set_autostart(want_start, force=want_start)
+        self.cfg['autostart'] = want_start
+        if not ok:
+            messagebox.showwarning('开机自启', msg)
         save_config(self.cfg)
+        _write_log(f'[配置] 保存 image={self.cfg.get("image")} layout={self.cfg.get("layout")} '
+                   f'side={self.cfg.get("side")} layer={self.cfg.get("layer")} '
+                   f'scale={self.cfg.get("scale")} 圆角={self.cfg.get("corner_enabled")}/'
+                   f'{self.cfg.get("corner_radius")} 整体模糊={self.cfg.get("blur_enabled")}/'
+                   f'{self.cfg.get("blur_radius")} 点阵羽化={self.cfg.get("feather_enabled")}/'
+                   f'{self.cfg.get("feather_radius")} 自启={self.cfg.get("autostart")}')
         self.root.destroy()
         self.on_done(self.cfg)
 
     def _on_cancel(self):
         # 只销毁窗口，让 mainloop 自然返回（不要 sys.exit，否则 Tk 清理会卡住）
-        # 顺带显式释放全部 PhotoImage（tcl 端 image table 同步清理）
+        # 先停动图预览节拍，再显式释放全部 PhotoImage（tcl 端 image table 同步清理）
+        self._anim_on = False
+        self._anim_after_stop()
         for p in self._photo_refs:
             _release_photo(p)
         self._photo_refs.clear()
@@ -1877,6 +2645,9 @@ class TrayIcon:
             menu = pystray.Menu(
                 pystray.MenuItem('重新配置…', self._reconfig, default=True),
                 pystray.MenuItem('皮肤选择', pystray.Menu(self._skin_items)),
+                pystray.MenuItem('开机自启', self._toggle_autostart,
+                                 checked=lambda item: autostart_installed()),
+                pystray.MenuItem('清理垃圾文件…', self._cleanup_junk),
                 pystray.MenuItem('退出 (Ctrl+Alt+Q)', self._quit),
             )
             self.icon = pystray.Icon('RimeSkinOverlay', img, 'Rime 皮肤外挂', menu)
@@ -1930,13 +2701,65 @@ class TrayIcon:
         except Exception:
             pass
 
+    def _toggle_autostart(self, icon, item):
+        """托盘开关开机自启（pystray 线程 → Tk 主线程执行）"""
+        try:
+            self.overlay.root.after(0, self._autostart_main)
+        except Exception:
+            pass
+
+    def _autostart_main(self):
+        """主线程切换自启：以启动文件夹实况为准取反，成功后同步配置并托盘提示"""
+        try:
+            want = not autostart_installed()
+            ok, msg = set_autostart(want, force=want)
+            if ok:
+                try:
+                    self.overlay.cfg['autostart'] = want
+                    save_config(self.overlay.cfg)
+                except Exception:
+                    pass
+                try:
+                    if self.icon is not None:
+                        self.icon.update_menu()
+                except Exception:
+                    pass
+            else:
+                try:
+                    import tkinter.messagebox as _mb
+                    _mb.showwarning('开机自启', msg, parent=self.overlay.root)
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                _write_log(f'[_autostart_main] 异常: {e}')
+            except Exception:
+                pass
+
+    def _cleanup_junk(self, icon, item):
+        """托盘入口：清理程序目录垃圾（pystray 线程 → Tk 主线程）"""
+        try:
+            self.overlay.root.after(0, self._cleanup_junk_main)
+        except Exception:
+            pass
+
+    def _cleanup_junk_main(self):
+        try:
+            cleanup_junk_files(extra_keep=[self.overlay.cfg.get('image', '')],
+                               parent=self.overlay.root)
+        except Exception as e:
+            try:
+                _write_log(f'[_cleanup_junk] 异常: {e}')
+            except Exception:
+                pass
+
     def _quit(self, icon, item):
         try:
             icon.stop()
         except Exception:
             pass
         try:
-            self.overlay.root.after(0, self.overlay.root.destroy)
+            self.overlay.root.after(0, self.overlay._graceful_quit)
         except Exception:
             pass
 
@@ -1949,9 +2772,29 @@ class TrayIcon:
 
 
 # ============ 主窗口 ============
+_ACTIVE_OVERLAY = None   # 进程内当前活跃的外挂实例（防同进程多实例 → 叠出多个托盘图标/窗口）
+
+
+def _close_active_overlay():
+    """确保进程内只有一个外挂实例：把上一个停动画 / 收托盘 / 销毁窗口。"""
+    global _ACTIVE_OVERLAY
+    ov = _ACTIVE_OVERLAY
+    _ACTIVE_OVERLAY = None
+    if ov is None:
+        return
+    try:
+        ov._graceful_quit()
+    except Exception:
+        pass
+
+
 class FollowOverlay:
     def __init__(self, cfg):
         self.cfg = cfg
+        _close_active_overlay()          # 同进程只留一个（防连点托盘/重复保存叠出多个）
+        global _ACTIVE_OVERLAY
+        _ACTIVE_OVERLAY = self
+        self._wizard = None              # 当前打开的配置向导（防连点叠出多个配置窗）
         self.PIL = False
         try:
             from PIL import Image, ImageDraw, ImageTk
@@ -1973,6 +2816,13 @@ class FollowOverlay:
         self.img_mtime = None
         self.key_rgb = MAGENTA          # 当前抠色键（动态，随图片变化）
         self.layer = self.cfg.get('layer', 'above')  # 图层：above=图片置顶 / below=候选框压图（v1.5）
+        # ===== 动图状态（v1.6；静态图时 anim_n=1 全走老路径）=====
+        self.anim_src = None            # 动画源图（保持打开，供 seek 逐帧解码）
+        self.anim_n = 0                 # 总帧数
+        self.anim_idx = 0               # 当前帧号
+        self.anim_after = None          # after() 句柄（停止/重载时 cancel）
+        self._frame_cache = collections.OrderedDict()  # 帧号 → PhotoImage（LRU）
+        self._base_h = 300.0            # 帧缩放基准高度（base_height × scale）
         self.load_char()
 
         self.label = tk.Label(self.root, image=self.img, bg=_key_hex(self.key_rgb), cursor='fleur')
@@ -1984,9 +2834,14 @@ class FollowOverlay:
         self.label.bind('<Button-3>', self.on_right_click)
         self.menu = tk.Menu(self.root, tearoff=0)
         self.menu.add_command(label='隐藏/显示 Ctrl+Alt+C', command=self.toggle)
-        self.menu.add_command(label='退出 Ctrl+Alt+Q', command=self.root.destroy)
+        self.menu.add_command(label='退出 Ctrl+Alt+Q', command=self._graceful_quit)
         self.root.bind('<Control-Alt-Key-c>', lambda e: self.toggle())
-        self.root.bind('<Control-Alt-Key-q>', lambda e: self.root.destroy())
+        self.root.bind('<Control-Alt-Key-q>', lambda e: self._graceful_quit())
+        # WM_DELETE_WINDOW 协议：注册后 _kill_existing 的 WM_CLOSE 才能让它体面退出（S8）。
+        # 不注册时 overrideredirect 窗被 WM_CLOSE 干掉后 Tk 记账不对，进程会残留在后台。
+        self.root.protocol('WM_DELETE_WINDOW', self._graceful_quit)
+        # 销毁前停掉动画节拍：否则遗留的 after 回调会在 Tcl 里报 invalid command name
+        self.root.bind('<Destroy>', self._on_root_destroy, add='+')
 
         self.visible = False
         self.pinned = False   # 手动固定显示（托盘/快捷键切换，不受候选框有无影响）
@@ -2018,46 +2873,236 @@ class FollowOverlay:
         self.tray.start()
 
     def load_char(self):
+        """加载/重载图片（热重载、切皮肤、滚轮缩放共用入口）。
+
+        静态图：原管线不变（缩放 → 动态键色 → 品红式抠色 → PhotoImage）。
+        动图（GIF/动图 WebP/APNG，n_frames>1）：建帧序列 + after 按帧时长播放；
+        帧按需解码（LRU 6 张），键色取多帧颜色并集。
+        """
         img_path = self.cfg['image']
-        if self.PIL:
-            img = self._Image.open(img_path).convert('RGBA')
-            base_h = self.cfg.get('base_height', 300) * self.cfg.get('scale', 1.0)
+        self._anim_stop()
+        self.anim_src = None
+        self.anim_n = 0
+        self.anim_idx = 0
+        old_frames = list(getattr(self, '_frame_cache', {}).values())
+        self._frame_cache.clear()
+        if not self.PIL:
+            self.img = tk.PhotoImage(file=img_path, master=self.root)
+            self.w, self.h = self.img.width(), self.img.height()
+            self.layer = self.cfg.get('layer', 'above')
+            return
+        Image = self._Image
+        base_h = self.cfg.get('base_height', 300) * self.cfg.get('scale', 1.0)
+        self._base_h = base_h
+        src = Image.open(img_path)
+        try:
+            n = int(getattr(src, 'n_frames', 1) or 1)
+        except Exception:
+            n = 1
+        if n > 1:
+            # ---- 动图：帧序列播放 ----
+            self.anim_src = src
+            self.anim_n = n
+            self.key_rgb = self._pick_anim_key(Image, n)
+            self.img = self._decode_frame(0)
+            if self.img is None:      # 解码失败 → 退回静态首帧路径
+                self.anim_src, self.anim_n = None, 0
+                raise ValueError('首帧解码失败')
+            self._frame_cache[self.anim_idx] = self.img
+            self.raw_img = None
+        else:
+            # ---- 静态图：原管线（行为与 v1.5 一致）----
+            img = src.convert('RGBA')
             if img.height > 0:
                 ratio = base_h / img.height
                 new_w = max(1, int(img.width * ratio))
-                img = img.resize((new_w, max(1, int(base_h))), self._Image.LANCZOS)
+                img = img.resize((new_w, max(1, int(base_h))), Image.LANCZOS)
+            # 显示期特效（圆角 / 高斯模糊）——在选抠色键之前做（模糊会改颜色分布）
+            img = apply_display_effects(img, self.cfg, Image)
             # 动态颜色键：统计颜色并集，选图中不存在的颜色当抠色键（消灭「图含品红被误抠」）
-            key = pick_key_color([img], self._Image)
-            self.key_rgb = key
+            self.key_rgb = pick_key_color([img], Image)
             # 修复紫边：缩放后 alpha 二值化 + 透明区填键色（配合 transparentcolor 抠色）
-            img = _flatten_alpha_for_tk(img, self._Image, key)
+            img = _flatten_alpha_for_tk(img, Image, self.key_rgb)
             self.raw_img = img.copy()
-            self.img_mtime = os.path.getmtime(img_path)
-            # 不画光环（纯图片）
-            self.cur_accent = None
             old = getattr(self, 'img', None)
             self.img = self._ImageTk.PhotoImage(img, master=self.root)
             if old is not None:
                 _release_photo(old)  # 显式释放旧 tcl image（热重载/切皮肤同步清理）
-            # 窗口透明色 / 背景 / Label 底色全部跟随动态键色
-            key_hex = _key_hex(key)
+        self.img_mtime = os.path.getmtime(img_path)
+        # 不画光环（纯图片）
+        self.cur_accent = None
+        # 窗口透明色 / 背景 / Label 底色全部跟随动态键色
+        key_hex = _key_hex(self.key_rgb)
+        try:
+            self.root.attributes('-transparentcolor', key_hex)
+        except Exception:
+            pass
+        try:
+            self.root.configure(bg=key_hex)
+        except Exception:
+            pass
+        if hasattr(self, 'label'):
             try:
-                self.root.attributes('-transparentcolor', key_hex)
+                self.label.configure(image=self.img, bg=key_hex)
             except Exception:
                 pass
-            try:
-                self.root.configure(bg=key_hex)
-            except Exception:
-                pass
-            if hasattr(self, 'label'):
-                try:
-                    self.label.configure(image=self.img, bg=key_hex)
-                except Exception:
-                    pass
-        else:
-            self.img = tk.PhotoImage(file=img_path, master=self.root)
         self.w, self.h = self.img.width(), self.img.height()
         self.layer = self.cfg.get('layer', 'above')  # 热重载/切皮肤/缩放重载后同步图层配置
+        # 新图已挂上 Label，再释放旧帧序列的 tcl image（避免切换瞬间画布指向已删 image）
+        for _p in old_frames:
+            _release_photo(_p)
+        if self.anim_n > 1:
+            self._anim_start()
+
+    # ---------- 动图播放（v1.6）----------
+    def _pick_anim_key(self, Image, n):
+        """动图抠色键：多帧颜色并集（帧多则均匀采样，始终含首帧）"""
+        src = self.anim_src
+        imgs = []
+        for i in _sample_frame_indices(n, ANIM_KEY_SAMPLE):
+            try:
+                src.seek(i)
+                imgs.append(src.convert('RGBA'))
+            except Exception:
+                break
+        try:
+            src.seek(0)
+        except Exception:
+            pass
+        if not imgs:
+            return MAGENTA
+        return pick_key_color(imgs, Image)
+
+    def _decode_frame(self, idx):
+        """按需解码单帧：seek → RGBA → 缩放 → 抠色 → PhotoImage（不写 self.img）。"""
+        src = self.anim_src
+        if src is None:
+            return None
+        Image = self._Image
+        src.seek(idx % self.anim_n)
+        img = src.convert('RGBA')
+        base_h = getattr(self, '_base_h', 300.0)
+        if img.height > 0:
+            ratio = base_h / img.height
+            img = img.resize((max(1, int(img.width * ratio)), max(1, int(base_h))),
+                             Image.LANCZOS)
+        img = apply_display_effects(img, self.cfg, Image)   # 与静态图一致的特效管线
+        img = _flatten_alpha_for_tk(img, Image, self.key_rgb)
+        return self._ImageTk.PhotoImage(img, master=self.root)
+
+    def _get_frame(self, idx):
+        """取帧（LRU 缓存，上限 ANIM_CACHE_MAX 张）：命中即置为最近使用，
+        未命中则解码并按 FIFO 淘汰最旧（永不淘汰当前显示帧）。"""
+        idx = idx % self.anim_n
+        if idx in self._frame_cache:
+            self._frame_cache.move_to_end(idx)
+            return self._frame_cache[idx]
+        while len(self._frame_cache) >= ANIM_CACHE_MAX:
+            if len(self._frame_cache) == 1:
+                break                      # 只剩当前显示帧，宁可多留一帧
+            old_idx = next(iter(self._frame_cache))
+            if old_idx == self.anim_idx:
+                self._frame_cache.move_to_end(old_idx)   # 当前显示帧保底，改淘汰下一个
+                continue
+            _release_photo(self._frame_cache.pop(old_idx))
+        photo = self._decode_frame(idx)
+        if photo is None:
+            return getattr(self, 'img', None)
+        self._frame_cache[idx] = photo
+        return photo
+
+    def _on_root_destroy(self, event=None):
+        """root 销毁前取消动画 after（只在 root 自己身上触发时动作）"""
+        try:
+            if event is not None and getattr(event, 'widget', None) is not self.root:
+                return
+            self._anim_stop()
+        except Exception:
+            pass
+
+    def _graceful_quit(self):
+        """体面退出（右键菜单 / Ctrl+Alt+Q / 托盘退出 / 外部 WM_CLOSE 共用）：
+        停动画节拍 → 收托盘图标 → 销毁窗口，让 run() 的 finally 正常释放事件线程。"""
+        global _ACTIVE_OVERLAY
+        _write_log('[退出] 体面退出')
+        if _ACTIVE_OVERLAY is self:
+            _ACTIVE_OVERLAY = None
+        try:
+            self._anim_stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'tray', None):
+                self.tray.stop()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _anim_start(self):
+        self._anim_stop()
+        if self.anim_n > 1:
+            self.anim_idx = 0
+            self._schedule_anim(0)
+
+    def _anim_stop(self):
+        h = getattr(self, 'anim_after', None)
+        if h:
+            try:
+                self.root.after_cancel(h)
+            except Exception:
+                pass
+            self.anim_after = None
+
+    def _schedule_anim(self, delay_ms):
+        try:
+            self.anim_after = self.root.after(int(delay_ms), self._anim_tick)
+        except Exception:
+            self.anim_after = None
+
+    def _anim_tick(self):
+        """动图播放节拍：窗口隐藏 → 暂停（仅低频探活，CPU 最大省钱点）；
+        显示 → 推进到下一帧并按该帧时长重排，顺带预解下下帧消 seek 卡顿。"""
+        self.anim_after = None
+        if self.anim_n <= 1:
+            return
+        try:
+            if not self.visible:
+                self._schedule_anim(ANIM_HIDDEN_POLL_MS)
+                return
+            src = self.anim_src
+            nxt = (self.anim_idx + 1) % self.anim_n
+            try:
+                src.seek(nxt)
+                dur = _frame_duration(src)
+            except Exception:
+                dur = 100
+            self.anim_idx = nxt
+            photo = self._get_frame(nxt)
+            if photo is not None:
+                self.img = photo
+                try:
+                    self.label.configure(image=photo)
+                except Exception:
+                    pass
+            self._prefetch(nxt)
+            self._schedule_anim(dur)
+        except Exception as e:
+            try:
+                _write_log(f'[_anim_tick] 异常: {e}')
+            except Exception:
+                pass
+            self._schedule_anim(200)
+
+    def _prefetch(self, idx):
+        """预解下一帧（最多再解 1 帧，单帧开销 15-30ms，不影响 15-30fps）"""
+        try:
+            if self.anim_n > 1:
+                self._get_frame((idx + 1) % self.anim_n)
+        except Exception:
+            pass
 
     # ---------- 多皮肤 ----------
     def apply_skin(self, name):
@@ -2067,6 +3112,7 @@ class FollowOverlay:
             return False
         self.cfg = cfg
         self.load_char()
+        _write_log(f'[皮肤] 切换到 {name} image={cfg.get("image")}')
         self._sync_tk_geometry()  # 尺寸变化：低频 geometry 同步镜像坐标（与 SetWindowPos 镜像一致）
         # 图层同步：切皮肤后候选框在场 → 重插层级（layer/side 可能已随皮肤变化）
         self._sync_layer_with_candidate()
@@ -2185,7 +3231,19 @@ class FollowOverlay:
         向导作为独立窗口打开（双 Tk 嵌套 mainloop，overlay 的跟随/托盘不受影响）：
         - 保存新配置 → 替换当前实例（停托盘、关窗口、启动新配置的 overlay）
         - 取消/关闭向导 → 什么都不动，外挂继续后台运行
+        - 单实例守卫：连点托盘/右键菜单只保留一个配置窗，后到的把已有窗提到前面
+          （否则每次点击都会排队开一个新向导 → 「托盘多点几次多出几个程序」）
         """
+        w = getattr(self, '_wizard', None)
+        if w is not None:
+            try:
+                w.root.deiconify()
+                w.root.lift()
+                w.root.focus_force()
+                return
+            except Exception:
+                self._wizard = None
+
         def start(cfg2):
             try:
                 self.tray.stop()
@@ -2201,9 +3259,12 @@ class FollowOverlay:
             FollowOverlay(cfg2).run()
         try:
             wizard = ConfigWizard(on_done=start, overlay=self)
+            self._wizard = wizard
             wizard.root.mainloop()
         except Exception:
             pass
+        finally:
+            self._wizard = None
 
     # ---------- 路径 B：事件驱动定位（替代 50ms 全桌轮询）----------
     def _top_hwnd(self):
@@ -2338,22 +3399,19 @@ class FollowOverlay:
             return False
 
     def _try_attach_show_hwnd(self, hwnd):
-        """SHOW 事件候选句柄直挂（免全扫）：校验可见 + TSF 样式 + 尺寸合理后缓存并定位。"""
+        """SHOW 事件候选句柄直挂（免全扫）：与全扫共用 _is_candidate_window 统一判定。
+        v1.6 修复误贴：原直挂路径缺 ATL: 类名约束，Electron/Edge 菜单与网址提示浮层、
+        explorer 浮层等非候选小窗在候选框空缺时 SHOW 即被直挂（见 B_test_misdetect_diag）。"""
         try:
             if not hwnd or not user32.IsWindowVisible(hwnd):
                 return False
-            if not _is_tsf_candidate_style(hwnd) and not _window_belongs_to_weasel(hwnd):
-                return False
-            rect = wintypes.RECT()
-            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                return False
-            w, h = rect.right - rect.left, rect.bottom - rect.top
-            if not (0 < w < 1300 and 0 < h < 1000 and h < w * 4):
+            if not _is_candidate_window(hwnd):
                 return False
             self._cached_hwnd = hwnd
             set_candidate_hwnd(hwnd)
             self._hide_since = None
             self._pos_dirty = True
+            _write_log(f'[候选框] SHOW 直挂 hwnd=0x{hwnd:X} {_describe_window(hwnd)}')
             self._position_once()
             # SHOW 直挂后补一次图层插序：候选框重建自愈（v1.4 相对 v1.2 的关键优势）
             if self.visible:
@@ -2381,10 +3439,11 @@ class FollowOverlay:
             return False
         if not win:
             return False
-        hwnd, _rect = win
+        hwnd, rect = win
         if hwnd != self._cached_hwnd:
             self._cached_hwnd = hwnd
             set_candidate_hwnd(hwnd)
+            _write_log(f'[候选框] 命中 hwnd=0x{hwnd:X} {_describe_window(hwnd)}')
         self._hide_since = None
         self._need_rescan = False
         self._position_once()
@@ -2597,12 +3656,55 @@ class FollowOverlay:
 
 # ============ 入口 ============
 def _write_log(msg):
-    """写运行日志到 exe 同目录 error.log（排查用）"""
+    """写关键操作日志到 exe 同目录 error.log（带时间戳；超 256KB 自动轮转）。
+
+    只记关键点：启动/退出、配置保存、切皮肤、预处理、自启开关、清理、候选框首次命中、
+    异常（含 traceback）。日常打字/跟随/移动不记，所以长期用也不会膨胀。
+    """
     try:
-        with open(os.path.join(HERE, 'error.log'), 'a', encoding='utf-8') as f:
-            f.write(f'{msg}\n')
+        path = os.path.join(HERE, 'error.log')
+        try:
+            if os.path.getsize(path) > 256 * 1024:
+                bak = path + '.1'
+                if os.path.exists(bak):
+                    os.remove(bak)
+                os.rename(path, bak)
+        except OSError:
+            pass
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}\n')
     except Exception:
         pass
+
+
+def _log_env(tag='启动'):
+    """记录环境指纹：版本/打包形式/Python/系统/DPI/参数 —— 事后按日志就能复现大半"""
+    try:
+        import platform
+        dpi = ''
+        try:
+            g32 = ctypes.windll.gdi32
+            dc = ctypes.windll.user32.GetDC(0)
+            dpi = f' dpi={g32.GetDeviceCaps(dc, 90)}'   # LOGPIXELSY（gdi32）
+            ctypes.windll.user32.ReleaseDC(0, dc)
+        except Exception:
+            pass
+        _write_log(f'[{tag}] {VERSION} frozen={getattr(sys, "frozen", False)} '
+                   f'python={sys.version.split()[0]} os={platform.platform()}{dpi} '
+                   f'cwd={os.getcwd()} argv={sys.argv[1:]}')
+    except Exception:
+        pass
+
+
+def _human_size(n):
+    try:
+        n = float(n)
+    except Exception:
+        return '?'
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if n < 1024 or unit == 'GB':
+            return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.1f} {unit}'
+        n /= 1024.0
 
 def _ask_action():
     """弹选择框：直接启动 / 重新配置"""
@@ -2622,13 +3724,11 @@ def _ask_action():
 
 def main():
     try:
-        # 启动即写日志（诊断用：任何路径都留痕，含 cwd/exe/python 版本）
-        try:
-            _write_log(f'[启动] v{VERSION} cwd={os.getcwd()} exe={sys.argv[0]} '
-                       f'frozen={getattr(sys, "frozen", False)} python={sys.version.split()[0]}')
-        except Exception:
-            pass
+        # 启动即写日志（环境指纹：版本/打包形式/系统/DPI/参数 —— 事后按日志就能复现大半）
+        _log_env('启动')
         argv = [a for a in sys.argv if not a.startswith('--')]
+        # --tray：开机自启专用（静默启动到托盘，不弹选择框/不显示窗口）
+        tray_mode = '--tray' in sys.argv
         if len(argv) >= 2 and not argv[1].startswith('-'):
             # 命令行模式（临时指定图片），单例检查
             if _already_running():
@@ -2643,6 +3743,14 @@ def main():
 
         cfg = load_config()
         if cfg:
+            if tray_mode:
+                # 自启模式：已有实例就静默退出（开机重复触发不打扰），否则直接后台跑到托盘
+                if _already_running():
+                    _write_log('[启动] --tray 已有实例在跑，静默退出')
+                    return
+                _write_log(f'[启动] --tray 静默启动到托盘: {cfg}')
+                FollowOverlay(cfg).run()
+                return
             # 有配置 → 先弹选择框（单例检查在这之后）
             try:
                 start_now = _ask_action()
@@ -2666,7 +3774,11 @@ def main():
             ConfigWizard(on_done=start).root.mainloop()
             return
 
-        # 无配置 → 直接弹向导（保存后若已有实例则替换）
+        # 无配置 → 直接弹向导（保存后若已有实例则替换）；--tray 下不弹（开机不该蹦出配置窗）
+        if tray_mode:
+            _write_log('[启动] --tray 尚无配置，静默退出')
+            return
+
         def start(cfg):
             if _already_running():
                 _kill_existing()
