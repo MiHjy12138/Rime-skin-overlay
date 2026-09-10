@@ -44,14 +44,19 @@ def test_effects(tmp):
     check('1d 圆角：边缘中段保持不透明', corner.getpixel((100, 2))[3] >= 128,
           f'alpha={corner.getpixel((100, 2))[3]}')
 
-    blurred = R.apply_display_effects(noisy, {'blur_enabled': True, 'blur_radius': 8}, Image)
-    check('1e 模糊：尺寸不变', blurred.size == noisy.size)
-    check('1f 模糊：画面确实被柔化', blurred.tobytes() != noisy.tobytes())
+    # 整体模糊已按用户反馈移除：旧配置里的 blur 字段应当被安全忽略（不崩、不改图）
+    legacy = R.apply_display_effects(noisy, {'blur_enabled': True, 'blur_radius': 8}, Image)
+    check('1e 已移除的 blur 字段被安全忽略',
+          legacy.size == noisy.size and legacy.tobytes() == noisy.tobytes())
 
     both = R.apply_display_effects(
-        img, {'corner_enabled': True, 'corner_radius': 20,
-              'blur_enabled': True, 'blur_radius': 4}, Image)
-    check('1g 两者可叠加', both.size == img.size and both.getpixel((1, 1))[3] < 128)
+        noisy, {'corner_enabled': True, 'corner_radius': 20,
+                'blur_enabled': True, 'blur_radius': 4}, Image)
+    check('1f 圆角 + 旧 blur 字段共存（圆角仍生效）',
+          both.size == noisy.size and both.getpixel((1, 1))[3] < 128)
+
+    check('1g 默认配置已无 blur 字段',
+          'blur_enabled' not in R.DEFAULT_CONFIG and 'blur_radius' not in R.DEFAULT_CONFIG)
 
     none = R.apply_display_effects(img, {}, Image)
     check('1h 关闭时原样返回（不影响老配置）', none.tobytes() == img.tobytes())

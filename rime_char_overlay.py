@@ -334,8 +334,6 @@ DEFAULT_CONFIG = {
     # 显示期特效（只影响外挂显示，不改图片文件本身；皮肤档案一并保存）
     'corner_enabled': False,   # 圆角
     'corner_radius': 24,       # 圆角半径（px，按缩放后的显示尺寸）
-    'blur_enabled': False,     # 整体模糊（高斯，作用于整张图）
-    'blur_radius': 6,          # 模糊半径（px，0~30）
     'feather_enabled': False,  # 点阵羽化（边缘 alpha 用有序抖动近似成渐变）
     'feather_radius': 24,      # 羽化带宽（px，0~80）
 }
@@ -649,12 +647,11 @@ def _tile_bayer(size, Image):
 
 
 def apply_display_effects(img_rgba, cfg, Image=None):
-    """显示期特效：水平翻转 + 整体模糊（RGB）+ 点阵羽化（alpha）+ 圆角遮罩（alpha）。
+    """显示期特效：水平翻转 + 点阵羽化（alpha）+ 圆角遮罩（alpha）。
 
     ⚠️ 透明机制上限（README「已知限制」同步写明）：tkinter 的 -transparentcolor
     只支持「全透明 / 全不透明」两档，做不出真正的半透明渐变。所以：
       · 水平翻转：显示期镜像（不动文件，动图同样生效，随时可逆）；
-      · 整体模糊：作用在 RGB 上（柔化画面本身），不受 alpha 二值化影响；
       · 点阵羽化：用 4×4 有序抖动把羽化带内的 alpha 近似成渐变
         （远看像边缘渐隐，贴近看是细点阵——真羽化要等 2.0 分层窗）；
       · 圆角：作用在 alpha 上，4× 超采样绘制后缩回，让硬边尽量贴合轮廓。
@@ -667,13 +664,6 @@ def apply_display_effects(img_rgba, cfg, Image=None):
     try:
         if cfg.get('flip_h'):
             out = out.transpose(Image.FLIP_LEFT_RIGHT)
-    except Exception:
-        pass
-    try:
-        br = int(cfg.get('blur_radius', 0) or 0)
-        if cfg.get('blur_enabled') and br > 0:
-            from PIL import ImageFilter
-            out = out.filter(ImageFilter.GaussianBlur(float(min(br, 60))))
     except Exception:
         pass
     try:
@@ -1977,26 +1967,16 @@ class ConfigWizard:
                                        justify='left', wraplength=300)
         self.lbl_layer_hint.pack(anchor='w', pady=(0, 4))
 
-        # ⑨ 特效（显示期：圆角 / 整体模糊；只影响外挂显示，不改图片文件）
+        # ⑨ 特效（显示期：圆角；只影响外挂显示，不改图片文件）
         tk.Label(adv, text='⑨ 特效（只影响显示）:', font=('Microsoft YaHei', 10)).pack(anchor='w')
         row_fx = tk.Frame(adv)
-        row_fx.pack(anchor='w', pady=(0, 2))
+        row_fx.pack(anchor='w', pady=(0, 4))
         self.var_corner = tk.BooleanVar(master=self.root, value=False)
         tk.Checkbutton(row_fx, text='圆角', variable=self.var_corner,
                        font=('Microsoft YaHei', 9),
                        command=self._update_preview).pack(side='left')
         self.var_corner_r = tk.IntVar(master=self.root, value=24)
         tk.Scale(row_fx, from_=0, to=120, orient='horizontal', variable=self.var_corner_r,
-                 length=110, command=lambda _: self._update_preview(),
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
-        row_fx2 = tk.Frame(adv)
-        row_fx2.pack(anchor='w', pady=(0, 4))
-        self.var_blur = tk.BooleanVar(master=self.root, value=False)
-        tk.Checkbutton(row_fx2, text='整体模糊', variable=self.var_blur,
-                       font=('Microsoft YaHei', 9),
-                       command=self._update_preview).pack(side='left')
-        self.var_blur_r = tk.IntVar(master=self.root, value=6)
-        tk.Scale(row_fx2, from_=0, to=30, orient='horizontal', variable=self.var_blur_r,
                  length=110, command=lambda _: self._update_preview(),
                  font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
 
@@ -2063,8 +2043,6 @@ class ConfigWizard:
         try:
             return {'corner_enabled': bool(self.var_corner.get()),
                     'corner_radius': int(self.var_corner_r.get()),
-                    'blur_enabled': bool(self.var_blur.get()),
-                    'blur_radius': int(self.var_blur_r.get()),
                     'feather_enabled': bool(self.var_feather.get()),
                     'feather_radius': int(self.var_feather_r.get()),
                     'flip_h': bool(self.var_flip.get())}
@@ -2275,8 +2253,6 @@ class ConfigWizard:
         # 特效参数随皮肤整套恢复
         self.var_corner.set(bool(cfg.get('corner_enabled', False)))
         self.var_corner_r.set(int(cfg.get('corner_radius', 24) or 0))
-        self.var_blur.set(bool(cfg.get('blur_enabled', False)))
-        self.var_blur_r.set(int(cfg.get('blur_radius', 6) or 0))
         self.var_feather.set(bool(cfg.get('feather_enabled', False)))
         self.var_feather_r.set(int(cfg.get('feather_radius', 24) or 0))
         self.var_flip.set(bool(cfg.get('flip_h', False)))
@@ -2589,8 +2565,8 @@ class ConfigWizard:
         # 显示期特效（圆角 / 高斯模糊）：写进配置，随皮肤一起保存
         self.cfg['corner_enabled'] = bool(self.var_corner.get())
         self.cfg['corner_radius'] = int(self.var_corner_r.get())
-        self.cfg['blur_enabled'] = bool(self.var_blur.get())
-        self.cfg['blur_radius'] = int(self.var_blur_r.get())
+        self.cfg.pop('blur_enabled', None)   # 旧字段清理（整体模糊已移除）
+        self.cfg.pop('blur_radius', None)
         self.cfg['feather_enabled'] = bool(self.var_feather.get())
         self.cfg['feather_radius'] = int(self.var_feather_r.get())
         self.cfg['flip_h'] = bool(self.var_flip.get())
@@ -2605,8 +2581,7 @@ class ConfigWizard:
         _write_log(f'[配置] 保存 image={self.cfg.get("image")} layout={self.cfg.get("layout")} '
                    f'side={self.cfg.get("side")} layer={self.cfg.get("layer")} '
                    f'scale={self.cfg.get("scale")} 圆角={self.cfg.get("corner_enabled")}/'
-                   f'{self.cfg.get("corner_radius")} 整体模糊={self.cfg.get("blur_enabled")}/'
-                   f'{self.cfg.get("blur_radius")} 点阵羽化={self.cfg.get("feather_enabled")}/'
+                   f'{self.cfg.get("corner_radius")} 点阵羽化={self.cfg.get("feather_enabled")}/'
                    f'{self.cfg.get("feather_radius")} 自启={self.cfg.get("autostart")}')
         self.root.destroy()
         self.on_done(self.cfg)
