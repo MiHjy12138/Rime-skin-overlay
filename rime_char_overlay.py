@@ -2668,14 +2668,35 @@ def _tile_bayer(size, Image):
     return out
 
 
+def _feather_true_alpha(cfg):
+    """羽化走「逐像素真羽化」还是「4×4 点阵近似」？
+
+    v2.0-R1：真 alpha 分层窗支持逐像素 alpha，羽化就可以是真渐变；而 Tk 老路径
+    （-transparentcolor）只有全透明/全不透明两档，只能拿点阵近似。判定口径：
+      · cfg['true_alpha'] 显式给真值 → 真羽化（向导预览用它对齐模式）
+      · 否则看 cfg['render_mode'] == 'alpha'（运行时 overlay.cfg 自带该键）
+      · 缺键 / 非法值 → 点阵近似（compat 老路径零变化）
+    """
+    try:
+        if bool(cfg.get('true_alpha')):
+            return True
+    except Exception:
+        return False
+    try:
+        return resolve_render_mode(cfg) == 'alpha'
+    except Exception:
+        return False
+
+
 def apply_display_effects(img_rgba, cfg, Image=None):
-    """显示期特效：水平翻转 + 点阵羽化（alpha）+ 圆角遮罩（alpha）。
+    """显示期特效：水平翻转 + 羽化（alpha）+ 圆角遮罩（alpha）。
 
     ⚠️ 透明机制上限（README「已知限制」同步写明）：tkinter 的 -transparentcolor
     只支持「全透明 / 全不透明」两档，做不出真正的半透明渐变。所以：
       · 水平翻转：显示期镜像（不动文件，动图同样生效，随时可逆）；
-      · 点阵羽化：用 4×4 有序抖动把羽化带内的 alpha 近似成渐变
-        （远看像边缘渐隐，贴近看是细点阵——真羽化要等 2.0 分层窗）；
+      · 羽化：兼容模式用 4×4 有序抖动把羽化带内的 alpha 近似成渐变
+        （远看像边缘渐隐，贴近看是细点阵）；**增强模式**（render_mode=alpha /
+        cfg['true_alpha']）改走逐像素高斯渐变 —— 真羽化，见 _feather_true_alpha；
       · 圆角：作用在 alpha 上，4× 超采样绘制后缩回，让硬边尽量贴合轮廓。
     与预处理抠图共存：alpha 相乘关系，抠图得出的透明区不受影响。
     """
@@ -2695,16 +2716,22 @@ def apply_display_effects(img_rgba, cfg, Image=None):
             from PIL import ImageDraw, ImageFilter, ImageChops
             w, h = out.size
             band = max(2, min(fr, min(w, h) // 2))
-            # 内部掩膜：带内 0 → 内部 255（高斯过渡），作为抖动用的渐变坡度
+            # 内部掩膜：带内 0 → 内部 255（高斯过渡）。兼容模式拿它当抖动坡度，
+            # 增强模式（v2.0-R1）直接拿它当逐像素 alpha。
             inner = Image.new('L', (w, h), 0)
             ImageDraw.Draw(inner).rectangle((band, band, w - band - 1, h - band - 1),
                                             fill=255)
             inner = inner.filter(ImageFilter.GaussianBlur(band * 0.5))
-            ramp = ImageChops.add(inner, _tile_bayer((w, h), Image), 1.0, -128)
-            alpha = ImageChops.multiply(out.split()[3],
-                                        ramp.point(lambda v: 255 if v > 128 else 0))
             out = out.copy()
-            out.putalpha(alpha)
+            if _feather_true_alpha(cfg):
+                # 增强（真羽化）：分层窗支持逐像素 alpha → 渐变本身就是边缘过渡，
+                # 没有点阵颗粒（4×4 有序抖动只是它在兼容模式下的近似）
+                out.putalpha(ImageChops.multiply(out.split()[3], inner))
+            else:
+                # 兼容：Tk 键色透明只有「全透明/全不透明」两档 → 用 4×4 有序抖动近似渐变
+                ramp = ImageChops.add(inner, _tile_bayer((w, h), Image), 1.0, -128)
+                out.putalpha(ImageChops.multiply(
+                    out.split()[3], ramp.point(lambda v: 255 if v > 128 else 0)))
     except Exception:
         pass
     try:
@@ -2723,6 +2750,63 @@ def apply_display_effects(img_rgba, cfg, Image=None):
     except Exception:
         pass
     return out
+
+
+# ---- 预览棋盘格（v2.0-R1）：Tk 的 PhotoImage 不支持逐像素 alpha，预览必须先把 RGBA 合成掉 ----
+CHECKER_CELL = 16                       # 棋盘格边长（对齐 ImagePreprocessDialog._draw_checker 的 16px）
+CHECKER_LIGHT = (255, 255, 255)
+CHECKER_DARK = (214, 214, 214)
+
+
+def checker_background(size, cell=CHECKER_CELL, light=CHECKER_LIGHT, dark=CHECKER_DARK,
+                       Image=None):
+    """生成透明棋盘格底图（RGB）。
+
+    与 ImagePreprocessDialog._draw_checker 同一套做法（16px 一格、偶格用深色），
+    区别只是：那边画在 Tk Canvas 上当背景，这里生成 PIL 底图供 alpha 合成。
+    """
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
+    w, h = max(1, int(size[0])), max(1, int(size[1]))
+    cell = max(2, int(cell))
+    bg = Image.new('RGB', (w, h), light)
+    try:
+        from PIL import ImageDraw
+        d = ImageDraw.Draw(bg)
+        for y in range(0, h, cell):
+            for x in range(0, w, cell):
+                if ((x // cell) + (y // cell)) % 2 == 0:
+                    d.rectangle((x, y, min(x + cell - 1, w - 1), min(y + cell - 1, h - 1)),
+                                fill=dark)
+    except Exception:
+        pass
+    return bg
+
+
+def compose_on_checker(img_rgba, cell=CHECKER_CELL, Image=None):
+    """把 RGBA 合成到棋盘格上 → RGB 图（预览专用）。
+
+    Tk PhotoImage 丢掉 alpha、画布又是白底，所以透明与半透明在预览里根本看不出来
+    （用户实测：「渲染增强没看见对应的预览」）。先合成再显示就能看见：
+      · 全透明像素 → 露出棋盘格（= 这里是透明的）
+      · 半透明像素 → 图片颜色与棋盘格的混合色（= 这里是半透明的）
+    这样「兼容 = 硬边点阵 / 增强 = 颜色到棋盘格的平滑过渡」才肉眼可辨。
+    """
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
+    bg = checker_background(img_rgba.size, cell=cell, Image=Image)
+    try:
+        return Image.alpha_composite(bg.convert('RGBA'),
+                                     img_rgba.convert('RGBA')).convert('RGB')
+    except Exception:
+        try:
+            out = bg.copy()
+            out.paste(img_rgba.convert('RGB'), (0, 0), img_rgba.split()[3])
+            return out
+        except Exception:
+            return bg
 
 
 def decode_anim_frame_rgba(overlay, idx):
@@ -3930,6 +4014,8 @@ class ConfigWizard:
         self._anim_idx = 0
         self._anim_on = False
         self._anim_after = None
+        # R1：进入「增强（真羽化）」模式前的点阵羽化勾选（切回兼容时原样恢复）
+        self._feather_prev = None
 
         self.root = tk.Tk()
         self.root.title(f'Rime 皮肤外挂 {VERSION} - 配置')
@@ -4111,20 +4197,32 @@ class ConfigWizard:
                  length=110, command=lambda _: self._update_preview(),
                  font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
 
-        # ⑩ 点阵羽化（用 4×4 有序抖动把边缘 alpha 近似成渐变）
+        # ⑩ 点阵羽化（用 4×4 有序抖动把边缘 alpha 近似成渐变）+ R1「增强（真羽化）」开关
         tk.Label(adv, text='⑩ 点阵羽化:', font=('Microsoft YaHei', 10)).pack(anchor='w')
         row_fe = tk.Frame(adv)
         row_fe.pack(anchor='w')
         self.var_feather = tk.BooleanVar(master=self.root, value=False)
-        tk.Checkbutton(row_fe, text='启用', variable=self.var_feather,
-                       font=('Microsoft YaHei', 9),
-                       command=self._update_preview).pack(side='left')
+        self.chk_feather = tk.Checkbutton(row_fe, text='启用', variable=self.var_feather,
+                                          font=('Microsoft YaHei', 9),
+                                          command=self._update_preview)
+        self.chk_feather.pack(side='left')
         self.var_feather_r = tk.IntVar(master=self.root, value=24)
-        tk.Scale(row_fe, from_=0, to=80, orient='horizontal', variable=self.var_feather_r,
-                 length=110, command=lambda _: self._update_preview(),
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
-        tk.Label(adv, text='带宽 px；远看像半透明，近看是点阵', fg='#888',
-                 font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(0, 4))
+        self.scl_feather = tk.Scale(row_fe, from_=0, to=80, orient='horizontal',
+                                    variable=self.var_feather_r,
+                                    length=110, command=lambda _: self._update_preview(),
+                                    font=('Microsoft YaHei', 8))
+        self.scl_feather.pack(side='left', padx=2)
+        # v2.0-R1：真 alpha 以前只做在 ⑪ 单选里，用户要的是「放后面的开关」→ 加在 ⑩ 后面。
+        # 它与 ⑪ 渲染模式双向联动（一处改另一处同步）：两边都收口到 _update_render_hint()
+        self.var_alpha_feather = tk.BooleanVar(master=self.root, value=False)
+        self.chk_alpha_feather = tk.Checkbutton(
+            row_fe, text='增强（真羽化）', variable=self.var_alpha_feather,
+            font=('Microsoft YaHei', 9), command=self._on_alpha_feather_toggle)
+        self.chk_alpha_feather.pack(side='left', padx=(8, 0))
+        self.lbl_feather_hint = tk.Label(
+            adv, text='带宽 px；点阵羽化是兼容模式下的近似（远看半透明，近看有细点阵）',
+            fg='#888', font=('Microsoft YaHei', 8))
+        self.lbl_feather_hint.pack(anchor='w', pady=(0, 4))
 
         # ⑪ 渲染模式（v2.0-①）：兼容 = v1.6 老路径；增强 = 真 alpha 分层窗（真·半透明）
         tk.Label(adv, text='⑪ 渲染模式:', font=('Microsoft YaHei', 10)).pack(anchor='w')
@@ -4524,10 +4622,85 @@ class ConfigWizard:
         finally:
             self._layer_loading = False
 
-    def _update_render_hint(self):
-        """渲染模式提示（大白话，不摆 compat/alpha 术语）"""
+    def _is_alpha_mode(self):
+        """当前 ⑪ 渲染模式 / ⑩ 旁「增强（真羽化）」开关是不是指向「增强」"""
         try:
-            if resolve_render_mode({'render_mode': self.var_render.get()}) == 'alpha':
+            return resolve_render_mode({'render_mode': self.var_render.get()}) == 'alpha'
+        except Exception:
+            return False
+
+    def _on_alpha_feather_toggle(self):
+        """⑩ 旁「增强（真羽化）」开关：勾/取消 = 切 ⑪ 渲染模式，随即同步两处并立刻重绘预览。
+
+        Tk 的 set() 不触发 command，所以这里与 _update_render_hint 之间没有递归。
+        """
+        try:
+            want = bool(self.var_alpha_feather.get())
+        except Exception:
+            want = False
+        try:
+            self.var_render.set('alpha' if want else 'compat')
+        except Exception:
+            pass
+        self._update_render_hint()
+
+    def _sync_feather_widgets(self):
+        """⑩ 旁开关回显 + 「点阵羽化」勾选框的可编辑性（增强模式下置灰）。
+
+        v2.0-R1：增强模式走分层窗的逐像素 alpha，「点阵羽化」（compat 的 4×4 抖动近似）
+        已不参与渲染 —— 所以勾选框锁定在勾选态并置灰，提示行写明「点阵 = 兼容模式的近似」；
+        切回兼容模式恢复用户原来的勾选（self._feather_prev 记忆）。
+        带宽滑条仍可拖：增强模式下它调的就是真羽化的过渡带宽度（拖到 0 = 不羽化）。
+        """
+        alpha = self._is_alpha_mode()
+        try:
+            if bool(self.var_alpha_feather.get()) != alpha:
+                self.var_alpha_feather.set(alpha)
+        except Exception:
+            pass
+        try:
+            if alpha:
+                if self._feather_prev is None:
+                    self._feather_prev = bool(self.var_feather.get())
+                if not bool(self.var_feather.get()):
+                    self.var_feather.set(True)
+            elif self._feather_prev is not None:
+                self.var_feather.set(bool(self._feather_prev))
+                self._feather_prev = None
+        except Exception:
+            pass
+        try:
+            self.chk_feather.config(state='disabled' if alpha else 'normal')
+        except Exception:
+            pass
+        try:
+            self.lbl_feather_hint.config(
+                text=('带宽 px；增强模式 = 逐像素真羽化（点阵近似已被替代，勾选已锁定）'
+                      if alpha else
+                      '带宽 px；点阵羽化是兼容模式下的近似（要逐像素真羽化请勾右边「增强」）'),
+                fg='#2e7d32' if alpha else '#888')
+        except Exception:
+            pass
+
+    def _safe_update_preview(self):
+        """开关即时反馈：立刻重绘预览。控件还没建好（构造期）时静默跳过，不炸向导构建。"""
+        try:
+            if getattr(self, 'canvas', None) is None:
+                return False
+            self._update_preview()
+            return True
+        except Exception:
+            return False
+
+    def _update_render_hint(self):
+        """渲染模式提示（大白话，不摆 compat/alpha 术语）。
+
+        v2.0-R1：这里同时是「⑪ 渲染模式 ↔ ⑩ 旁「增强（真羽化）」开关」双向联动的收口 ——
+        ⑪ 单选 command、⑩ 旁开关 command、切皮肤回显都走这里，所以两处永远一致；
+        末尾再刷一次预览，做到「勾一下立刻看到差别」。
+        """
+        try:
+            if self._is_alpha_mode():
                 txt = ('💡 增强：支持真·半透明（羽化/圆角边缘更柔和、图里含品红也不再被抠穿）。\n'
                        '透明区域会点击穿透（不挡鼠标，点击落到下面的窗口）；拖动请抓图片不透明部分。')
             else:
@@ -4536,14 +4709,55 @@ class ConfigWizard:
             self.lbl_render_hint.configure(text=txt)
         except Exception:
             pass
+        self._sync_feather_widgets()
+        self._safe_update_preview()
+
+    def _preview_render_mode_img(self, img):
+        """预览的「显示口径」对齐运行时渲染模式。
+
+        兼容（compat）：Tk 键色透明只有全透/全不透两档 → alpha 二值化（>=128 不透明），
+                        半透明在真实窗口里也是硬边，预览不能假装它平滑；
+        增强（alpha）：分层窗支持逐像素 alpha → 原样保留（半透明 / 真羽化都平滑）。
+        """
+        try:
+            if self._is_alpha_mode():
+                return img
+            a = img.split()[3].point(lambda v: 255 if v >= 128 else 0)
+            out = img.copy()
+            out.putalpha(a)
+            return out
+        except Exception:
+            return img
+
+    def _checker_compose(self, img):
+        """预览用：按渲染模式对齐显示口径 → 合成到棋盘格（Tk 画布不支持逐像素 alpha）。
+
+        用户实测「渲染增强没看见对应的预览」的根因就在这：以前 RGBA 直接塞给
+        PhotoImage（alpha 被丢）又画在白底上，兼容/增强、透明/半透明全长一样。
+        现在 兼容 = 二值 alpha + 点阵 → 硬边；增强 = 逐像素 alpha + 真羽化 → 平滑过渡。
+        """
+        try:
+            return compose_on_checker(self._preview_render_mode_img(img), CHECKER_CELL,
+                                      self._Image)
+        except Exception:
+            try:
+                return img.convert('RGB')
+            except Exception:
+                return img
 
     def _effects_cfg(self):
-        """向导里的特效参数（与 config 同名字段，可直接喂给 apply_display_effects）"""
+        """向导里的特效参数（与 config 同名字段，可直接喂给 apply_display_effects）
+
+        v2.0-R1：增强（真羽化）模式下羽化恒定开启且走逐像素真羽化（true_alpha）——
+        与「⑩ 旁开关勾上 = 点阵被真羽化替代」的 UI 口径一致，保存与预览也不打架。
+        """
         try:
+            alpha = self._is_alpha_mode()
             return {'corner_enabled': bool(self.var_corner.get()),
                     'corner_radius': int(self.var_corner_r.get()),
-                    'feather_enabled': bool(self.var_feather.get()),
+                    'feather_enabled': bool(self.var_feather.get()) or alpha,
                     'feather_radius': int(self.var_feather_r.get()),
+                    'true_alpha': alpha,
                     'flip_h': bool(self.var_flip.get())}
         except Exception:
             return {}
@@ -4583,8 +4797,9 @@ class ConfigWizard:
                 ld['follow_width_ratio'] = (int(self.var_lay_follow_r.get()) / 100.0
                                             if self.var_lay_follow.get() else 0.0)
                 if i == 0:
+                    # true_alpha 是「预览当前渲染模式」的口径，不是图层参数，逐层注入（见下）
                     ld['effects'] = {k: v for k, v in self._effects_cfg().items()
-                                     if k != 'flip_h'}
+                                     if k not in ('flip_h', 'true_alpha')}
             except Exception:
                 pass
             layers[i] = ld
@@ -4612,6 +4827,8 @@ class ConfigWizard:
                                    self._Image.BILINEAR)
                 eff = dict(ld.get('effects') or {})
                 eff['flip_h'] = bool(ld.get('flip'))
+                # v2.0-R1：羽化实现跟当前渲染模式走（增强 = 逐像素真羽化）
+                eff['true_alpha'] = self._is_alpha_mode()
                 im = apply_display_effects(im, eff, self._Image)
             except Exception:
                 im = None
@@ -5413,7 +5630,9 @@ class ConfigWizard:
                             continue
                         dx, dy = pos.get(k, (0, 0))
                         px, py = base_x + wx0 + dx, base_y + wy0 + dy
-                        tk_im = self._ImageTk.PhotoImage(im, master=self.root)
+                        # R1：预览先合成到棋盘格再显示（Tk 图片丢 alpha，白底上看不出透明/半透明）
+                        tk_im = self._ImageTk.PhotoImage(self._checker_compose(im),
+                                                         master=self.root)
                         self._photo_refs.append(tk_im)
                         if len(self._photo_refs) > MAX_LAYERS + 2:
                             _release_photo(self._photo_refs.pop(0))
@@ -5472,7 +5691,9 @@ class ConfigWizard:
                     ix = base_x + (cw - new_w) // 2 + offx
                 iy = base_y + (ch - new_h) // 2 + offy
                 # 预览不加光环（实际运行时有皮肤联动光环）
-                self.tk_img = self._ImageTk.PhotoImage(img, master=self.root)
+                # R1：合成到棋盘格再显示 —— 兼容 = 硬边点阵、增强 = 颜色到棋盘的平滑过渡
+                self.tk_img = self._ImageTk.PhotoImage(self._checker_compose(img),
+                                                       master=self.root)
                 self._photo_refs.append(self.tk_img)
                 if len(self._photo_refs) > 3:
                     _release_photo(self._photo_refs.pop(0))
@@ -5655,7 +5876,9 @@ class ConfigWizard:
         self.cfg['corner_radius'] = int(self.var_corner_r.get())
         self.cfg.pop('blur_enabled', None)   # 旧字段清理（整体模糊已移除）
         self.cfg.pop('blur_radius', None)
-        self.cfg['feather_enabled'] = bool(self.var_feather.get())
+        # v2.0-R1：增强（真羽化）模式下羽化恒定开启（走逐像素真羽化）—— 与预览口径一致；
+        # 兼容模式下仍按用户在 ⑩ 的勾选（老路径零变化）
+        self.cfg['feather_enabled'] = bool(self.var_feather.get()) or self._is_alpha_mode()
         self.cfg['feather_radius'] = int(self.var_feather_r.get())
         # 注意：flip_h 不再在这里从 var_flip 写顶层 —— var_flip 是「当前选中图层」的翻转
         # （v2.0-t15 复用），主层的翻转已由上面的 _layer_set_params 处理好
