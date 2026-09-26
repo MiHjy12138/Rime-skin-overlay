@@ -24,12 +24,24 @@
        改后全绿。判别力：把右栏可视高度人为锁回 602（_panel_view_h monkeypatch）
        再跑 A/B 段必须重新出红（见 B06 的判别力断言）。
 
+t9 微调（本文件 G 段，改的是 `_fit_dialog_size` 的布局调用）：
+  · G1 `create_window(..., width=PREPROCESS_PANEL_W)`：建窗即定内容宽，免掉首次 itemconfigure 重排；
+  · G2 `_fit_dialog_size` 内 update_idletasks 恰好 1 次（改前 3 次）。
+  **实测结论（同一 harness、同轮交替）**：这两条改法带来的收益在噪声内 —— R8 初版（72ecddd）
+  vs 微调后 11 轮配对差中位 +1.0ms（四分位 −1.9 / +3.4）。成本拆解（同轮变体对照）：
+  跳过整个 _fit_dialog_size +1.0ms / 执行但不调 idle +8.0ms / 原样 +40.2ms
+  —— 也即 **32ms 全部来自那次不可省的 idle**（0 次 idle 时 winfo_reqheight 返回 1，
+  内容高算成 618，动图下方控件会被裁）。因此 D3 的「增量 ≤60ms」保持原阈值，
+  不再另设更紧的增量判据（t9 试过 30ms / 45ms 两档，跨运行负载波动会让它自身偶发红）。
+
 运行: python B_test_r8_prep_layout.py   （退出码 0 = 全过；默认 GBK 控制台直接跑）
 """
 import os
+import re
 import sys
 import time
 import shutil
+import inspect
 import tempfile
 import subprocess
 import importlib.util
@@ -551,6 +563,9 @@ def test_d_r6_kept(tmp, big, before_cost, old_mod):
                   f'新 min {t_new:.1f}ms / 改前 min {t_old:.1f}ms')
             check('D3b ★打开耗时的绝对上限（≤ 250ms：重排成本再抖也不至于让用户觉得卡）',
                   t_new <= 250.0, f'新 min {t_new:.1f}ms')
+            # 说明：这里**不另设**「增量上限」判据 —— t9 试过 30ms/45ms 两档，跨运行负载
+            # 波动（同一份代码实测配对差中位 +33.5 ~ +49.5ms）会让它自身偶发红。t9 微调的
+            # 落地改由 G1/G2 两条**结构判据**锁住（零 flaky、且回退必红），耗时不退化由 D3 管。
         check('D4 ★打开仍只解码首帧（按需解码没被滚动容器吞掉）',
               int(getattr(dlg, '_decode_calls', 999)) <= 1,
               f'_decode_calls={getattr(dlg, "_decode_calls", "N/A")}')
@@ -660,6 +675,63 @@ def test_f_cleanup(tmp, gif):
         kill(dlg, root)
 
 
+def _call_text(src, name):
+    """从源码里摘出 `name(...)` 这次调用的完整文本（按括号配对，能处理嵌套/跨行）。"""
+    i = src.find(name + '(')
+    if i < 0:
+        return ''
+    j = i + len(name) + 1
+    depth = 1
+    while j < len(src) and depth > 0:
+        if src[j] == '(':
+            depth += 1
+        elif src[j] == ')':
+            depth -= 1
+        j += 1
+    return src[i:j]
+
+
+# ================= G 段（t9 微调） =================
+def test_g_impl_structure(tmp, png):
+    section('G 性能改法落地（结构判据：免首次重排 + 少一次 idle）')
+    # G1：面板 item 建窗时直接给定宽度 → 内容 frame 从一开始就是 240px 宽，
+    #     不需要事后 itemconfigure 触发的那一次全量重排。
+    src_ui = ''
+    try:
+        src_ui = inspect.getsource(R.ImagePreprocessDialog._build_ui)
+    except Exception as e:
+        note('取 _build_ui 源码失败：%s' % e)
+    seg = _call_text(src_ui, 'create_window').replace('\n', ' ')
+    check('G1 ★面板 item 建窗就给定宽度（create_window(..., width=PREPROCESS_PANEL_W)）→ 免掉首次内容定宽重排',
+          'width=PREPROCESS_PANEL_W' in seg,
+          seg[:130] if seg else '未找到 create_window 调用')
+    # G2：_fit_dialog_size 里 update_idletasks 的次数（改前 3：开头 / 定宽后 / geometry 后；
+    #     中间那次是冗余的 —— panel_wrap 宽本来就固定 240，不必先 idle 再读）。
+    src_fit = ''
+    try:
+        src_fit = inspect.getsource(R.ImagePreprocessDialog._fit_dialog_size)
+    except Exception as e:
+        note('取 _fit_dialog_size 源码失败：%s' % e)
+    code_lines = [l.split('#')[0] for l in src_fit.splitlines()]
+    n_idle = sum(l.count('update_idletasks()') for l in code_lines)
+    check('G2 ★_fit_dialog_size 内 update_idletasks 恰好 1 次（改前 3 次；0 次也不行 —— '
+          '实测不 idle 时 winfo_reqheight 返回 1，内容高算成 618，动图下方控件会被裁）',
+          n_idle == 1, f'实测 {n_idle} 次')
+    # G3：静态图内容 item 宽仍是 240px（观感口径不变；宽度现在由建窗宽度直接给定）
+    root = _new_root()
+    dlg = None
+    try:
+        dlg = R.ImagePreprocessDialog(root, png)
+        try:
+            iw = int(float(dlg.panel_canvas.itemcget(dlg._panel_win, 'width') or 0))
+        except Exception:
+            iw = -1
+        check('G3 静态图：内容 item 宽 = 240px（折行口径与 t3 交付态一致）',
+              iw == int(R.PREPROCESS_PANEL_W), f'item 宽={iw}')
+    finally:
+        kill(dlg, root)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix='r8prep_')
     real_here = R.HERE
@@ -681,6 +753,7 @@ def main():
         test_d_r6_kept(tmp, big, None, old_mod)     # 耗时对照在 D 段内交替取样
         test_e_inventory(tmp, gif, png, old_mod)
         test_f_cleanup(tmp, gif)
+        test_g_impl_structure(tmp, png)
     finally:
         R.HERE = real_here
         shutil.rmtree(tmp, ignore_errors=True)

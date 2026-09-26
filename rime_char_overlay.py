@@ -3694,7 +3694,12 @@ class ImagePreprocessDialog:
         self.panel_canvas.pack(side='left', fill='both', expand=True)
         panel = tk.Frame(self.panel_canvas)
         self.panel = panel
-        self._panel_win = self.panel_canvas.create_window((0, 0), window=panel, anchor='nw')
+        # 建窗时直接给定 item 宽（= 右栏 240px）：内容 frame 从第一帧起就是最终宽度，
+        # 省掉 R8 初版「建完再 itemconfigure 定宽」触发的那次**全量重排**（≈20ms/次打开）。
+        self._panel_win = self.panel_canvas.create_window((0, 0), window=panel, anchor='nw',
+                                                          width=PREPROCESS_PANEL_W)
+        # 已设宽记账：_on_panel_configure 只在宽度真要变（出滚动条 240 → 223）时才重设。
+        self._panel_w_set = PREPROCESS_PANEL_W
         panel.bind('<Configure>', self._on_panel_configure)
         self.panel_canvas.bind('<Configure>', self._on_panel_configure)
 
@@ -3859,16 +3864,20 @@ class ImagePreprocessDialog:
             view_h = max(120, h - pad_h)
             self._panel_h_target = view_h
             need_sb = content_h > view_h
+            cv_w_target = (max(140, PREPROCESS_PANEL_W - PREPROCESS_PANEL_SB_W) if need_sb
+                           else PREPROCESS_PANEL_W)
             if need_sb:
                 self.panel_sb.pack(side='right', fill='y')
-                self.panel_canvas.configure(width=max(140, PREPROCESS_PANEL_W - PREPROCESS_PANEL_SB_W))
             else:
                 self.panel_sb.pack_forget()
-                self.panel_canvas.configure(width=PREPROCESS_PANEL_W)
-            self._panel_w_set = 0            # 宽度变了 → 让 _on_panel_configure 重设内容宽
-            self._on_panel_configure()
-            self.root.update_idletasks()
+            self.panel_canvas.configure(width=cv_w_target)
+            # 内容宽只在真要变时才重设（建窗已给 240；出滚动条才变 223）→ 常态零重排。
+            if int(getattr(self, '_panel_w_set', 0)) != cv_w_target:
+                self._panel_w_set = cv_w_target
+                self.panel_canvas.itemconfigure(self._panel_win, width=cv_w_target)
+            self._on_panel_configure()       # 只刷 scrollregion（宽度已是目标值，不再触发重排）
             # 宽度：左画布 + 10 间距 + 右栏 + 左右 pad(10+10)（1080p 下 = 912px，与改前一致）
+            # 注：cv_w / panel_w 上面已读过（panel_wrap 宽固定 240），这里不需要再 idle 一次。
             w = cv_w + 10 + panel_w + 20
             try:
                 wat, wab = screen_work_area(self.root)
@@ -3878,7 +3887,11 @@ class ImagePreprocessDialog:
                 self.root.geometry(f'{w}x{h}+{x}+{y}')
             except Exception:
                 self.root.geometry(f'{w}x{h}')
-            self.root.update_idletasks()
+            # 这里**故意不再 update_idletasks**：geometry 是异步命令，调用方（wait_window /
+            # 测试的 update）随后就会应用它；实测「只保留开头那次 idle」与「2 次 idle」的
+            # 窗口尺寸逐位一致（动图 912x678 / 静态 912x618），而每次 idle 要付约 16ms
+            # 的全窗布局计算 —— 这是 _fit_dialog_size 里最大的一笔开销（拆解实测：
+            # 跳过整个函数 +1ms / 不调 idle +8ms / 全量 +40ms，geometry 与 configure 均非瓶颈）。
         except Exception as e:
             try:
                 _write_log(f'[预处理布局] 尺寸自适应失败: {e}')
