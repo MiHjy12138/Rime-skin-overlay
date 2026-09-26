@@ -4507,12 +4507,24 @@ class ConfigWizard:
         tk.Button(row3, text='读取当前Rime配置', command=self._read_rime,
                   font=('Microsoft YaHei', 9)).pack(side='left', padx=8)
 
-        # ③ 贴边方向 / 水平翻转（v2.0-R2 起都是**每图层参数**，控件已搬进 ⑫ 图层区）
-        # 这里只留下两个变量（通用区不再放控件，顺带省掉一行高度）：
-        #   · var_side   = 主层（第 0 层）贴边方向的 UI 镜像，仍是单层路径 / 保存 / 皮肤往返的
-        #                  来源，与 resolve_layers、save_layers_into_cfg 的「顶层 side 权威」一致；
-        #   · var_flip   = 当前选中层的水平翻转（图层区勾选框复用同一个变量）。
+        # ③ 贴边方向（v2.0-R11：用户实测「贴边做错了，贴边放回原位，24中间」→ 从 ⑫ 图层区
+        # 搬回**通用区原位（② 与 ④ 之间）**，语义同时升级为**统一管所有图层**：
+        # 点一次 = 全部图层的 anchor 一起改（图层区不再有「选中层贴哪儿」，界面回到最简）。
+        # 顶层 cfg['side'] 仍是主层锚点的权威（resolve_layers / save_layers_into_cfg 口径不变），
+        # 统一同步由 _sync_side_to_all_layers() 一处收口 —— R2 修过的「多图层时主层贴边改不动」
+        # 的 bug 继续被守护（那条通路现在写的是全部层，含第 0 层）。
+        # 这里的两个变量：
+        #   · var_side = ③ 的单选值，也是**全部图层** anchor 的 UI 权威；
+        #   · var_flip = 当前选中层的水平翻转（图层区勾选框复用同一个变量，与 ④⑤⑥ 同族）。
+        row4 = tk.Frame(left)
+        row4.pack(fill='x', pady=1)
+        tk.Label(row4, text='③ 贴边方向（所有图层统一）:',
+                 font=('Microsoft YaHei', 10)).pack(side='left')
         self.var_side = tk.StringVar(master=self.root, value='right')
+        for text, val in [('右侧', 'right'), ('左侧', 'left'), ('中间', 'center')]:
+            tk.Radiobutton(row4, text=text, variable=self.var_side, value=val,
+                           font=('Microsoft YaHei', 9),
+                           command=self._on_side_change).pack(side='left', padx=2)
         self.var_flip = tk.BooleanVar(master=self.root, value=False)
 
         # ④⑤⑥ 缩放 / 水平 / 垂直（合一行，紧凑）
@@ -4655,22 +4667,20 @@ class ConfigWizard:
         tk.Button(lay_btns, text='↓ 下移', command=lambda: self._layer_move(1),
                   font=('Microsoft YaHei', 8)).pack(side='left')
 
-        # ③ 贴边方向（v2.0-R2）：从通用区搬到这里 —— 它是**每图层参数**（选中哪层调哪层），
-        # 标题带当前层号，切层即时回显该层的值；改只改那一层（主层同时写顶层 side）。
-        self.lbl_side_target = tk.Label(lay_box, text='③ 贴边方向（当前层）:', fg='#555',
-                                        font=('Microsoft YaHei', 9))
+        # ③ 贴边方向（v2.0-R11）：已搬回通用区（② 与 ④ 之间）并统一管所有图层 ——
+        # 这里只留一行小字说明 + 「当前选中层」的水平翻转（与 ④⑤⑥ 同族：选中哪层调哪层）。
+        # var_layer_anchor 自 R11 起不再绑任何单选按钮，保留为**当前选中层 anchor 的回显镜像**
+        # （切层时更新；既有回归脚本按它核对「切层回显」）。
+        self.lbl_side_target = tk.Label(lay_box, text='', fg='#555',
+                                        font=('Microsoft YaHei', 9), justify='left',
+                                        wraplength=300)
         self.lbl_side_target.pack(anchor='w')
         row_la = tk.Frame(lay_box)
-        row_la.pack(anchor='w')
+        row_la.pack(anchor='w', pady=(2, 0))
         self.var_layer_anchor = tk.StringVar(master=self.root, value='right_edge')
-        for _t, _v in (('贴左边', 'left_edge'), ('贴右边', 'right_edge'), ('居中', 'center')):
-            tk.Radiobutton(row_la, text=_t, variable=self.var_layer_anchor, value=_v,
-                           font=('Microsoft YaHei', 8),
-                           command=self._on_layer_param_change).pack(side='left')
-        # 翻转与上方 ③ 是同一个变量（改哪个都作用于当前选中图层）
-        tk.Checkbutton(row_la, text='水平翻转', variable=self.var_flip,
+        tk.Checkbutton(row_la, text='水平翻转（当前层）', variable=self.var_flip,
                        font=('Microsoft YaHei', 8),
-                       command=self._on_layer_flip).pack(side='left', padx=(8, 0))
+                       command=self._on_layer_flip).pack(side='left')
         # v2.0-t15：缩放/水平/垂直 不再在本区重复一套 —— 复用上方 ④⑤⑥（选中哪层就调哪层）
         tk.Label(lay_box, text='↖ 这一层的大小/位置用上方 ④缩放 ⑤水平 ⑥垂直 调',
                  fg='#888', font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(1, 0))
@@ -4690,6 +4700,7 @@ class ConfigWizard:
                                         font=('Microsoft YaHei', 8), justify='left',
                                         wraplength=300)
         self.lbl_layer_hint2.pack(anchor='w', pady=(2, 0))
+        self._update_side_hint()
         self._layer_sync_from_cfg()
 
         # ⑬ 皮肤管理（图片 + 全套参数整套切换）
@@ -4987,7 +4998,7 @@ class ConfigWizard:
         self._update_preview()
 
     def _on_layer_flip(self):
-        """水平翻转：上方 ③ 与图层区共用同一个 var_flip —— 勾一下就写进当前选中图层"""
+        """水平翻转：翻转勾选框与上方 ④⑤⑥ 同族 —— 勾一下就写进**当前选中图层**"""
         if getattr(self, '_layer_loading', False):
             return
         try:
@@ -4997,43 +5008,103 @@ class ConfigWizard:
             pass
         self._update_preview()
 
-    def _sync_side_to_layer0(self):
-        """③ 贴边方向的「主层权威」归一（v2.0-R2）。
+    def _sync_side_to_all_layers(self, force=False):
+        """③ 贴边方向的统一同步（v2.0-R11：③ 一处驱动**全部图层**的 anchor）。
 
-        顶层 cfg['side']（及其 UI 镜像 var_side）是主层（第 0 层）锚点的权威 —— 这与
-        resolve_layers（l0['anchor'] = 顶层 side）和 save_layers_into_cfg
-        （arch[0].anchor = anchor_from_side(cfg['side'])）的既有约定完全一致。
+        语义：通用区 ③（UI 镜像 var_side）是全部图层锚点的唯一权威 —— 点一次 =
+        cfg['side'] 与 layers[*].anchor 一起改，图层列表文案与预览随之刷新。
+        顶层 cfg['side'] 仍是主层锚点的权威（resolve_layers / save_layers_into_cfg 口径不变）。
 
-        修的是什么：以前只有 _save_and_start 才把 var_side 落到 layers[0].anchor，而多图层
-        预览 _preview_specs 里主层锚点又取图层区控件（旧值）→ 点 ③ 时预览 / 图层列表 /
-        图层参数三处都不动，用户看到的就是「多图层时原图贴边方向无法更改，仅能调整翻转」
-        （翻转天然有联动，走的是同一个 var_flip）。现在画预览、切层、保存前都先归一，
-        三个通路永远同一个值。
+        什么时候推给所有层（而不是只保底主层）：
+          · force=True：保存 / 存皮肤 / 切皮肤 / 点 ③ 这些**显式动作**，必须保证各层一致；
+          · ③ 的值与 cfg['side'] 不一致：说明用户刚改了 ③（Tk 的 Radiobutton 先改变量、
+            再调 command，所以进到这里时已是「改过」状态）→ 推给所有层；
+          · 其余情况（打开向导 / 切层 / 普通重绘）只做**主层保底归一** —— 不静默改写老档案里
+            其它层的历史 anchor（R2 时代的多层档案仍能原样读出来看）。
+        返回值 = 本轮是否做了「全部层」同步（测试用来验判别力）。
+
+        与 R2 的关系：R2 修过的 bug（多图层时主层贴边改不动：旧入口只刷预览、既不写
+        cfg['side'] 也不写 layers[0].anchor）在本方法里继续成立 —— 主层永远跟着 ③ 走，
+        只不过现在其余层也一起走；调用点仍是预览前 / 保存前两个通路（R2 同款）。
         """
         try:
             layers = self._layers()
             if not layers:
-                return
-            side = self.cfg.get('side')
+                return False
+            side = None
             w = getattr(self, 'var_side', None)
             if w is not None:
                 v = str(w.get() or '')
                 if v in ('left', 'right', 'center'):
                     side = v
+            if side is None:
+                side = self.cfg.get('side')
             if side not in ('left', 'right', 'center'):
                 side = 'right'
             anc = anchor_from_side(side)
+            spread = bool(force) or (self.cfg.get('side') != side)
             self.cfg['side'] = side
-            if layers[0].get('anchor') != anc:
+            if spread:
+                for i, ld in enumerate(layers):
+                    if ld.get('anchor') != anc:
+                        ld['anchor'] = anc
+                        self._refresh_layer_row(i)
+            elif layers[0].get('anchor') != anc:
                 layers[0]['anchor'] = anc
                 self._refresh_layer_row(0)
-            # 正在编辑主层 → 图层区回显也跟着走（否则用户改了看不出反馈）
-            if int(getattr(self, '_layer_sel', 0) or 0) == 0:
-                try:
-                    if str(self.var_layer_anchor.get()) != anc:
-                        self.var_layer_anchor.set(anc)
-                except Exception:
-                    pass
+            self._mirror_layer_anchor(layers)
+            return spread
+        except Exception:
+            return False
+
+    def _sync_side_to_layer0(self):
+        """R2 兼容名：③ 的「预览前归一」入口（v2.0-R11 起实现搬进 _sync_side_to_all_layers）。
+
+        保留这个名字是因为 R2 起的两个调用点（_update_preview_impl 与保存前）按它写；
+        非 force 调用 = 「用户改了 ③ 才推全部层，否则只保底主层」的原行为。
+        """
+        return self._sync_side_to_all_layers()
+
+    def _on_side_change(self):
+        """③ 贴边方向（通用区）的单选 command：一次改动驱动**全部图层**的 anchor。
+
+        v2.0-R11：用户实测「贴边做错了，贴边放回原位，24中间」→ 控件回通用区、语义统一。
+        force=True 表示「点一下 = 所有层都改」（不依赖 var_side 与 cfg['side'] 的差集判断，
+        点同值也算一次显式动作，代价只是重刷列表文案）。
+        """
+        self._sync_side_to_all_layers(force=True)
+        self._update_preview()
+
+    def _mirror_layer_anchor(self, layers=None):
+        """刷新图层区的「当前层锚点镜像」（var_layer_anchor）与统一说明行。
+
+        v2.0-R11：var_layer_anchor 不再绑单选按钮（贴边方向已收归通用区 ③ 统一），
+        它保留为**当前选中层 anchor 的回显镜像** —— 既有回归脚本按它核对「切层回显」。
+        """
+        try:
+            layers = layers if layers is not None else self._layers()
+            i = int(getattr(self, '_layer_sel', 0) or 0)
+            if not (0 <= i < len(layers)):
+                i = 0
+            cur = str(layers[i].get('anchor') or 'right_edge') if layers else 'right_edge'
+            if str(self.var_layer_anchor.get()) != cur:
+                self.var_layer_anchor.set(cur)
+        except Exception:
+            pass
+        self._update_side_hint()
+
+    def _update_side_hint(self):
+        """图层区那行小字：讲清「贴边方向由通用区 ③ 统一管所有图层」并回显当前统一值"""
+        try:
+            side = 'right'
+            w = getattr(self, 'var_side', None)
+            if w is not None:
+                v = str(w.get() or '')
+                if v in ('left', 'right', 'center'):
+                    side = v
+            word = {'left': '贴左', 'right': '贴右', 'center': '居中'}.get(side, '贴右')
+            self.lbl_side_target.config(
+                text=f'③ 贴边方向统一 = {word}（在通用区改）')
         except Exception:
             pass
 
@@ -5312,11 +5383,9 @@ class ConfigWizard:
                 i = 0
             ld = dict(layers[i])
             try:
-                # v2.0-R2：主层（第 0 层）的贴边方向以顶层 side（var_side 镜像）为准。
-                # 以前这里对**任何**层都取图层区控件，于是多图层时改 ③ 预览不动 → 用户
-                # 看到的「原图贴边方向无法更改」。其余层仍取图层区（选中哪层调哪层）。
-                ld['anchor'] = (anchor_from_side(self.var_side.get()) if i == 0
-                                else str(self.var_layer_anchor.get() or 'right_edge'))
+                # v2.0-R11：贴边方向已收归通用区 ③ 统一（点一次全部层同步），所以这里直接
+                # 用该层自己的 anchor（主层由 resolve_layers 取顶层 side，口径不变），
+                # 不再需要 R2 那套「主层读 var_side / 其余层读图层区控件」的分支。
                 ld['scale'] = round(float(self.var_scale.get()), 2)
                 ld['flip'] = bool(self.var_flip.get())
                 ld['offset_x'] = int(self.var_offx.get())
@@ -5588,9 +5657,9 @@ class ConfigWizard:
         # 文案长度有讲究：本行是右栏（高级设置）的高度瓶颈之一，wraplength=300，
         # 多折一行就把窗口需求高度顶上去（R2 实测 +16px）。控制在两行内。
         if i == 0:
-            return ('第 1 层是主图：③ 贴边方向与 ④ 缩放 / 翻转 / ⑤⑥ 微调都作用于它；'
-                    '另几层叠在它周围。')
-        return ('这一层跟着候选框走：③ 贴边方向（就在下面）；大小与位置用上方 ④⑤⑥ 调；'
+            return ('第 1 层是主图：贴哪边由上方 ③ 统一（所有图层一起改）；'
+                    '大小/位置用上方 ④⑤⑥ 调，翻转勾选框只作用当前层。')
+        return ('这一层跟着候选框走：贴哪边同样由上方 ③ 统一；翻转与 ④⑤⑥ 只调当前层；'
                 '勾「随候选框变宽往外让」后它会按比例再外让。')
 
     def _on_layer_select(self, _e=None):
@@ -5610,13 +5679,13 @@ class ConfigWizard:
             self._layer_sel = i
             ld = layers[i]
             self._layer_loading = True
-            # v2.0-R2：③ 在本区 —— 主层取顶层 side 的映射（与 resolve_layers 的主层权威一致），
-            # 其余层取各自 anchor；标题带上当前层号，让「跟着选中层走」一目了然
+            # v2.0-R2/R11：③ 已回通用区统一管所有图层 —— var_layer_anchor 只是「当前层
+            # anchor 的回显镜像」（不再有绑定它的单选按钮）；主层取顶层 side 的映射，
+            # 其余层取各自 anchor（统一同步后它们本就同值，这里保留回显口径不变）。
             self.var_layer_anchor.set(anchor_from_side(self.cfg.get('side')) if i == 0
                                       else ld.get('anchor', 'right_edge'))
             try:
-                _tag = '第 1 层（主图）' if i == 0 else f'第 {i + 1} 层'
-                self.lbl_side_target.config(text=f'③ 贴边方向（当前层：{_tag}）:')
+                self._update_side_hint()
             except Exception:
                 pass
             # ④⑤⑥ + 翻转：切到该层的值（第 0 层取顶层兼容字段）
@@ -5648,10 +5717,11 @@ class ConfigWizard:
         self._update_preview()
 
     def _on_layer_param_change(self, *_a):
-        """图层区自有控件（锚点 / 随宽度比例）写回当前选中层。
+        """图层区自有控件（「随候选框变宽往外让」比例）写回当前选中层。
 
-        缩放/水平/垂直/翻转已改由上方 ④⑤⑥（_on_main_slider / _on_layer_flip）负责，
-        本方法不再碰它们 —— 单一入口，避免两套控件互相覆盖。
+        v2.0-R11：贴边方向的单选取控件已搬回通用区（③ 统一管所有图层），本方法不再碰
+        anchor；缩放/水平/垂直/翻转由上方 ④⑤⑥ 与翻转勾选框负责 —— 单一入口，
+        避免两套控件互相覆盖。
         """
         if getattr(self, '_layer_loading', False):
             return
@@ -5661,20 +5731,8 @@ class ConfigWizard:
             if i >= len(layers):
                 return
             ld = layers[i]
-            anc = self.var_layer_anchor.get()
-            ld['anchor'] = anc if anc in LAYER_ANCHORS else 'right_edge'
             ld['follow_width_ratio'] = (int(self.var_lay_follow_r.get()) / 100.0
                                         if self.var_lay_follow.get() else 0.0)
-            if i == 0:
-                # 主层的贴边方向就是顶层 side（老字段继续可用）
-                self.cfg['side'] = side_from_anchor(ld['anchor'])
-                w = getattr(self, 'var_side', None)
-                if w is not None:
-                    try:
-                        w.set(self.cfg['side'])
-                    except Exception:
-                        pass
-            self._refresh_layer_row(i)
             self.lbl_layer_hint2.config(text=self._layer_hint(i))
             self._update_preview()
         except Exception:
@@ -5694,8 +5752,9 @@ class ConfigWizard:
                            ('所有文件', '*.*')], parent=self.root)
             if not path:
                 return
-            main_anchor = layers[0].get('anchor', 'right_edge')
-            anc = 'left_edge' if main_anchor != 'left_edge' else 'right_edge'
+            # v2.0-R11：新层的贴边方向也跟随 ③ 的统一值（不再默认「贴到主图另一侧」——
+            # 统一语义下所有层同一边；想左右夹持可用 ⑤水平偏移 微调）。
+            anc = anchor_from_side(self.var_side.get())
             z = max([int(x.get('z', 0) or 0) for x in layers] or [0]) + 1
             layers.append(normalize_layer({'image': path, 'anchor': anc, 'z': z}))
             self.cfg['layers'] = layers
@@ -5778,6 +5837,9 @@ class ConfigWizard:
         self.cfg.update(cfg)
         self.var_layout.set(cfg.get('layout', 'horizontal_double'))
         self.var_side.set(cfg.get('side', 'right'))
+        # v2.0-R11：切皮肤后**所有图层** anchor 统一到档案顶层 side（统一语义下的「不串层」：
+        # 只按新皮肤的 ③ 走，不残留上一个皮肤 / 向导里的贴边值）
+        self._sync_side_to_all_layers(force=True)
         self.var_layer.set(cfg.get('layer', 'above'))
         self.var_scale.set(cfg.get('scale', 1.0))
         self.var_offx.set(cfg.get('offset_x', 0))
@@ -5850,7 +5912,11 @@ class ConfigWizard:
             tcfg['side'] = self.var_side.get()
             _lyr0 = self._layers()
             if _lyr0:
-                _lyr0[0]['anchor'] = anchor_from_side(tcfg['side'])
+                # v2.0-R11：档案里**各层** anchor 与 ③ 保持一致（统一语义；切皮肤不串层）
+                _anc = anchor_from_side(tcfg['side'])
+                for _ld in _lyr0:
+                    _ld['anchor'] = _anc
+                tcfg['side'] = side_from_anchor(_anc)
                 _lyr0[0]['image'] = tcfg.get('image') or _lyr0[0].get('image')
             save_layers_into_cfg(tcfg, _lyr0)     # ② 套层：多图层一起进档案
         except Exception as _e:
@@ -6484,9 +6550,9 @@ class ConfigWizard:
                                    offset_x=int(self.var_offx.get()),
                                    offset_y=int(self.var_offy.get()),
                                    flip=bool(self.var_flip.get()))
-            # v2.0-R2：③ 主层贴边归一（var_side → cfg['side'] → layers[0].anchor）——
-            # 与预览/切层同一个入口，保存出来的 side/anchor 永远与界面一致
-            self._sync_side_to_layer0()
+            # v2.0-R2/R11：③ 归一（var_side → cfg['side'] → **全部图层** anchor）——
+            # 与预览/切层同一个入口，保存出来的 side 与各层 anchor 永远与界面一致
+            self._sync_side_to_all_layers(force=True)
             _lyr0 = self._layers()
             if _lyr0:
                 self.cfg['side'] = side_from_anchor(_lyr0[0].get('anchor'))

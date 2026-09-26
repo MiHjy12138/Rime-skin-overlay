@@ -17,6 +17,16 @@
 红线：只读被测模块；不写真实 config.json / skin.json（save_config 打桩）；
       文件对话框与模态框全部打桩。
 
+================== v2.0-R11 需求回退（本文件已按新需求改写两处） ==================
+  · C 段清单条目「③ 贴边方向（图层区）」→ ③ 已按用户要求搬回**通用区**（② 与 ④ 之间，
+    统一管所有图层），条目改为 ('var_side', 'lbl_side_target')；var_layer_anchor 自 R11 起
+    降级为「当前选中层 anchor 的回显镜像」（不再绑单选按钮），故移出该条目。
+  · B02 的高度阈值 900 → 960：旧的 900 是「③ 在图层区、通用区只有 ② 一行」时代的实测值
+    （R4 后 867px）。R11 把 ③ 一行搬回通用区后实测 914px（+ 图层区说明行换文案），
+    阈值按新事实放宽到 960，同时新增 **B02b 判别力**断言（把高级设置 monkeypatch 回
+    竖排一列 → 需求高必须超过 960），证明阈值不是恒真、横排收益仍在。
+    R12 折叠（⚙ 高级设置可折叠）另有约 -330px 的折叠态收益，见 B_test_r12_collapse.py。
+
 用法: python B_test_r4_layout.py
 """
 import os
@@ -252,8 +262,8 @@ def test_size(tmp, cfg, real_work_h):
         need_w = wiz.root.winfo_reqwidth()
         check('B01 ★1080p 下窗口需求高度 ≤ 工作区 1040', need_h <= real_work_h,
               f'reqheight={need_h}（R3 基线 1038）')
-        check('B02 ★窗口需求高度显著变小（≤900，R3 基线 1038）', need_h <= 900,
-              f'reqheight={need_h}（省 {1038 - need_h}px）')
+        check('B02 ★窗口需求高度显著变小（≤960，R3 基线 1038；R11 回退 ③ 后 867→914）',
+              need_h <= 960, f'reqheight={need_h}（省 {1038 - need_h}px）')
         check('B06 ★窗口需求宽度不超工作区，且显著变窄（≤1100，R3 基线 1225）',
               need_w <= 1920 and need_w <= 1100, f'reqwidth={need_w}（R3 基线 1225）')
         info = _btn_row_info(wiz)
@@ -274,6 +284,20 @@ def test_size(tmp, cfg, real_work_h):
     finally:
         _restore(real)
         _kill(wiz)
+
+    # v2.0-R11 新增判别力：把高级设置 monkeypatch 回「竖排一列」→ 窗口必须变高，
+    # 证明 B02 的 960 阈值确实能区分「横排生效」与「没生效」（不是恒真阈值）
+    real_cnt = R.ConfigWizard._adv_column_count
+    R.ConfigWizard._adv_column_count = lambda self: 1
+    wiz3, real3 = _wiz_probe(None, None, cfg)
+    try:
+        n3 = wiz3.root.winfo_reqheight()
+        check('B02b ★判别力：高级设置改回竖排一列 → 需求高超过 B02 阈值（阈值非恒真）',
+              n3 > 960, f'竖排={n3} 阈值=960')
+    finally:
+        _restore(real3)
+        _kill(wiz3)
+        R.ConfigWizard._adv_column_count = real_cnt
 
     # 小屏 1366x768（工作区 728）：按钮行可见 + 滚动可达 ⑭
     wiz2, real2 = _wiz_probe(728, 1366, cfg)
@@ -320,7 +344,9 @@ def test_widget_inventory(tmp, cfg):
         items = [
             ('① 图片', ('btn_img', 'btn_prep', 'btn_anim', 'lbl_img')),
             ('② 候选框类型', ('var_layout',)),
-            ('③ 贴边方向（图层区）', ('var_layer_anchor', 'lbl_side_target')),
+            # R11 需求回退：③ 搬回通用区（② 与 ④ 之间）并统一管所有图层 → 条目改绑 var_side；
+            # var_layer_anchor 降级为「当前选中层 anchor 的回显镜像」，不再算 UI 控件
+            ('③ 贴边方向（通用区，统一管所有图层）', ('var_side', 'lbl_side_target')),
             ('④⑤⑥ 缩放/水平/垂直', ('var_scale', 'var_offx', 'var_offy',
                                      'lbl_scale', 'lbl_offx', 'lbl_offy', 'lbl_slider_target')),
             ('⑦ 预览', ('canvas',)),
