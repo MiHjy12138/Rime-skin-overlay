@@ -4779,15 +4779,32 @@ class ConfigWizard:
           · 2 列 → 列高 ≈ [440, 443]，仍然平衡
           · 1 列 → 退化成原来的自然竖排顺序
         这就是「窗口显著变小」的主要来源；预览块宽度不受影响。
+
+        v2.0-R12：整块再做成**可折叠** —— 用户原话「"高级设置"那个位置是否可做成折叠按钮，
+        点一下弹出/折叠」。外层由 LabelFrame 换成普通 Frame：
+          · self.btn_adv_toggle = 可点的标题（文案带 ▾/▸，点一下展开/折叠）
+          · self.adv_body       = 内容区（各列都在它下面），折叠时 pack_forget
+        折叠后由 _fit_window_height() 重算：窗口跟着变矮、滚动条按需收回。列骨架
+        (adv_cols / _adv_col_of) 与展开态完全一致，折叠只是「不 pack 内容区」。
         """
         n = int(self._adv_column_count())
-        self.adv_area = tk.LabelFrame(body, text='⚙ 高级设置（横排多列，按编号找）',
-                                      font=('Microsoft YaHei', 9), fg='#555',
-                                      padx=8, pady=6)
+        self.adv_area = tk.Frame(body)
         self.adv_area.pack(fill='x', pady=(8, 0))
+        head = tk.Frame(self.adv_area)
+        head.pack(fill='x')
+        self.btn_adv_toggle = tk.Button(head, text='', font=('Microsoft YaHei', 9),
+                                        anchor='w', relief='flat', bd=0, fg='#555',
+                                        activeforeground='#000', cursor='hand2',
+                                        command=self._toggle_adv_collapse)
+        self.btn_adv_toggle.pack(side='left')
+        self.lbl_adv_hint = tk.Label(head, text='（折叠只是收起来，设置不会丢）',
+                                     fg='#999', font=('Microsoft YaHei', 8))
+        self.lbl_adv_hint.pack(side='left', padx=(6, 0))
+        self.adv_body = tk.Frame(self.adv_area, padx=8, pady=6)
+        self.adv_body.pack(fill='x')
         cols = []
         for c in range(n):
-            f = tk.Frame(self.adv_area)
+            f = tk.Frame(self.adv_body)
             f.grid(row=0, column=c, sticky='nw', padx=(0, 12))
             cols.append(f)
         self.adv_cols = cols
@@ -4799,7 +4816,44 @@ class ConfigWizard:
                 ('layer', 'fx', 'feather', 'lay', 'skin', 'start'))}
         col_of = {k: max(0, min(v, n - 1)) for k, v in col_of.items()}
         self._adv_col_of = col_of
+        self._adv_collapsed = False
+        self._apply_adv_collapsed()       # 初态 = 展开（标题行/内容区与状态一致）
         return cols, col_of
+
+    # ---------- v2.0-R12 布局：⚙ 高级设置可折叠 ----------
+    def _toggle_adv_collapse(self, collapse=None):
+        """点标题 = 展开/折叠「⚙ 高级设置」（R12）。
+
+        参数 collapse 可显式指定目标态（None = 取反，按钮 command 走这条）；
+        传给测试/程序化调用 True/False。切完必须重算窗口高度：折叠后内容需求变矮
+        → 窗口跟着收、滚动条按需收回（_scroll_needed 由 _fit_window_height 重算）。
+        """
+        if collapse is None:
+            collapse = not bool(getattr(self, '_adv_collapsed', False))
+        self._adv_collapsed = bool(collapse)
+        self._apply_adv_collapsed()
+        self._fit_window_height()
+
+    def _apply_adv_collapsed(self):
+        """把当前折叠状态落到控件上（单独抽出的执行点：只做「收起/放回 + 文案」）。
+
+        折叠 = adv_body.pack_forget()（不 pack 的控件不参与父容器需求高度计算 →
+        窗口需求高度立刻变小）；展开 = 重新 pack 回标题行下面。幂等，可反复切。
+        """
+        collapsed = bool(getattr(self, '_adv_collapsed', False))
+        try:
+            if collapsed:
+                self.adv_body.pack_forget()
+            elif self.adv_body.winfo_manager() != 'pack':
+                self.adv_body.pack(fill='x')
+        except Exception:
+            pass
+        try:
+            self.btn_adv_toggle.config(
+                text=('▸ ⚙ 高级设置（⑧~⑭，点这里展开）' if collapsed
+                      else '▾ ⚙ 高级设置（⑧~⑭ 横排多列，点这里折叠）'))
+        except Exception:
+            pass
 
     # ---------- v2.0-t15 布局：可滚动主体 ----------
     def _build_scroll_body(self, parent):
