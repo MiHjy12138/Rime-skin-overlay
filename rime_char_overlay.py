@@ -33,6 +33,13 @@ v2.0-③ 选图自动生成候选框配色（升级四）：
   → 备份 weasel.custom.yaml.bak-<时间戳> 后按 patch 扁平键合并注入 → WeaselDeployer 重部署。
   皮肤档案记录配色名，切皮肤时图/参数/配色整套恢复（光环经 get_rime_accent 自动联动）。
   未生成过配色（配置里无 rime_scheme）时全链路静默跳过 —— 老用户零感知。
+
+v2.0-①a 渲染层收口（升级一，第二步）：
+  config.json 增 render_mode：compat（默认，v1.6 键色抠色路径）/ alpha（真 alpha 分层窗）。
+  FollowOverlay.load_char 里「RGBA → 抠色 → PhotoImage → Label + 窗口透明色」整段收口成
+  Renderer 接口，两个实现：CompatRenderer（老逻辑原样承载）/ LayeredRenderer（①b 实装骨架）。
+  缺键与非法值一律按 compat（resolve_render_mode）；alpha 骨架期对外行为与 compat 逐像素一致。
+  回滚：render_mode 改回 compat 即恢复，无需回退代码。
 """
 import sys, os, json, time, threading, re, queue, collections
 import tkinter as tk
@@ -346,6 +353,9 @@ DEFAULT_CONFIG = {
     # ③ 候选框配色绑定（升级四）：空 = 未生成/未绑定 → 全链路静默跳过（老用户零感知）
     'rime_scheme': '',         # 亮套 Rime 配色方案名（生成后写入；切皮肤时整套恢复）
     'rime_scheme_dark': '',    # 暗套 Rime 配色方案名
+    # ① 渲染模式（升级一）：compat=老键色抠色路径（v1.6 行为，默认）/ alpha=真 alpha 分层窗
+    # 缺键与非法值一律按 compat 处理（resolve_render_mode），老用户零感知；见 Renderer 抽象
+    'render_mode': 'compat',
 }
 
 def load_config():
@@ -1403,6 +1413,245 @@ def _flatten_alpha_for_tk(img_rgba, Image=None, key=MAGENTA):
     key_img = Image.new('RGB', img_rgba.size, key)
     out = Image.composite(rgb, key_img, alpha)
     return out.convert('RGBA')  # alpha 全 255，无半透明
+
+
+# ============ 渲染层抽象（v2.0-①a：Renderer 接口 + CompatRenderer）============
+# 手册 ① 步 1：config.json 增 render_mode —— compat（默认，v1.6 键色路径不动）/ alpha（真 alpha 分层窗）。
+# 缺键与非法值一律按 compat 处理：老用户升级后零感知（渲染层纯收口，不改行为）。
+RENDER_MODES = ('compat', 'alpha')
+DEFAULT_RENDER_MODE = 'compat'
+
+
+def resolve_render_mode(cfg):
+    """决定渲染模式：缺键 / 非字符串 / 拼写不对 → 一律回落 compat（手册 ① 步 1）。
+
+    容忍前后空白与大小写（' Alpha ' 认作 alpha），但仅 compat/alpha 两个词合法 ——
+    这样既不给老配置（无该键）添麻烦，也不会把 ['alpha']/True/1 之类脏值当成开关。
+    """
+    raw = None
+    try:
+        raw = cfg.get('render_mode', DEFAULT_RENDER_MODE)
+    except AttributeError:          # cfg 为 None / 非映射
+        return DEFAULT_RENDER_MODE
+    if not isinstance(raw, str):
+        return DEFAULT_RENDER_MODE
+    v = raw.strip().lower()
+    return v if v in RENDER_MODES else DEFAULT_RENDER_MODE
+
+
+class Renderer:
+    """渲染接口（手册 ① 步 2）：收口「RGBA → 屏幕上一帧」的整条链路。
+
+    FollowOverlay 只通过这套方法出图，不再直接碰 _flatten_alpha_for_tk /
+    ImageTk.PhotoImage / -transparentcolor / Label —— 换实现即换渲染模式。
+    两个实现：
+      · CompatRenderer  —— v1.6 老路径（键色抠色 + Tk Label），默认
+      · LayeredRenderer —— 真 alpha 分层窗（①b/t3 实装；骨架期对外行为与 compat 等价）
+    """
+
+    mode = DEFAULT_RENDER_MODE
+    uses_tk_label = True      # alpha 实装后为 False（手册 ① 步 5：该模式不再放 Label 贴图）
+
+    def __init__(self, overlay, mode=None):
+        self.overlay = overlay
+        self.mode = mode or self.mode
+        self.cfg = getattr(overlay, 'cfg', None) or {}
+
+    @property
+    def root(self):
+        return getattr(self.overlay, 'root', None)
+
+    # ---------- 管线三段：抠色 → 出帧 → 应用 ----------
+    def pick_key(self, imgs, Image=None):
+        """动态抠色键：选一个图中不存在的颜色（alpha 模式不需要，但接口保持一致）"""
+        return pick_key_color(imgs, Image)
+
+    def flatten(self, img_rgba, key=MAGENTA, Image=None):
+        """RGBA → 显示帧（格式由实现决定：compat=键色抠色 RGB / alpha=原 RGBA）"""
+        raise NotImplementedError
+
+    def to_photo(self, img):
+        """显示帧 → Tk PhotoImage（alpha 实装后改推分层位图，返回 None）"""
+        raise NotImplementedError
+
+    def prepare(self, img_rgba, key=MAGENTA, Image=None):
+        """一步出图：flatten + to_photo（动图逐帧、静态图共用）"""
+        return self.to_photo(self.flatten(img_rgba, key, Image))
+
+    def make_label(self, parent, photo, key_rgb, cursor='fleur'):
+        """造承载图片的 Label（拖动/滚轮/右键事件都绑在它身上）"""
+        raise NotImplementedError
+
+    def apply_window(self, key_rgb):
+        """窗口级应用（透明色 / 底色 / 首推位图）→ 返回键色 '#RRGGBB'"""
+        raise NotImplementedError
+
+    def apply_label(self, label, photo, key_rgb):
+        """把帧贴到 Label（图像 + 跟随键色的底色）"""
+        raise NotImplementedError
+
+    def apply_photo_only(self, label, photo):
+        """只换图、不改底色（热重载 / 滚轮缩放 / 动图节拍共用）"""
+        raise NotImplementedError
+
+    def push_frame(self, img_rgba, key_rgb=None, x=None, y=None):
+        """把一帧真正送达屏幕。compat：显示由 Tk Label 承担，这里无事可做；
+        alpha：UpdateLayeredWindow 推预乘位图（①b/t3 实装）。"""
+        return None
+
+    def release(self, photo):
+        """释放 tcl image（同步，不等 GC 的 __del__）"""
+        _release_photo(photo)
+
+    def describe(self):
+        return f'{type(self).__name__}(mode={self.mode})'
+
+
+class CompatRenderer(Renderer):
+    """v1.6 老路径原样承载：_flatten_alpha_for_tk → ImageTk.PhotoImage → Label + -transparentcolor。
+
+    本类每个方法都是 v1.6 行为的一对一搬运（含 try/except 静默容错的边界条件），
+    逐像素不变 —— 由 B_test_renderer.py 与既有 6 个回归脚本共同守住这条。
+    """
+
+    mode = 'compat'
+    uses_tk_label = True
+
+    def flatten(self, img_rgba, key=MAGENTA, Image=None):
+        # 修复紫边：缩放后 alpha 二值化 + 透明区填键色（配合 transparentcolor 抠色）
+        return _flatten_alpha_for_tk(img_rgba, Image, key if key is not None else MAGENTA)
+
+    def to_photo(self, img):
+        image_tk = getattr(self.overlay, '_ImageTk', None)
+        return image_tk.PhotoImage(img, master=self.root)
+
+    def make_label(self, parent, photo, key_rgb, cursor='fleur'):
+        return tk.Label(parent, image=photo, bg=_key_hex(key_rgb), cursor=cursor)
+
+    def apply_window(self, key_rgb):
+        # 窗口透明色 / 背景色全部跟随动态键色
+        key_hex = _key_hex(key_rgb)
+        root = self.root
+        if root is not None:
+            try:
+                root.attributes('-transparentcolor', key_hex)
+            except Exception:
+                pass
+            try:
+                root.configure(bg=key_hex)
+            except Exception:
+                pass
+        return key_hex
+
+    def apply_label(self, label, photo, key_rgb):
+        if label is None:
+            return
+        try:
+            label.configure(image=photo, bg=_key_hex(key_rgb))
+        except Exception:
+            pass
+
+    def apply_photo_only(self, label, photo):
+        if label is None:
+            return
+        try:
+            label.configure(image=photo)
+        except Exception:
+            pass
+
+
+class LayeredRenderer(CompatRenderer):
+    """真 alpha 分层窗渲染（手册 ① 步 2-5）—— 本阶段（①a）只落骨架。
+
+    ①b/t3 实装清单（接口按 spike_layered_alpha.py 的六步留好位置）：
+      1. ensure_layered(hwnd)：GetWindowLongW/GWL_EXSTYLE 或上 WS_EX_LAYERED；
+         每次推图前重设（Tk 重设窗口属性会冲掉，手册 ① 步 4）
+      2. premultiply_bgra(img)：PIL 向量化预乘 —— split → ImageChops.multiply(ch, a)
+         → merge('RGBA', (b, g, r, a)) → tobytes()；
+         **勿照抄 spike 的逐像素循环**（46ms/帧 → 向量化 2.07ms/帧，手册 ① 步 3）
+      3. push_bitmap(hwnd, img, x, y)：GetDC → CreateCompatibleDC → CreateDIBSection
+         （biHeight 取负数 = 自上而下）→ memmove 预乘 BGRA → UpdateLayeredWindow(ULW_ALPHA)
+         → 释放 GDI 对象
+      4. make_label/apply_window/apply_label 改为「不放贴图、不设 -transparentcolor」：
+         该模式下窗口内容完全由位图决定（手册 ① 步 5）；Label 仍保留以接收鼠标事件
+      5. 推送时机：静态图只在「首次显示 / 移动 / 缩放 / 换图 / 特效参数变」推一次，
+         动图跟 _anim_tick 每帧推（手册 ① 步 6，勿按 50ms 轮询硬推）
+
+    骨架期约定：alpha_ready=False → 上面 5 条一律不启用，所有渲染调用继续走
+    CompatRenderer 的实现，保证 render_mode=alpha 时对外行为与 compat 逐像素一致
+    （t2 验收要求）；t3 置 alpha_ready=True 后这套骨架才开始接管显示。
+    """
+
+    mode = 'alpha'
+    uses_tk_label = True    # t3 实装后置 False（骨架期仍用 Label，行为才能与 compat 等价）
+    alpha_ready = False     # t3 实装完成置 True；在此之前全部走 compat 兼容实现
+
+    # ---- ①b/t3 实装用的骨架 API（骨架期安全空转，绝不改变显示行为）----
+    def ensure_layered(self, hwnd):
+        """[t3] 给顶层句柄补 WS_EX_LAYERED（Tk 改属性会冲掉，每次推图前重设）"""
+        if not self.alpha_ready:
+            return None
+        raise NotImplementedError('①b/t3 实装：SetWindowLongW(GWL_EXSTYLE, ex | WS_EX_LAYERED)')
+
+    def premultiply_bgra(self, img_rgba):
+        """[t3] PIL 向量化预乘 → BGRA bytes（手册 ① 步 3）"""
+        if not self.alpha_ready:
+            return None
+        raise NotImplementedError('①b/t3 实装：split/multiply/merge(B,G,R,A)/tobytes')
+
+    def push_bitmap(self, hwnd, img_rgba, x, y):
+        """[t3] UpdateLayeredWindow 六步推送（spike push_bitmap 的向量化版）"""
+        if not self.alpha_ready:
+            return None
+        raise NotImplementedError('①b/t3 实装：spike_layered_alpha.push_bitmap 六步')
+
+    def push_frame(self, img_rgba, key_rgb=None, x=None, y=None):
+        """[t3] 逐帧推送入口。骨架期显示仍由 Tk Label 承担，这里安全空转。"""
+        if not self.alpha_ready:
+            return None
+        raise NotImplementedError('①b/t3 实装：ensure_layered + premultiply_bgra + UpdateLayeredWindow')
+
+
+RENDERER_CLASSES = {'compat': CompatRenderer, 'alpha': LayeredRenderer}
+
+
+def create_renderer(overlay, cfg=None, mode=None):
+    """按 render_mode 造渲染器。缺键 / 非法值 / 构造失败一律 compat 兜底 —— 渲染层不能成为启动崩溃源。"""
+    if cfg is None:
+        cfg = getattr(overlay, 'cfg', None)
+    m = mode or resolve_render_mode(cfg)
+    cls = RENDERER_CLASSES.get(m, CompatRenderer)
+    try:
+        r = cls(overlay, m)
+        if not isinstance(r, Renderer):     # 防御：实现必须满足接口
+            raise TypeError(f'{cls.__name__} 不是 Renderer')
+        r.cfg = cfg or {}
+        return r
+    except Exception as e:
+        try:
+            _write_log(f'[渲染] {m} 渲染器构造失败 → 回落 compat: {e}')
+        except Exception:
+            pass
+        r = CompatRenderer(overlay, 'compat')
+        r.cfg = cfg or {}
+        return r
+
+
+def _renderer_of(overlay):
+    """取 overlay 的渲染器；没有则按当前 cfg 现造一个并挂回去（惰性兜底，等效 compat）。
+
+    正常路径的渲染器在 FollowOverlay.__init__ 就建好；这里是给「桩对象直接调
+    FollowOverlay 方法」的场景兜底（如 B_test_anim_sim 的 _decode_frame 壳），
+    也给极端情况下 renderer 字段丢失留一条自愈路径 —— 渲染层不该是崩溃源。
+    """
+    r = getattr(overlay, 'renderer', None)
+    if r is None:
+        r = create_renderer(overlay, getattr(overlay, 'cfg', None))
+        try:
+            overlay.renderer = r
+        except Exception:
+            pass
+    return r
 
 
 # ============ 动图支持（v1.6）============
@@ -3608,7 +3857,8 @@ class ConfigWizard:
                    f'side={self.cfg.get("side")} layer={self.cfg.get("layer")} '
                    f'scale={self.cfg.get("scale")} 圆角={self.cfg.get("corner_enabled")}/'
                    f'{self.cfg.get("corner_radius")} 点阵羽化={self.cfg.get("feather_enabled")}/'
-                   f'{self.cfg.get("feather_radius")} 自启={self.cfg.get("autostart")}')
+                   f'{self.cfg.get("feather_radius")} 渲染={resolve_render_mode(self.cfg)} '
+                   f'自启={self.cfg.get("autostart")}')
         self.root.destroy()
         self.on_done(self.cfg)
 
@@ -3817,6 +4067,15 @@ class FollowOverlay:
         self.img_mtime = None
         self.key_rgb = MAGENTA          # 当前抠色键（动态，随图片变化）
         self.layer = self.cfg.get('layer', 'above')  # 图层：above=图片置顶 / below=候选框压图（v1.5）
+        # ===== 渲染层（v2.0-①a）：render_mode=compat(默认)/alpha → Renderer 实现 =====
+        # 缺键/非法值一律 compat（老用户零感知）；alpha 当前只有骨架，对外行为与 compat 逐像素一致
+        self.render_mode = resolve_render_mode(self.cfg)
+        self.renderer = create_renderer(self, self.cfg, self.render_mode)
+        try:
+            _write_log(f'[渲染] render_mode={self.render_mode} '
+                       f'renderer={type(self.renderer).__name__}')
+        except Exception:
+            pass
         # ===== 动图状态（v1.6；静态图时 anim_n=1 全走老路径）=====
         self.anim_src = None            # 动画源图（保持打开，供 seek 逐帧解码）
         self.anim_n = 0                 # 总帧数
@@ -3826,7 +4085,7 @@ class FollowOverlay:
         self._base_h = 300.0            # 帧缩放基准高度（base_height × scale）
         self.load_char()
 
-        self.label = tk.Label(self.root, image=self.img, bg=_key_hex(self.key_rgb), cursor='fleur')
+        self.label = self.renderer.make_label(self.root, self.img, self.key_rgb)
         self.label.pack()
 
         self.label.bind('<ButtonPress-1>', self.on_press)
@@ -3876,11 +4135,15 @@ class FollowOverlay:
     def load_char(self):
         """加载/重载图片（热重载、切皮肤、滚轮缩放共用入口）。
 
-        静态图：原管线不变（缩放 → 动态键色 → 品红式抠色 → PhotoImage）。
+        静态图：原管线不变（缩放 → 动态键色 → 渲染层出图 → 贴 Label）。
         动图（GIF/动图 WebP/APNG，n_frames>1）：建帧序列 + after 按帧时长播放；
         帧按需解码（LRU 6 张），键色取多帧颜色并集。
+
+        v2.0-①a：出图与应用全部经渲染器（_renderer_of(self)；CompatRenderer = v1.6 老路径原样
+        承载），这里不再直接调 _flatten_alpha_for_tk / ImageTk.PhotoImage / -transparentcolor。
         """
         img_path = self.cfg['image']
+        renderer = _renderer_of(self)      # 渲染层（v2.0-①a）：出图与应用都走它
         self._anim_stop()
         self.anim_src = None
         self.anim_n = 0
@@ -3921,37 +4184,26 @@ class FollowOverlay:
             # 显示期特效（圆角 / 高斯模糊）——在选抠色键之前做（模糊会改颜色分布）
             img = apply_display_effects(img, self.cfg, Image)
             # 动态颜色键：统计颜色并集，选图中不存在的颜色当抠色键（消灭「图含品红被误抠」）
-            self.key_rgb = pick_key_color([img], Image)
-            # 修复紫边：缩放后 alpha 二值化 + 透明区填键色（配合 transparentcolor 抠色）
-            img = _flatten_alpha_for_tk(img, Image, self.key_rgb)
+            self.key_rgb = renderer.pick_key([img], Image)
+            # 渲染层出帧（compat = 修复紫边：缩放后 alpha 二值化 + 透明区填键色）
+            img = renderer.flatten(img, self.key_rgb, Image)
             self.raw_img = img.copy()
             old = getattr(self, 'img', None)
-            self.img = self._ImageTk.PhotoImage(img, master=self.root)
+            self.img = renderer.to_photo(img)
             if old is not None:
-                _release_photo(old)  # 显式释放旧 tcl image（热重载/切皮肤同步清理）
+                renderer.release(old)  # 显式释放旧 tcl image（热重载/切皮肤同步清理）
         self.img_mtime = os.path.getmtime(img_path)
         # 不画光环（纯图片）
         self.cur_accent = None
-        # 窗口透明色 / 背景 / Label 底色全部跟随动态键色
-        key_hex = _key_hex(self.key_rgb)
-        try:
-            self.root.attributes('-transparentcolor', key_hex)
-        except Exception:
-            pass
-        try:
-            self.root.configure(bg=key_hex)
-        except Exception:
-            pass
-        if hasattr(self, 'label'):
-            try:
-                self.label.configure(image=self.img, bg=key_hex)
-            except Exception:
-                pass
+        # 窗口透明色 / 背景 / Label 底色全部跟随动态键色（渲染层统一应用：
+        # compat = -transparentcolor + 键色底；alpha 实装后改推分层位图）
+        renderer.apply_window(self.key_rgb)
+        renderer.apply_label(getattr(self, 'label', None), self.img, self.key_rgb)
         self.w, self.h = self.img.width(), self.img.height()
         self.layer = self.cfg.get('layer', 'above')  # 热重载/切皮肤/缩放重载后同步图层配置
         # 新图已挂上 Label，再释放旧帧序列的 tcl image（避免切换瞬间画布指向已删 image）
         for _p in old_frames:
-            _release_photo(_p)
+            renderer.release(_p)
         if self.anim_n > 1:
             self._anim_start()
 
@@ -3972,10 +4224,29 @@ class FollowOverlay:
             pass
         if not imgs:
             return MAGENTA
-        return pick_key_color(imgs, Image)
+        return _renderer_of(self).pick_key(imgs, Image)
+
+    def _sync_render_mode(self):
+        """切皮肤后同步渲染层（render_mode 是全局渲染开关，不属于皮肤参数）。
+
+        规则：皮肤档案**显式**声明 render_mode 才采纳；缺键（老档案）保持当前全局值 ——
+        否则 skin.json 里没有该键的老皮肤一被切过去就会把 alpha 用户莫名打回 compat。
+        """
+        cfg = self.cfg if isinstance(self.cfg, dict) else {}
+        mode = resolve_render_mode(cfg) if 'render_mode' in cfg else self.render_mode
+        if mode != self.render_mode:
+            self.render_mode = mode
+            self.renderer = create_renderer(self, cfg, mode)
+            try:
+                _write_log(f'[渲染] 皮肤档案声明 render_mode={mode} → 切换渲染器')
+            except Exception:
+                pass
+        else:
+            _renderer_of(self).cfg = cfg   # 换的是同一个全局开关 → 只更新 cfg 引用
+        return self.render_mode
 
     def _decode_frame(self, idx):
-        """按需解码单帧：seek → RGBA → 缩放 → 抠色 → PhotoImage（不写 self.img）。"""
+        """按需解码单帧：seek → RGBA → 缩放 → 抠色（渲染层）→ PhotoImage（不写 self.img）。"""
         src = self.anim_src
         if src is None:
             return None
@@ -3988,8 +4259,7 @@ class FollowOverlay:
             img = img.resize((max(1, int(img.width * ratio)), max(1, int(base_h))),
                              Image.LANCZOS)
         img = apply_display_effects(img, self.cfg, Image)   # 与静态图一致的特效管线
-        img = _flatten_alpha_for_tk(img, Image, self.key_rgb)
-        return self._ImageTk.PhotoImage(img, master=self.root)
+        return _renderer_of(self).prepare(img, self.key_rgb, Image)
 
     def _get_frame(self, idx):
         """取帧（LRU 缓存，上限 ANIM_CACHE_MAX 张）：命中即置为最近使用，
@@ -4005,7 +4275,7 @@ class FollowOverlay:
             if old_idx == self.anim_idx:
                 self._frame_cache.move_to_end(old_idx)   # 当前显示帧保底，改淘汰下一个
                 continue
-            _release_photo(self._frame_cache.pop(old_idx))
+            _renderer_of(self).release(self._frame_cache.pop(old_idx))
         photo = self._decode_frame(idx)
         if photo is None:
             return getattr(self, 'img', None)
@@ -4084,10 +4354,8 @@ class FollowOverlay:
             photo = self._get_frame(nxt)
             if photo is not None:
                 self.img = photo
-                try:
-                    self.label.configure(image=photo)
-                except Exception:
-                    pass
+                # 换帧走渲染层（compat = 贴 Label；alpha 实装后 = 推分层位图）
+                _renderer_of(self).apply_photo_only(getattr(self, 'label', None), photo)
             self._prefetch(nxt)
             self._schedule_anim(dur)
         except Exception as e:
@@ -4112,6 +4380,8 @@ class FollowOverlay:
         if not cfg:
             return False
         self.cfg = cfg
+        # 渲染层同步：皮肤档案显式声明 render_mode 才切换，缺键保持全局开关（见 _sync_render_mode）
+        self._sync_render_mode()
         self.load_char()
         _write_log(f'[皮肤] 切换到 {name} image={cfg.get("image")}')
         self._sync_tk_geometry()  # 尺寸变化：低频 geometry 同步镜像坐标（与 SetWindowPos 镜像一致）
@@ -4180,7 +4450,7 @@ class FollowOverlay:
             if mtime != self.img_mtime:
                 try:
                     self.load_char()
-                    self.label.configure(image=self.img)
+                    _renderer_of(self).apply_photo_only(self.label, self.img)
                     self._sync_tk_geometry()  # 热重载尺寸变化：低频 geometry 同步镜像
                     # 热重载后候选框在场 → 补一次图层同步（图片尺寸变化可能影响叠放观感）
                     self._sync_layer_with_candidate()
@@ -4219,7 +4489,7 @@ class FollowOverlay:
         self.cfg['scale'] = new_scale
         try:
             self.load_char()
-            self.label.configure(image=self.img)
+            _renderer_of(self).apply_photo_only(self.label, self.img)
             self._sync_tk_geometry()  # 缩放后尺寸变化：低频 geometry 同步镜像
         except Exception:
             pass
