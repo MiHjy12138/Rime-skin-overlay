@@ -1,0 +1,73 @@
+# ==== v1.6 baseline run ====
+# script : B_test_extras.py
+# cwd    : C:\Users\Misaka\AppData\Local\Temp\rime_v16_baseline
+# return : 0 (ok)
+# seconds: 3.1
+# note   : 输出为 stdout+stderr 合并，utf-8
+# ===========================
+
+============================================================
+--- [1] 圆角 / 高斯模糊（显示期特效）---
+PASS  1a 圆角：尺寸不变 | (200, 300)
+PASS  1b 圆角：左上角变透明 | alpha=0
+PASS  1c 圆角：中心仍不透明
+PASS  1d 圆角：边缘中段保持不透明 | alpha=255
+PASS  1e 已移除的 blur 字段被安全忽略
+PASS  1f 圆角 + 旧 blur 字段共存（圆角仍生效）
+PASS  1g 默认配置已无 blur 字段
+PASS  1h 关闭时原样返回（不影响老配置）
+PASS  1i 与抠图透明区共存（外圈仍透明）
+PASS  1j 抠图内容区在圆角内保持不透明
+PASS  1k 外挂加载后圆角外圈=抠色键（真透明） | 角落=(255, 0, 255) key=#FF00FF
+PASS  1l 外挂加载后中心为图片本体
+PASS  2m 动图+特效：仍识别为动图 | anim_n=8
+PASS  2n 动图逐帧套了特效（尺寸不变）
+--- [2] 清理垃圾（白名单 / 引用保护 / 回收站）---
+PASS  2a 收集到预期垃圾 | 实际=['RimeSkinOverlay.exe.bak-v1.5', 'diag_misdetect.log', 'preprocessed_1789.png', 'tmp_notes.txt']
+PASS  2b 白名单文件不删（README/CHANGELOG/error.log/config/LICENSE）
+PASS  2c 程序本体与源码不删（.exe/.py/.ico 受保护）
+PASS  2d 正在使用的图片不删
+PASS  2e 子目录内的文件不碰
+PASS  2f 清理数量正确 | n=4
+PASS  2g 垃圾文件已消失 | 剩余=['CHANGELOG.md', 'LICENSE', 'README.md', 'RimeSkinOverlay.exe', 'cfg_image_1788.png', 'config.json', 'error.log', 'icon.ico', 'rime_char_overlay.py', 'skins']
+PASS  2h 白名单 + 程序本体 + 引用图片仍在 | 剩余=['CHANGELOG.md', 'LICENSE', 'README.md', 'RimeSkinOverlay.exe', 'cfg_image_1788.png', 'config.json', 'error.log', 'icon.ico', 'rime_char_overlay.py', 'skins']
+PASS  2i skins/ 目录仍在
+PASS  2j 幂等：再清理为 0 | n=0
+PASS  2k 回收站 API 可调用且文件被移走 | ok=True 仍存在=False
+--- [3] 日志：时间戳 / 轮转 / 关键点 ---
+PASS  3a 日志带时间戳前缀 | [2026-09-26 11:08:20] 测试一条关键操作
+PASS  3b 时间戳是当天日期
+PASS  3c 环境指纹含版本/系统/DPI | [2026-09-26 11:08:20] [启动] v1.6 frozen=False python=3.12.10 os=Windows-10-10.0.19045-SP0 dpi=96 cwd=C:\Users\M
+PASS  3d 超限后轮转出 error.log.1 | 新文件=42 旧文件=307416
+PASS  3e 轮转后新日志可继续写
+PASS  3f 清理动作写入关键日志 | [2026-09-26 11:08:20] [清理] 清理垃圾文件 1/1 个（共 1 B）
+--- [4] 点阵羽化（边缘 alpha 用有序抖动近似渐变）---
+PASS  4a 羽化：尺寸不变
+PASS  4b 羽化带内 alpha 有透明也有不透明（点阵渐变） | 带内 alpha=[0, 255]
+PASS  4c 中心区域保持完全不透明
+PASS  4d 只动透明通道，画面像素不变
+PASS  4e 关闭 → 原样返回
+PASS  4f 兼容旧配置（只有 feather_dither 字段）
+PASS  4g 羽化 + 圆角可叠加
+PASS  4h 外挂带羽化正常加载
+--- [5] 清理：配置指向的冗余副本（自动改指向皮肤）---
+PASS  5a 冗余副本被列入可清理 | ['cfg_image_111.png']
+PASS  5b 副本已清掉 | n=1
+PASS  5c config 指向已改到皮肤里的同一张图 | C:\Users\Misaka\AppData\Local\Temp\extras_ggm6lfog\repoint\skins\阿芙\image.png
+PASS  5d 皮肤副本仍在（皮肤没坏）
+--- [6] 水平翻转（显示期开关）---
+PASS  6a 翻转：尺寸不变
+PASS  6b 翻转：像素左右镜像
+PASS  6c 关时不翻转
+PASS  6d 翻转 + 圆角可叠加
+PASS  6e 外挂加载后画面已镜像
+PASS  6f 不动图片文件（显示期）
+PASS  6g 动图 + 翻转：仍识别为动图 | anim_n=6
+PASS  6h 动图逐帧可解码
+--- [7] 预处理里已无「镜像反转」---
+PASS  7a 对话框不再有 btn_flip 控件
+PASS  7b 无 flip 相关属性
+PASS  7c 预处理仍可正常输出
+============================================================
+通过 54 项 / 失败 0 项
+ALL CHECKS PASS

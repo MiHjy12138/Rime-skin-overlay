@@ -1,0 +1,28 @@
+# ==== v1.6 baseline run ====
+# script : B_test_anim_sim.py
+# cwd    : C:\Users\Misaka\AppData\Local\Temp\rime_v16_baseline
+# return : 0 (ok)
+# seconds: 0.9
+# note   : 输出为 stdout+stderr 合并，utf-8
+# ===========================
+
+============================================================
+PASS  T1a n<=limit 全取（不丢帧）
+PASS  T1b n>limit 均匀采样且含首末帧 | len=49
+PASS  T2a 缺省 duration → 100
+PASS  T2b 过小 duration → 钳到下限
+PASS  T2c 过大 duration → 钳到上限
+PASS  T2d 正常 duration 原样
+PASS  T3a n_frames 识别为动图 | n=12
+PASS  T3b 仅首帧统计 → 品红可用（键=品红） | key=(255, 0, 255)
+PASS  T3c 全帧并集 → 品红被占用，自动换键 | key=(0, 0, 255)
+PASS  T4a 首帧可解码成 PhotoImage | 200x300
+PASS  T4b 帧缓存不超过上限 | max=6 limit=6
+PASS  T4c 全程可解码且当前帧常驻缓存
+PASS  T4d 缓存里始终只留少量帧（按需解码） | 6 <= 6
+PASS  T5a 透明像素填键色
+PASS  T5b 半透明像素二值化为不透明
+PASS  T5c 输出 alpha 恒为 255
+============================================================
+通过 16 项 / 失败 0 项
+ALL CHECKS PASS

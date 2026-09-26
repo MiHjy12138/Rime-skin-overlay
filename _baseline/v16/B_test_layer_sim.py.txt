@@ -1,0 +1,69 @@
+# ==== v1.6 baseline run ====
+# script : B_test_layer_sim.py
+# cwd    : C:\Users\Misaka\AppData\Local\Temp\rime_v16_baseline
+# return : 0 (ok)
+# seconds: 3.5
+# note   : 输出为 stdout+stderr 合并，utf-8
+# ===========================
+
+=== v1.5 图层功能验证：模拟候选框 + below/above 层级语义 ===
+Python 3.12.10
+tk 8.6
+
+[S1] below + 贴边=中间 + 候选框置顶 → 图片窗插到候选框正下方
+  [PASS] 假候选框确为置顶(WS_EX_TOPMOST)  (0x2706B0)
+  [PASS] _position_once 定位成功且图片窗可见  (visible=True)
+  [PASS] 图片窗仍为 topmost（不被普通窗口盖住）
+  [PASS] 图片窗紧贴候选框正下方（被压）  (prev=0x2706B0 cand=0x2706B0)
+  [PASS] 候选框在图片窗上方（below 语义成立）
+  [PASS] 重复 apply 幂等（仍紧贴候选框下方）
+
+[S2] below + 贴边=中间 + 候选框非置顶 → 保持 topmost（保底分支）
+  [PASS] 假候选框确为非置顶
+  [PASS] 图片窗已显示
+  [PASS] 候选框非置顶 → 图片窗保持 topmost 保底可见
+  [PASS] 候选框未压住图片窗（below 未误插序）
+  [PASS] 心跳后图片窗仍 topmost
+  [PASS] 心跳后候选框仍未压住图片窗
+
+[S3] below + 贴边=左/右（不重叠）→ 保持 topmost，不执行插序
+  [PASS] left 贴边 + below → 图片窗仍 topmost
+  [PASS] left 贴边定位在候选框左侧（不重叠）  (ov3.x=-88 ov3.w=140 cand.left=60)
+  [PASS] side=left 时 apply_layer 不改动 z-order（纯副作用被禁止）  (covers before=True after=True)
+  [PASS] left 贴边 apply 后仍 topmost
+  [PASS] right 贴边 + below → 图片窗仍 topmost
+  [PASS] right 贴边定位在候选框右侧（不重叠）  (ov3.x=488 cand.right=480)
+  [PASS] side=right 时 apply_layer 不改动 z-order
+  [PASS] right 贴边 apply 后仍 topmost
+
+[S4] above 默认 → 移动即置顶（v1.4 回归）
+  [PASS] 旧配置无 layer 字段 → 默认 above  (layer='above')
+  [PASS] above + 候选框置顶：图片窗显示且 topmost
+  [PASS] above：候选框未压住图片窗
+  [PASS] above + 候选框非置顶：图片窗仍 topmost
+  [PASS] above：非置顶候选框未压住图片窗
+  [PASS] 候选框已提到图片窗上方（构造被压态）
+  [PASS] above 被压后心跳补回 topmost
+  [PASS] above 心跳后候选框不再压住图片窗
+\n[S5] 候选框销毁重建 → GONE+SHOW 事件后缓存清空/直挂/重定位自愈
+  [PASS] 初始：图片窗插到候选框A下方（below+center）
+  [PASS] GONE 事件后候选框缓存已清空
+  [PASS] SHOW 事件直挂新候选框B  (0x8107FA)
+  [PASS] 重建后图片窗仍可见
+    [PASS] 重建自愈：图片窗重插到新候选框B下方
+\n[S6] 心跳：below 漂移只重插不拉顶（受候选框置顶态可用性约束）
+    [PASS] below 完整态心跳后仍紧贴候选框下方（不破坏插序）
+  [PASS] 人为把图片窗提到顶（构造漂移态）
+    [PASS] 心跳自愈：漂移后重插回候选框B下方
+  [PASS] 重插后图片窗仍 topmost（保底可见）
+
+[S7] 向导控件与 layer 字段同步（save_config/find_skin 已打桩）
+  [PASS] 向导 var_layer 默认 above
+  [PASS] below+center 提示文案显示  ('💡 下方效果仅在 贴边=中间(重叠) 时可见；左/右贴边时自动保持置顶')
+  [PASS] below+右贴边 提示文案（提醒不重叠自动置顶）  ('⚠ 当前 贴边=右侧（不与候选框重叠），「下方」不生效，将自动保持置顶；切到 中间 才可见下方效果')
+  [PASS] above 时提示行为空
+  [PASS] 向导保存字段 side/layer 写入 cfg  (('center', 'below'))
+  [PASS] 皮肤应用后向导 var_layer 同步为 below
+  [PASS] 皮肤应用后 var_side 同步为 center
+
+ALL CHECKS PASS  (共 41 项断言通过)
