@@ -836,6 +836,34 @@ def test_runtime(tmp, gui_ok):
                   _has_alpha_variety(fr), '有 alpha 跨度')
             check('F26 三层内容都落在画布内（bbox 覆盖多段）',
                   bb is not None and (bb[2] - bb[0]) > 0, str(bb))
+
+        # ---- ② 兜底：候选框只改宽度（weasel 可能不发事件）与零尺寸保护 ----
+        ov2._position_once()
+        check('F27 定位后候选框矩形无变化 → _rect_changed() 为 False',
+              ov2._rect_changed() is False, str(getattr(ov2, '_applied_rect', None)))
+        fake2.move(300, 240, w=620, h=80)
+        check('F28 候选框只改宽度（不动位置）→ _rect_changed() 为 True',
+              ov2._rect_changed() is True, str(getattr(ov2, '_applied_rect', None)))
+        ov2._position_once()          # 心跳兜底走的就是这条路径
+        wx4, wy4, ww4, wh4, _pl4 = ov2._calc_layer_targets(fake2.rect())
+        top = ov2._top_hwnd()
+        R.user32.GetWindowRect(top, ctypes.byref(wr))
+        check('F29 变宽后窗口宽度补上（心跳兜底路径可用）',
+              abs((wr.right - wr.left) - ww4) <= 4,
+              f'win_w={wr.right - wr.left} exp={ww4}')
+
+        saved_layers = ov2.cfg.get('layers')
+        ov2.cfg['layers'] = [{'image': os.path.join(tmp, 'missing1.png'),
+                              'anchor': 'left_edge'},
+                             {'image': os.path.join(tmp, 'missing2.png'),
+                              'anchor': 'right_edge'}]
+        _x5, _y5, w5, h5, _ch5 = ov2._plan_targets(fake2.rect())
+        top = ov2._top_hwnd()
+        R.user32.GetWindowRect(top, ctypes.byref(wr))
+        check('F30 图层图全缺失 → 不传尺寸（窗口绝不被缩成 0）',
+              w5 is None and h5 is None and (wr.right - wr.left) > 0,
+              f'w={w5} h={h5} win_w={wr.right - wr.left}')
+        ov2.cfg['layers'] = saved_layers
     finally:
         R.SKINS_DIR = real_skins
         R.save_config = real_save

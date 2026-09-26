@@ -5975,6 +5975,10 @@ class FollowOverlay:
         if not self._layers_active():
             return int(wx), int(wy), None, None, False
         ww, wh = int(ww), int(wh)
+        if ww <= 0 or wh <= 0:
+            # 布局算不出尺寸（所有图层图都缺失/尺寸为 0）→ 保持窗口现状，
+            # 绝不能把 SetWindowPos 的 cx/cy 传 0（那会把窗口缩成一条线）
+            return int(wx), int(wy), None, None, False
         changed = (ww, wh) != tuple(getattr(self, '_canvas_size', None) or (0, 0))
         if changed:
             try:
@@ -5989,6 +5993,18 @@ class FollowOverlay:
             except Exception:
                 pass
         return int(wx), int(wy), ww, wh, changed
+
+    def _rect_changed(self):
+        """候选框矩形（位置或尺寸）与上次已应用的记录不同 → True（O(1) 一次 GetWindowRect）。
+
+        v2.0-② 套层用：候选框"只变宽不移动"时 weasel 未必发 LOCATIONCHANGE 事件，
+        心跳（200ms）用这个兜底把多图层窗口的宽度跟上 —— 单图层路径不查它，零影响。
+        """
+        r = self._read_cached_rect()
+        if r is None:
+            return False
+        cur = (int(r.left), int(r.top), int(r.right), int(r.bottom))
+        return cur != tuple(getattr(self, '_applied_rect', None) or ())
 
     def _layer_raw_frame(self, idx, ld, Image):
         """取第 idx 层的原始 RGBA 帧（缩放 + 特效后、抠色前）。命中 _layer_raw 缓存即复用。"""
@@ -6126,6 +6142,8 @@ class FollowOverlay:
                     ch = rect.bottom - rect.top
                     if cw > 0 and ch > 0 and ch < cw * 4 and cw < 1300 and ch < 1000:
                         x, y, w, h, size_changed = self._plan_targets(rect)
+                        self._applied_rect = (int(rect.left), int(rect.top),
+                                              int(rect.right), int(rect.bottom))
                         # 死区：窗口已显示、位置变化 <2px 且画布尺寸未变 → 不移动
                         # （省一次系统调用与重绘；尺寸变了必须走完整路径，否则窗口停在旧宽度）
                         if (self.visible and not size_changed
@@ -6383,6 +6401,11 @@ class FollowOverlay:
                 if self._pos_dirty:
                     self._position_once()
                     self._pos_dirty = False
+                elif self._layers_active() and self._rect_changed():
+                    # ② 套层兜底（v2.0-②）：候选框只改宽度（候选数变化）时事件可能不到，
+                    # 心跳发现矩形变了就补一次定位 → 两侧图层最多晚 200ms 拉开/收拢。
+                    # 单图层不查（_layers_active() 先短路），v1.6 行为零变化。
+                    self._position_once(allow_scan=False)
                 self._ensure_topmost_if_needed()
             elif self._need_rescan:
                 # 兜底：心跳允许在「缓存失效待重扫」时低频触发全扫（受节流）
