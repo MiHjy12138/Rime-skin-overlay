@@ -11,8 +11,12 @@
     I 段改守 `_preview_compose`（纯色底）并新增「合成图不含棋盘格深色」一条 —— 只换底，
     没有放宽任何既有断言。
   · 「我想的是放后面的开关」→ 真 alpha 以前只做在 ⑪「渲染模式」单选里。
-    验收：F/G/H 段 —— ⑩ 点阵羽化 旁新增「增强（真羽化）」开关，与 ⑪ 双向联动，
-    点阵勾选在增强模式下置灰 + 明确提示「点阵羽化 = 兼容模式下的近似」，切换即时重绘。
+    验收：F/G/H 段 —— ⑩ 点阵羽化 旁新增「增强（真羽化）」开关，与内部渲染模式
+    var_render 同一切口（改一处另一处同步），点阵勾选在增强模式下置灰 +
+    明确提示「点阵羽化 = 兼容模式下的近似」，切换即时重绘。
+    ⚠️ v2.0-R10：⑪ 单选组已按用户实测反馈删除（「有增强按钮后渲染模式部分就可以取了」），
+    var_render 降为**内部状态**（由该开关驱动）—— G/H 段的断言条件一字未动，
+    只把「⑪」的说法换成「内部模式 var_render」：删掉的是控件，不是这条通路。
 
 红绿纪律：本脚本先跑出红（缺 compose_on_checker / true_alpha / 新开关 → FAIL），再改实现到绿。
 
@@ -293,16 +297,16 @@ def test_wizard_widgets(tmp, saved):
 
 
 def test_toggle_link(tmp, saved):
-    section('G. 双向联动：⑩ 旁开关 ↔ ⑪ 渲染模式（改一处另一处同步 + 即时重绘）')
+    section('G. 同一切口：⑩ 旁开关 ↔ 内部模式 var_render（改一处另一处同步 + 即时重绘）')
     img = _make_png(os.path.join(tmp, 'r1b.png'))
     wiz = _make_wiz({'image': img}, saved)
     try:
         if not hasattr(wiz, '_on_alpha_feather_toggle'):
-            check('G01 ★⑩ 旁开关 → ⑪ 同步为增强', False, '_on_alpha_feather_toggle 未实现')
+            check('G01 ★⑩ 旁开关 → 内部模式同步为增强', False, '_on_alpha_feather_toggle 未实现')
             check('G02 ★切换后预览立即重绘', False, '_on_alpha_feather_toggle 未实现')
             check('G03 ★增强模式下点阵勾选置灰', False, '_on_alpha_feather_toggle 未实现')
             check('G04 提示文案讲清「点阵羽化 = 兼容模式下的近似」', False, '未实现')
-            check('G05 ★⑪ 改回兼容 → ⑩ 旁开关同步为关', False, '未实现')
+            check('G05 ★内部模式改回兼容 → ⑩ 旁开关同步为关', False, '未实现')
             check('G06 切回兼容后点阵勾选恢复可编辑', False, '未实现')
             return
         n = [0]
@@ -315,7 +319,7 @@ def test_toggle_link(tmp, saved):
 
         wiz.var_alpha_feather.set(True)
         wiz._on_alpha_feather_toggle()
-        check('G01 ★⑩ 旁开关打开 → ⑪ 渲染模式同步为增强',
+        check('G01 ★⑩ 旁开关打开 → 内部模式 var_render 同步为增强',
               R.resolve_render_mode({'render_mode': wiz.var_render.get()}) == 'alpha',
               repr(wiz.var_render.get()))
         check('G02 ★切换后预览立即重绘（无需拖滑条/重开窗口）', n[0] >= 1,
@@ -329,12 +333,12 @@ def test_toggle_link(tmp, saved):
         n[0] = 0
         wiz.var_render.set('compat')
         wiz._update_render_hint()
-        check('G05 ★⑪ 改回兼容 → ⑩ 旁开关同步为关',
+        check('G05 ★内部模式改回兼容 → ⑩ 旁开关同步为关',
               not bool(wiz.var_alpha_feather.get()), str(wiz.var_alpha_feather.get()))
         check('G06 切回兼容后点阵勾选恢复可编辑',
               str(wiz.chk_feather.cget('state')) == 'normal',
               str(wiz.chk_feather.cget('state')))
-        check('G07 ★⑪ 改回兼容也立刻重绘预览', n[0] >= 1, f'重绘 {n[0]} 次')
+        check('G07 ★切回兼容也立刻重绘预览', n[0] >= 1, f'重绘 {n[0]} 次')
         txt_cmp = str(wiz.lbl_feather_hint.cget('text'))
         check('G08 兼容模式提示给出「增强」指引', '近似' in txt_cmp and '增强' in txt_cmp,
               txt_cmp)
@@ -372,10 +376,10 @@ def test_save_consistency(tmp, saved):
         wiz2._update_render_hint()
         saved.clear()
         wiz2._save_and_start()
-        check('H03 ★⑪ 选兼容 → 保存 render_mode=compat（两处口径一致）',
+        check('H03 ★内部模式切到兼容 → 保存 render_mode=compat（口径一致）',
               R.resolve_render_mode(saved) == 'compat', repr(saved.get('render_mode')))
     except Exception as e:
-        check('H03 ★⑪ 选兼容 → 保存 render_mode=compat（两处口径一致）', False, repr(e))
+        check('H03 ★内部模式切到兼容 → 保存 render_mode=compat（口径一致）', False, repr(e))
     finally:
         _kill(wiz2)
 
@@ -435,7 +439,7 @@ def _canvas_images(wiz):
 
 # ==========================================================================
 def main():
-    print('=== B_test_r1_feather：R1 增强羽化（⑩ 旁开关 + ⑪ 双向联动 + 预览棋盘格真 alpha 合成）===')
+    print('=== B_test_r1_feather：R1 增强羽化（⑩ 旁开关 ↔ 内部渲染模式 + 预览真 alpha 合成）===')
     print('Python', sys.version.split()[0], '| PIL 可用:', PIL_OK)
     tmp = tempfile.mkdtemp(prefix='r1_feather_')
     gui_ok = _has_gui()

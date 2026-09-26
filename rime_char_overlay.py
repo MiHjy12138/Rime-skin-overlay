@@ -2051,6 +2051,8 @@ def _flatten_alpha_for_tk(img_rgba, Image=None, key=MAGENTA):
 RENDER_MODES = ('compat', 'alpha')
 DEFAULT_RENDER_MODE = 'compat'
 # 向导里的中文标签（不把 compat/alpha 术语摆给用户看）：(模式值, 显示文案)
+# v2.0-R10：⑪ 单选组已删 —— 这对标签现在只供提示文案（_update_render_hint）取中文名，
+# 不再是控件选项；保留常量以免动到既有测试/档案口径。
 RENDER_MODE_CHOICES = (('compat', '兼容（默认）'), ('alpha', '增强（真·半透明）'))
 
 # ---- 分层窗（真 alpha）所需的 GDI/USER32 常量与结构（v2.0-①b，对齐 spike_layered_alpha.py）----
@@ -4605,7 +4607,8 @@ class ConfigWizard:
                                     font=('Microsoft YaHei', 8))
         self.scl_feather.pack(side='left', padx=2)
         # v2.0-R1：真 alpha 以前只做在 ⑪ 单选里，用户要的是「放后面的开关」→ 加在 ⑩ 后面。
-        # 它与 ⑪ 渲染模式双向联动（一处改另一处同步）：两边都收口到 _update_render_hint()
+        # v2.0-R10：⑪ 单选已删（用户实测「有增强按钮后渲染模式部分就可以取了」），
+        # 本开关成为**唯一入口**；内部状态与提示文案都收口到 _update_render_hint()。
         self.var_alpha_feather = tk.BooleanVar(master=self.root, value=False)
         self.chk_alpha_feather = tk.Checkbutton(
             row_fe, text='增强（真羽化）', variable=self.var_alpha_feather,
@@ -4616,19 +4619,15 @@ class ConfigWizard:
             fg='#888', font=('Microsoft YaHei', 8))
         self.lbl_feather_hint.pack(anchor='w', pady=(0, 4))
 
-        # ⑪ 渲染模式（v2.0-①）：兼容 = v1.6 老路径；增强 = 真 alpha 分层窗（真·半透明）
-        tk.Label(adv, text='⑪ 渲染模式:', font=('Microsoft YaHei', 10)).pack(anchor='w')
-        row_rm = tk.Frame(adv)
-        row_rm.pack(anchor='w', pady=(0, 2))
+        # 渲染模式（v2.0-① → v2.0-R10 收口）：兼容 = v1.6 老路径；增强 = 真 alpha 分层窗（真·半透明）。
+        # R10：删掉 ⑪「渲染模式」单选组（Label + Radiobutton + 排版），入口只剩 ⑩ 旁那个开关；
+        # var_render 保留为**内部状态**（由该开关驱动、供 cfg['render_mode'] 读写），
+        # _update_render_hint 仍是唯一收口：开关 → 提示文案 + 预览重绘，回显时同步给开关。
         _cur_render = resolve_render_mode(self.cfg)
         if self.overlay is not None:      # 打开向导时回显当前模式，避免一保存就被打回兼容
             _cur_render = resolve_render_mode({'render_mode':
                                                getattr(self.overlay, 'render_mode', _cur_render)})
         self.var_render = tk.StringVar(master=self.root, value=_cur_render)
-        for _val, _text in RENDER_MODE_CHOICES:
-            tk.Radiobutton(row_rm, text=_text, variable=self.var_render, value=_val,
-                           font=('Microsoft YaHei', 9),
-                           command=self._update_render_hint).pack(side='left', padx=2)
         self.lbl_render_hint = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8),
                                         justify='left', wraplength=320)
         self.lbl_render_hint.pack(anchor='w', pady=(0, 4))
@@ -5132,16 +5131,21 @@ class ConfigWizard:
             self._layer_loading = False
 
     def _is_alpha_mode(self):
-        """当前 ⑪ 渲染模式 / ⑩ 旁「增强（真羽化）」开关是不是指向「增强」"""
+        """内部渲染模式是不是「增强」。
+
+        v2.0-R10：入口只剩 ⑩ 旁「增强（真羽化）」开关；var_render 是该开关的内部状态
+        （写回 cfg 时仍读它，口径与 R1/R7 一致）。
+        """
         try:
             return resolve_render_mode({'render_mode': self.var_render.get()}) == 'alpha'
         except Exception:
             return False
 
     def _on_alpha_feather_toggle(self):
-        """⑩ 旁「增强（真羽化）」开关：勾/取消 = 切 ⑪ 渲染模式，随即同步两处并立刻重绘预览。
+        """⑩ 旁「增强（真羽化）」开关：勾/取消 = 切内部渲染模式，随即刷新提示并立刻重绘预览。
 
-        Tk 的 set() 不触发 command，所以这里与 _update_render_hint 之间没有递归。
+        v2.0-R10：⑪ 单选已删，本开关是**唯一入口**（Tk 的 set() 不触发 command，
+        所以这里与 _update_render_hint 之间没有递归）。
         """
         try:
             want = bool(self.var_alpha_feather.get())
@@ -5204,17 +5208,24 @@ class ConfigWizard:
     def _update_render_hint(self):
         """渲染模式提示（大白话，不摆 compat/alpha 术语）。
 
-        v2.0-R1：这里同时是「⑪ 渲染模式 ↔ ⑩ 旁「增强（真羽化）」开关」双向联动的收口 ——
-        ⑪ 单选 command、⑩ 旁开关 command、切皮肤回显都走这里，所以两处永远一致；
-        末尾再刷一次预览，做到「勾一下立刻看到差别」。
+        v2.0-R1：这里同时是「⑪ 渲染模式 ↔ ⑩ 旁「增强（真羽化）」开关」双向联动的收口。
+        v2.0-R10：⑪ 单选已删 —— 现在只有 ⑩ 旁开关一个入口，本方法负责「开关 → 提示文案 +
+        立刻重绘预览」，并在从老配置/皮肤档案回显时把内部状态同步到开关（_sync_feather_widgets）。
+        文案不再引用 ⑪，但仍要讲清「点阵羽化 = 兼容模式下的近似」。
         """
         try:
+            names = dict(RENDER_MODE_CHOICES)
             if self._is_alpha_mode():
-                txt = ('💡 增强：支持真·半透明（羽化/圆角边缘更柔和、图里含品红也不再被抠穿）。\n'
-                       '透明区域会点击穿透（不挡鼠标，点击落到下面的窗口）；拖动请抓图片不透明部分。')
+                txt = ('💡 %s（已开）：支持真·半透明（羽化/圆角边缘更柔和、'
+                       '图里含品红也不再被抠穿）。\n'
+                       '透明区域会点击穿透（不挡鼠标，点击落到下面的窗口）；'
+                       '拖动请抓图片不透明部分。'
+                       % names.get('alpha', '增强（真羽化）'))
             else:
-                txt = ('💡 兼容（默认）：与旧版显示方式完全一致，最稳；\n'
-                       '圆角/羽化的边缘是硬边（近看会有点阵/毛边）。')
+                txt = ('💡 %s（未勾，默认）：与旧版显示方式完全一致，最稳；\n'
+                       '圆角/羽化的边缘是硬边（近看有点阵/毛边）—— 点阵羽化是兼容模式下的近似，'
+                       '要逐像素真羽化请勾 ⑩ 旁的「增强（真羽化）」。'
+                       % names.get('compat', '兼容'))
             self.lbl_render_hint.configure(text=txt)
         except Exception:
             pass
