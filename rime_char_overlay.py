@@ -217,7 +217,7 @@ def _kill_existing(timeout=3.0):
 
 # ============ 自启管理 ============
 APP_NAME = 'RimeSkinOverlay'
-VERSION = 'v1.6'
+VERSION = 'v2.0'
 
 def _exe_dir():
     if getattr(sys, 'frozen', False):

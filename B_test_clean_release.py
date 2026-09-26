@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """B_test_clean_release.py —— 纯净包组装脚本（make_clean_release.py）契约回归
 
+对齐全新交付口径（历史发布样式）：包内**恰好 4 项、根目录平铺**
+（RimeSkinOverlay.exe / README.md / CHANGELOG.md / LICENSE），
+不含 icon.png、不含 skins/ 空目录、无外层文件夹。
+
 全程只操作临时目录：不启动 GUI、不读写用户配置、不碰桌面、不联网，秒级完成。
 
 覆盖：
-  A. 契约审计 audit()：干净集通过；黑名单逐项命中；skins/ 必须存在且为空；
+  A. 契约审计 audit()：4 项干净集通过；黑名单逐项命中；icon.png / skins/ 必须被判违规；
      缺必需文件；未知文件；exe 唯一性；每个黑名单条目独立成条
-  B. 端到端 build→zip→verify：条目集合精确匹配、--no-icon、脏包必须被拒、
+  B. 端到端 build→zip→verify：条目集合精确等于 4 项、默认包名、脏包必须被拒、
      目标已存在需 --force、非 PE / 体积异常拒绝、目标不存在退出码
 
 运行: python B_test_clean_release.py
@@ -38,12 +42,10 @@ def quiet(fn, *a, **kw):
         return fn(*a, **kw)
 
 
-def clean_entries(icon=True):
-    ents = [(f, False) for f in ('RimeSkinOverlay.exe', 'README.md', 'CHANGELOG.md', 'LICENSE')]
-    if icon:
-        ents.append(('icon.png', False))
-    ents.append(('skins', True))
-    return sorted(ents)
+def clean_entries():
+    """历史发布样式：4 个文件、无任何目录。"""
+    return sorted((f, False) for f in ('RimeSkinOverlay.exe', 'README.md',
+                                       'CHANGELOG.md', 'LICENSE'))
 
 
 def hits(problems, needle):
@@ -53,15 +55,12 @@ def hits(problems, needle):
 # --------------------------------------------------------------- A. audit
 
 def test_audit_clean():
-    print('--- [A1] 干净条目集应通过 ---')
-    probs = quiet(M.audit, clean_entries(), 'test', True)
-    check('干净集零问题', probs == [], f'problems={probs}')
-
-    probs = quiet(M.audit, clean_entries(icon=False), 'test', False)
-    check('无 icon 且声明 --no-icon 零问题', probs == [], f'problems={probs}')
-
-    probs = quiet(M.audit, clean_entries(icon=False), 'test', True)
-    check('声明要 icon 却没给 → 报错', len(probs) == 1, f'problems={probs}')
+    print('--- [A1] 4 项干净集应通过 ---')
+    probs = quiet(M.audit, clean_entries(), 'test')
+    check('4 项干净集零问题', probs == [], f'problems={probs}')
+    check('白名单恰好 4 项', M.ALLOWED_FILES == {'RimeSkinOverlay.exe', 'README.md',
+                                                 'CHANGELOG.md', 'LICENSE'},
+          f'ALLOWED_FILES={sorted(M.ALLOWED_FILES)}')
 
 
 def test_audit_blacklist():
@@ -76,64 +75,71 @@ def test_audit_blacklist():
         ('rime_char_overlay.py.bak-20260926', '备份残留'),
         ('preprocessed_1790391804686.png', '预处理中间图'),
         ('cfg_image_abc.png', '配置托管图片副本'),
+        ('icon.png', '不含 icon.png'),
+        ('icon.ico', '图标文件不随包分发'),
+        ('skins/config.json', '不得包含 "skins/"'),
+        ('skins/心灵信标/芙芙.png', '不得包含 "skins/"'),
         ('note.txt', '不在白名单内'),
         ('RimeSkinOverlay-v1.5.exe', '不在白名单内'),
-        ('skins/心灵信标/芙芙.png', '下不得含任何内容'),
         ('__pycache__/rime_char_overlay.cpython-312.pyc', '__pycache__'),
         ('build/x.toc', 'build'),
         ('dist_v2/RimeSkinOverlay.exe', 'dist_v2'),
     ]
     for bad, needle in cases:
         ents = clean_entries() + [(bad, False)]
-        probs = quiet(M.audit, ents, 'test', True)
+        probs = quiet(M.audit, ents, 'test')
         check(f'黑名单命中：{bad}', hits(probs, needle), f'期望含「{needle}」got={probs}')
 
     # 目录条目本身
-    ents = clean_entries() + [('build', True)]
-    probs = quiet(M.audit, ents, 'test', True)
-    check('黑名单目录条目命中：build/', hits(probs, 'build'), f'problems={probs}')
+    for bad_dir in ('build', 'dist', 'skins'):
+        ents = clean_entries() + [(bad_dir, True)]
+        probs = quiet(M.audit, ents, 'test')
+        check(f'目录条目不得通过：{bad_dir}/', hits(probs, bad_dir), f'problems={probs}')
+
+    # 空 skins/ 目录（历史发布样式没有它）
+    ents = clean_entries() + [('skins', True)]
+    probs = quiet(M.audit, ents, 'test')
+    check('空 skins/ 目录 → 报错（历史样式无此项）',
+          hits(probs, '不得包含 "skins/"'), f'problems={probs}')
 
 
 def test_audit_structure():
-    print('--- [A3] 结构约束（必需项 / exe 唯一性 / skins 空） ---')
-    ents = [e for e in clean_entries() if e[0] != 'skins']
-    probs = quiet(M.audit, ents, 'test', True)
-    check('缺 skins/ 目录 → 报错', hits(probs, '缺少必需目录 "skins/"'), f'problems={probs}')
-
-    ents = [e for e in clean_entries() if e[0] != 'CHANGELOG.md']
-    probs = quiet(M.audit, ents, 'test', True)
-    check('缺 CHANGELOG.md → 报错', hits(probs, '缺少必需文件 "CHANGELOG.md"'), f'problems={probs}')
+    print('--- [A3] 结构约束（必需项 / exe 唯一性 / 无外层文件夹） ---')
+    for miss in ('CHANGELOG.md', 'README.md', 'LICENSE'):
+        ents = [e for e in clean_entries() if e[0] != miss]
+        probs = quiet(M.audit, ents, 'test')
+        check(f'缺 {miss} → 报错', hits(probs, f'缺少必需文件 "{miss}"'), f'problems={probs}')
 
     ents = [e for e in clean_entries() if e[0] != 'RimeSkinOverlay.exe']
-    probs = quiet(M.audit, ents, 'test', True)
+    probs = quiet(M.audit, ents, 'test')
     check('缺 exe → 报错', hits(probs, '缺少必需文件 "RimeSkinOverlay.exe"'), f'problems={probs}')
 
     ents = clean_entries() + [('RimeSkinOverlay.exe.bak-20260926', False)]
-    probs = quiet(M.audit, ents, 'test', True)
+    probs = quiet(M.audit, ents, 'test')
     check('exe 备份残留 → 报错', hits(probs, '备份残留'), f'problems={probs}')
 
     ents = clean_entries() + [('RimeSkinOverlay-1.6.exe', False)]
-    probs = quiet(M.audit, ents, 'test', True)
+    probs = quiet(M.audit, ents, 'test')
     check('旧版 exe（带版本号）→ 报错', hits(probs, '恰好是') and hits(probs, '不在白名单内'),
           f'problems={probs}')
 
-    ents = clean_entries() + [('skins', True), ('skins/config.json', False)]
-    probs = quiet(M.audit, ents, 'test', True)
-    check('skins/ 非空 → 报错', hits(probs, '下不得含任何内容'), f'problems={probs}')
+    ents = clean_entries() + [('sub', True), ('sub/x.txt', False)]
+    probs = quiet(M.audit, ents, 'test')
+    check('外层文件夹（任意子目录）→ 报错', hits(probs, '不在白名单内'), f'problems={probs}')
 
 
 def test_audit_independence():
     print('--- [A4] 每个黑名单条目必须独立报出（不能因同段去重被吞） ---')
     ents = clean_entries() + [('build/a.txt', False), ('build/b.txt', False),
                               ('__pycache__/c.pyc', False)]
-    probs = quiet(M.audit, ents, 'test', True)
+    probs = quiet(M.audit, ents, 'test')
     for rel, _ in ents[-3:]:
         check(f'独立报出：{rel}', any(rel in p for p in probs), f'problems={probs}')
 
 
 # --------------------------------------------------------------- B. 端到端
 
-def make_fake_repo(tmp, exe_bytes=(2 << 20), version='v9.9', with_icon=True):
+def make_fake_repo(tmp, exe_bytes=(2 << 20), version='v9.9'):
     repo = os.path.join(tmp, 'repo')
     os.makedirs(os.path.join(repo, 'dist'), exist_ok=True)
     with open(os.path.join(repo, 'rime_char_overlay.py'), 'w', encoding='utf-8') as f:
@@ -141,9 +147,6 @@ def make_fake_repo(tmp, exe_bytes=(2 << 20), version='v9.9', with_icon=True):
     for name in ('README.md', 'CHANGELOG.md', 'LICENSE'):
         with open(os.path.join(repo, name), 'w', encoding='utf-8') as f:
             f.write(f'{name} 内容\n')
-    if with_icon:
-        with open(os.path.join(repo, 'icon.png'), 'wb') as f:
-            f.write(b'\x89PNG\r\n\x1a\n' + b'\0' * 64)
     exe = os.path.join(repo, 'dist', M.EXE_NAME)
     with open(exe, 'wb') as f:
         f.write(b'MZ' + b'\0' * max(0, exe_bytes - 2))
@@ -155,34 +158,33 @@ def test_end_to_end(tmp):
     repo, exe = make_fake_repo(os.path.join(tmp, 'e2e'))
     out = os.path.join(tmp, 'e2e', 'out', 'pkg.zip')
 
-    rc = quiet(M.main, ['build', '--repo', repo, '--out', out, '--date', '20260101'])
+    rc = quiet(M.main, ['build', '--repo', repo, '--out', out])
     check('build 退出码 0', rc == 0, f'rc={rc}')
     check('zip 已生成', os.path.isfile(out))
 
     ents = M.zip_entries(out)
     got = sorted(rel + ('/' if is_dir else '') for rel, is_dir in ents)
-    want = sorted(['RimeSkinOverlay.exe', 'README.md', 'CHANGELOG.md', 'LICENSE',
-                   'icon.png', 'skins/'])
-    check('zip 内条目集合精确匹配白名单', got == want, f'got={got}')
+    want = sorted(['RimeSkinOverlay.exe', 'README.md', 'CHANGELOG.md', 'LICENSE'])
+    check('zip 内恰好 4 项、根目录平铺', got == want, f'got={got}')
+    check('zip 内无任何目录条目', all(not is_dir for _rel, is_dir in ents), f'ents={ents}')
 
     rc = quiet(M.main, ['verify', out])
     check('verify 纯净 zip → 0', rc == 0, f'rc={rc}')
 
     rc = quiet(M.main, ['verify', repo])
-    check('verify 源码目录（脏）→ 非 0', rc != 0, f'rc={rc}')
+    check('verify 源码目录（脏）→ 2', rc == 2, f'rc={rc}')
 
-    print('--- [B2] --no-icon 与包名 ---')
-    out2 = os.path.join(tmp, 'e2e', 'out', f'RimeSkinOverlay-{M.detect_version(repo)}-纯净版-20260101.zip')
-    rc = quiet(M.main, ['build', '--repo', repo, '--no-icon', '--out', out2, '--date', '20260101'])
-    check('--no-icon build → 0', rc == 0, f'rc={rc}')
-    got2 = sorted(rel + ('/' if is_dir else '') for rel, is_dir in M.zip_entries(out2))
-    check('--no-icon 包内无 icon.png', got2 == want[:4] + ['skins/'], f'got={got2}')
+    print('--- [B2] 默认包名（对齐历史发布 RimeSkinOverlay-v<版本>.zip） ---')
     check('detect_version 抓到 v9.9', M.detect_version(repo) == 'v9.9')
+    rc = quiet(M.main, ['build', '--repo', repo])
+    default_zip = os.path.join(repo, 'dist', f'RimeSkinOverlay-{M.detect_version(repo)}.zip')
+    check('默认输出名 = RimeSkinOverlay-v9.9.zip', rc == 0 and os.path.isfile(default_zip),
+          f'rc={rc} path={default_zip}')
 
     print('--- [B3] 覆盖保护 / 缺产物 / 非 PE ---')
-    rc = quiet(M.main, ['build', '--repo', repo, '--out', out, '--date', '20260101'])
+    rc = quiet(M.main, ['build', '--repo', repo, '--out', out])
     check('目标已存在且无 --force → 3', rc == 3, f'rc={rc}')
-    rc = quiet(M.main, ['build', '--repo', repo, '--out', out, '--force', '--date', '20260101'])
+    rc = quiet(M.main, ['build', '--repo', repo, '--out', out, '--force'])
     check('加 --force → 0', rc == 0, f'rc={rc}')
 
     repo_nb = os.path.join(tmp, 'nobuild')
@@ -208,9 +210,15 @@ def test_end_to_end(tmp):
         zf.writestr('error.log', 'boom')
         zf.writestr('RimeSkinOverlay-v1.5.exe', b'MZ' + b'\0' * (2 << 20))
         zf.writestr('preprocessed_1.png', b'x')
+        zf.writestr('icon.png', b'\x89PNG\r\n\x1a\n')
         zf.writestr('skins/芙芙/图.png', b'x')
+        zf.writestr('extra_folder/README.md', b'x')
     rc = quiet(M.main, ['verify', dirty])
     check('脏包 verify → 2', rc == 2, f'rc={rc}')
+    probs = quiet(M.audit, M.zip_entries(dirty), 'test')
+    for needle in ('config.json', 'error.log', 'preprocessed_1.png', 'icon.png',
+                   '不得包含 "skins/"', '不在白名单内'):
+        check(f'脏包被点名：{needle}', hits(probs, needle), f'problems={probs[:6]}')
 
     rc = quiet(M.main, ['verify', os.path.join(tmp, '不存在.zip')])
     check('目标不存在 → 3', rc == 3, f'rc={rc}')

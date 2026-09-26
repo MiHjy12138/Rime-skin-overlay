@@ -5,23 +5,26 @@
 只用标准库，裸 Python 3 即可运行。
 
 契约（白名单 / 黑名单）
-    白名单（包内只允许这些）：
+    白名单（包内只允许这些，与历史发布 RimeSkinOverlay-v1.6.zip 的结构逐项一致）：
         RimeSkinOverlay.exe   README.md   CHANGELOG.md   LICENSE
-        skins/（必须存在且为空目录）     icon.png（可选，--no-icon 可省）
+        —— 解压后根目录平铺、无外层文件夹。
+    特别说明（历史发布样式就是如此）：
+        · 不含 icon.png —— 程序图标已由 _MEIPASS 内置。
+        · 不含 skins/ 空目录 —— 由程序首次存皮肤时自建。
     黑名单（出现即失败）：
         config.json（用户当前皮肤配置）、error.log*、perf.log*、overlay.log、
         diag_*.log、*.bak-*、*.bak、*.tmp、preprocessed_*.png、cfg_image_*.png、
-        __pycache__/、build/、dist/、.git/、skins/ 下的任何用户内容、旧版 exe
-        （包内 .exe 必须恰好是 RimeSkinOverlay.exe 一个）
+        icon.png / icon.ico、skins/（任何内容）、__pycache__/、build/、dist/、.git/、
+        旧版 exe（包内 .exe 必须恰好是 RimeSkinOverlay.exe 一个）
 
 用法
-    # 组装：默认取 <repo>/dist/RimeSkinOverlay.exe，默认输出 <repo>/dist/<包名>.zip
+    # 组装：默认取 <repo>/dist/RimeSkinOverlay.exe，默认输出 <repo>/dist/RimeSkinOverlay-<版本>.zip
     python make_clean_release.py
     python make_clean_release.py --exe dist_v2/RimeSkinOverlay.exe ^
-        --out "E:\\桌面\\RimeSkinOverlay-v2.0-纯净版-20260926.zip"
+        --out "E:\\桌面\\RimeSkinOverlay-v2.0.zip"
 
     # 只核验（交付后复检桌面上的 zip，或核验已解压目录）
-    python make_clean_release.py verify "E:\\桌面\\RimeSkinOverlay-v2.0-纯净版-20260926.zip"
+    python make_clean_release.py verify "E:\\桌面\\RimeSkinOverlay-v2.0.zip"
     python make_clean_release.py verify "D:\\tmp\\解压出来的目录"
 
 退出码
@@ -47,10 +50,9 @@ import zipfile
 
 EXE_NAME = 'RimeSkinOverlay.exe'
 REQUIRED_FILES = (EXE_NAME, 'README.md', 'CHANGELOG.md', 'LICENSE')
-OPTIONAL_FILES = ('icon.png',)
-ALLOWED_FILES = set(REQUIRED_FILES) | set(OPTIONAL_FILES)
-REQUIRED_DIRS = ('skins',)
-ALLOWED_DIRS = set(REQUIRED_DIRS)
+ALLOWED_FILES = set(REQUIRED_FILES)
+# 历史发布样式：包内不放任何子目录（skins/ 由程序首次存皮肤时自建）
+ALLOWED_DIRS = set()
 
 # 目录段黑名单（路径里任意一层命中即失败）
 BLACKLIST_DIR_SEGMENTS = {
@@ -78,6 +80,8 @@ BLACKLIST_FILE_PATTERNS = (
     ('*.log', '任何日志文件'),
     ('preprocessed_*.png', '预处理中间图（用户数据派生）'),
     ('cfg_image_*.png', '配置托管图片副本（用户数据）'),
+    ('icon.png', '历史发布样式不含 icon.png（程序图标已由 _MEIPASS 内置）'),
+    ('icon.ico', '图标文件不随包分发（已嵌在 exe 里）'),
     ('*.py', '源码不得随包分发'),
     ('*.spec', '构建脚本不得随包分发'),
     ('*.pyd', '编译扩展不得随包分发'),
@@ -143,12 +147,11 @@ def zip_entries(zip_path: str):
 
 # ---------------------------------------------------------------- 契约审计
 
-def audit(entries, stage: str, expect_icon: bool | None = None):
+def audit(entries, stage: str):
     """按契约审计条目集，返回问题字符串列表（空 = 通过）。
 
-    entries   : [(rel_posix, is_dir)]
-    stage     : 出现在报告里的阶段名
-    expect_icon: True=必须含 icon.png；False=必须不含；None=可选
+    entries : [(rel_posix, is_dir)]
+    stage   : 出现在报告里的阶段名
     """
     problems = []
     files = [rel for rel, is_dir in entries if not is_dir]
@@ -162,7 +165,7 @@ def audit(entries, stage: str, expect_icon: bool | None = None):
             hit = BLACKLIST_DIR_SEGMENTS.get(segs[-1].lower())
             if hit:
                 problems.append(f'[黑名单] 目录 "{rel}/" 命中：{hit}')
-        for seg in segs[:-1] if not is_dir else segs:
+        for seg in (segs if is_dir else segs[:-1]):
             hit = BLACKLIST_DIR_SEGMENTS.get(seg.lower())
             if hit and f'目录 "{seg}/"' not in ' '.join(problems):
                 problems.append(f'[黑名单] 路径 "{rel}" 含目录段 "{seg}"：{hit}')
@@ -173,13 +176,11 @@ def audit(entries, stage: str, expect_icon: bool | None = None):
                     problems.append(f'[黑名单] 文件 "{rel}" 命中 {pat}：{why}')
                     break
 
-    # 2) skins/ 必须存在且为空
-    for d in REQUIRED_DIRS:
-        if d not in dirs:
-            problems.append(f'[白名单] 缺少必需目录 "{d}/"（需存在且为空）')
-    for rel, is_dir in entries:
-        if rel.startswith('skins/'):
-            problems.append(f'[黑名单] "skins/" 下不得含任何内容，发现 "{rel}"')
+    # 2) 历史发布样式：包内不得出现 skins/（由程序首次存皮肤时自建）
+    for rel, _is_dir in entries:
+        if rel == 'skins' or rel.startswith('skins/'):
+            problems.append(f'[黑名单] 不得包含 "skins/"（历史发布样式无此项，'
+                            f'程序首次存皮肤时自建），发现 "{rel}"')
 
     # 3) 必需文件
     for f in REQUIRED_FILES:
@@ -199,12 +200,6 @@ def audit(entries, stage: str, expect_icon: bool | None = None):
     exes = [f for f in files if lower[f].endswith('.exe')]
     if len(exes) != 1 or exes[0] != EXE_NAME:
         problems.append(f'[白名单] 包内 .exe 必须恰好是 "{EXE_NAME}" 一个，实际：{exes or "无"}')
-
-    # 6) icon.png 期望
-    if expect_icon is True and 'icon.png' not in files:
-        problems.append('[白名单] 要求包含 icon.png，但包内没有')
-    if expect_icon is False and 'icon.png' in files:
-        problems.append('[黑名单] 指定 --no-icon，但包内仍有 icon.png')
 
     if problems:
         print(f'-- 契约自检（{stage}）：未通过，{len(problems)} 项问题', file=sys.stderr)
@@ -240,22 +235,22 @@ def cmd_build(args) -> int:
     repo = os.path.abspath(args.repo or os.path.dirname(os.path.abspath(__file__)))
     exe = os.path.abspath(args.exe or os.path.join(repo, 'dist', EXE_NAME))
     version = args.version or detect_version(repo)
-    date = args.date or time.strftime('%Y%m%d')
-    pkg_name = f'RimeSkinOverlay-{version}-纯净版-{date}.zip'
+    pkg_name = f'RimeSkinOverlay-{version}.zip'
     out = os.path.abspath(args.out or os.path.join(repo, 'dist', pkg_name))
-    with_icon = not args.no_icon
 
     print('== Rime 皮肤外挂 · 纯净发布包组装 ==')
     print(f'   源码根    : {repo}')
     print(f'   构建产物  : {exe}')
     print(f'   输出 zip  : {out}')
-    print(f'   版本/日期 : {version} / {date}     icon.png: {"包含" if with_icon else "不含"}')
+    print(f'   版本      : {version}（包内 {len(REQUIRED_FILES)} 项，根目录平铺）')
 
     if not os.path.isfile(exe):
         print(f'!! 找不到构建产物 {exe}\n   先跑 PyInstaller（python -m PyInstaller --noconfirm RimeSkinOverlay.spec）'
               f'，或用 --exe 指定路径。', file=sys.stderr)
         return 3
-    for f in ('README.md', 'CHANGELOG.md', 'LICENSE') + (('icon.png',) if with_icon else ()):
+    for f in REQUIRED_FILES:
+        if f == EXE_NAME:
+            continue
         if not os.path.isfile(os.path.join(repo, f)):
             print(f'!! 源码根缺少必需文件 {f}（在 {repo} 下找不到）', file=sys.stderr)
             return 3
@@ -272,17 +267,14 @@ def cmd_build(args) -> int:
 
     staging = tempfile.mkdtemp(prefix='rime_clean_release_')
     try:
-        # 1) 只按白名单复制（不做通配拷贝，从根上杜绝混入）
-        plan = [EXE_NAME, 'README.md', 'CHANGELOG.md', 'LICENSE'] + (['icon.png'] if with_icon else [])
-        for name in plan:
-            shutil.copy2(os.path.join(repo, name) if name != EXE_NAME else exe,
-                         os.path.join(staging, name))
-        # 2) 空 skins/
-        os.makedirs(os.path.join(staging, 'skins'), exist_ok=True)
+        # 只按白名单复制（不做通配拷贝，从根上杜绝混入）；exe 用 --exe 指定的构建产物
+        for name in REQUIRED_FILES:
+            src = exe if name == EXE_NAME else os.path.join(repo, name)
+            shutil.copy2(src, os.path.join(staging, name))
 
         entries = collect_entries(staging)
         print(f'\n[1/4] 暂存目录组装完成：{staging}')
-        problems = audit(entries, '打包前', expect_icon=with_icon)
+        problems = audit(entries, '打包前')
         problems += check_exe_bytes(os.path.join(staging, EXE_NAME))
         if problems:
             for p in problems:
@@ -290,7 +282,7 @@ def cmd_build(args) -> int:
             print('!! 契约自检未通过，已中止，未生成 zip。', file=sys.stderr)
             return 2
 
-        # 3) 打 zip
+        # 打 zip
         print(f'[2/4] 压缩中（DEFLATED）…')
         t0 = time.time()
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -301,7 +293,7 @@ def cmd_build(args) -> int:
         dt = time.time() - t0
         print(f'      写入 {human(os.path.getsize(out))}，耗时 {dt:.2f}s')
 
-        # 4) 打包后复检 zip 内部
+        # 打包后复检 zip 内部
         zentries = zip_entries(out)
         zproblems = audit(zentries, '打包后')
         zproblems += check_exe_bytes((out, EXE_NAME))
@@ -387,10 +379,8 @@ def main(argv=None) -> int:
     b = sub.add_parser('build', help='组装纯净包 zip（默认子命令）')
     b.add_argument('--exe', help=f'构建产物 exe 路径（默认 <repo>/dist/{EXE_NAME}）')
     b.add_argument('--repo', help='源码根目录（默认脚本所在目录）')
-    b.add_argument('--out', help='输出 zip 路径（默认 <repo>/dist/<包名>.zip）')
+    b.add_argument('--out', help='输出 zip 路径（默认 <repo>/dist/RimeSkinOverlay-<版本>.zip）')
     b.add_argument('--version', help="包名里的版本号（默认从 rime_char_overlay.py 的 VERSION 推断）")
-    b.add_argument('--date', help='包名里的日期，格式 YYYYMMDD（默认今天）')
-    b.add_argument('--no-icon', action='store_true', help='不包含 icon.png')
     b.add_argument('--force', action='store_true', help='允许覆盖已存在的输出 zip')
 
     v = sub.add_parser('verify', help='核验已有的 zip 或解压目录是否纯净')
