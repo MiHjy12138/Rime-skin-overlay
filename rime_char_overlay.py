@@ -2884,6 +2884,41 @@ def compose_on_checker(img_rgba, cell=CHECKER_CELL, Image=None):
             return bg
 
 
+# ---- 预览纯色底（v2.0-R7）：透明区不再垫棋盘格，改回画布底色 ----
+# 用户第三轮实测：「抠图后会变成这样，不再透明」——先生截的是**向导预览区**，R1 垫的棋盘格
+# 被看成了「不透明」，用户明确要求预览改回纯色底。上面那套棋盘格（CHECKER_*，本文件预览专用）
+# 保留作实现/测试的对照口径，不再参与预览显示；预处理对话框用的是另一套（PREPROCESS_CHECKER_*），
+# 两者互不影响。
+PREVIEW_BG_HEX = '#ffffff'              # = 预览画布底色（ConfigWizard.CV_BG）
+PREVIEW_BG_RGB = (255, 255, 255)
+
+
+def compose_on_solid(img_rgba, bg_color=PREVIEW_BG_RGB, Image=None):
+    """把 RGBA 合成到纯色底上 → RGB 图（预览专用）。
+
+    Tk PhotoImage 丢掉 alpha、画布又是白底，所以透明与半透明在预览里根本看不出来，
+    先合成再显示就能看见：
+      · 全透明像素 → 与画布底色同色（= 这里是透明的，融进背景）
+      · 半透明像素 → 图片颜色与底色的混合色（= 这里是半透明的）
+    这样「兼容 = 硬边点阵 / 增强 = 颜色到底色的平滑过渡」仍肉眼可辨（R1 的合成口径不变，只换底）。
+    """
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
+    w, h = max(1, int(img_rgba.size[0])), max(1, int(img_rgba.size[1]))
+    bg = Image.new('RGB', (w, h), tuple(bg_color))
+    try:
+        return Image.alpha_composite(bg.convert('RGBA'),
+                                     img_rgba.convert('RGBA')).convert('RGB')
+    except Exception:
+        try:
+            out = bg.copy()
+            out.paste(img_rgba.convert('RGB'), (0, 0), img_rgba.split()[3])
+            return out
+        except Exception:
+            return bg
+
+
 def decode_anim_frame_rgba(overlay, idx):
     """动图单帧解码到 **RGBA**（seek → RGBA → 缩放 → 特效），不做抠色。
 
@@ -4349,6 +4384,7 @@ class ConfigWizard:
         'vertical': ('竖排', 96, 320),
     }
     CV_W, CV_H = 620, 260     # 预览画布尺寸（调小给窗口减高，绘制逻辑自动等比适配）
+    CV_BG = PREVIEW_BG_HEX    # 预览画布底色（v2.0-R7：预览透明区 = 这个色，不再垫棋盘格）
 
     def __init__(self, on_done, overlay=None):
         self.on_done = on_done
@@ -4517,7 +4553,7 @@ class ConfigWizard:
         # ⑦ 预览区（候选框 + 图片 组合）
         tk.Label(left, text='⑦ 预览（候选框 + 图片组合样式）:', font=('Microsoft YaHei', 9),
                  fg='#555').pack(anchor='w', pady=(2, 0))
-        self.canvas = tk.Canvas(left, width=self.CV_W, height=self.CV_H, bg='#ffffff',
+        self.canvas = tk.Canvas(left, width=self.CV_W, height=self.CV_H, bg=self.CV_BG,
                                 highlightthickness=1, highlightbackground='#ccc')
         self.canvas.pack(pady=2)
 
@@ -5202,16 +5238,19 @@ class ConfigWizard:
         except Exception:
             return img
 
-    def _checker_compose(self, img):
-        """预览用：按渲染模式对齐显示口径 → 合成到棋盘格（Tk 画布不支持逐像素 alpha）。
+    def _preview_compose(self, img):
+        """预览用：按渲染模式对齐显示口径 → 合成到画布底色（Tk 画布不支持逐像素 alpha）。
 
         用户实测「渲染增强没看见对应的预览」的根因就在这：以前 RGBA 直接塞给
         PhotoImage（alpha 被丢）又画在白底上，兼容/增强、透明/半透明全长一样。
-        现在 兼容 = 二值 alpha + 点阵 → 硬边；增强 = 逐像素 alpha + 真羽化 → 平滑过渡。
+        现有口径：兼容 = 二值 alpha + 点阵 → 硬边；增强 = 逐像素 alpha + 真羽化 → 平滑过渡。
+
+        v2.0-R7：底从 R1 的棋盘格改回**纯色底**（= 画布底色）—— 用户把棋盘格当成了「不透明」，
+        明确要求预览里不要棋盘格；合成口径（上面那两步）不变，只换底。
         """
         try:
-            return compose_on_checker(self._preview_render_mode_img(img), CHECKER_CELL,
-                                      self._Image)
+            return compose_on_solid(self._preview_render_mode_img(img),
+                                    PREVIEW_BG_RGB, self._Image)
         except Exception:
             try:
                 return img.convert('RGB')
@@ -6226,8 +6265,8 @@ class ConfigWizard:
                             continue
                         dx, dy = pos.get(k, (0, 0))
                         px, py = base_x + wx0 + dx, base_y + wy0 + dy
-                        # R1：预览先合成到棋盘格再显示（Tk 图片丢 alpha，白底上看不出透明/半透明）
-                        tk_im = self._ImageTk.PhotoImage(self._checker_compose(im),
+                        # v2.0-R7：预览先合成到画布底色再显示（Tk 图片丢 alpha，白底上看不出透明/半透明）
+                        tk_im = self._ImageTk.PhotoImage(self._preview_compose(im),
                                                          master=self.root)
                         self._photo_refs.append(tk_im)
                         if len(self._photo_refs) > MAX_LAYERS + 2:
@@ -6287,8 +6326,8 @@ class ConfigWizard:
                     ix = base_x + (cw - new_w) // 2 + offx
                 iy = base_y + (ch - new_h) // 2 + offy
                 # 预览不加光环（实际运行时有皮肤联动光环）
-                # R1：合成到棋盘格再显示 —— 兼容 = 硬边点阵、增强 = 颜色到棋盘的平滑过渡
-                self.tk_img = self._ImageTk.PhotoImage(self._checker_compose(img),
+                # v2.0-R7：合成到画布底色再显示 —— 兼容 = 硬边点阵、增强 = 颜色到底色的平滑过渡
+                self.tk_img = self._ImageTk.PhotoImage(self._preview_compose(img),
                                                        master=self.root)
                 self._photo_refs.append(self.tk_img)
                 if len(self._photo_refs) > 3:

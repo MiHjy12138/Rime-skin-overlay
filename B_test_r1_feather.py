@@ -4,8 +4,12 @@
 对照用户实测反馈（HANDOFF-2.0 §3 R1）：
   · 「渲染增强没看见对应的预览」→ 向导预览是 Tk Canvas（不支持逐像素 alpha），
     以前直接把 RGBA 丢给 PhotoImage，alpha 被丢掉 → 兼容/增强预览长得一样。
-    验收：B/C/E/I 段 —— 预览先垫棋盘格背景再把 RGBA 合成上去（对齐
-    ImagePreprocessDialog._draw_checker 的做法），兼容 = 硬边、增强 = 颜色到棋盘格的平滑过渡。
+    验收：B/C/E/I 段 —— 预览先把 RGBA 合成掉再显示，兼容 = 硬边、增强 = 颜色到底色的平滑过渡。
+    ⚠️ 底的变化（v2.0-R7 · 需求回退）：R1 垫的是棋盘格，第三轮用户实测把棋盘格看成了
+    「不透明」，明确要求预览改回纯色底（= 画布底色）。本脚本 B/E 段守的是 `compose_on_checker`
+    这个**模块级合成函数本身**（它保留在代码里作对照口径，只是不再被预览调用，故断言不动）；
+    I 段改守 `_preview_compose`（纯色底）并新增「合成图不含棋盘格深色」一条 —— 只换底，
+    没有放宽任何既有断言。
   · 「我想的是放后面的开关」→ 真 alpha 以前只做在 ⑪「渲染模式」单选里。
     验收：F/G/H 段 —— ⑩ 点阵羽化 旁新增「增强（真羽化）」开关，与 ⑪ 双向联动，
     点阵勾选在增强模式下置灰 + 明确提示「点阵羽化 = 兼容模式下的近似」，切换即时重绘。
@@ -128,7 +132,9 @@ def test_api_surface():
           hasattr(R, 'checker_background'))
     check('A02 模块级 RGBA→棋盘格合成符号存在（compose_on_checker）',
           hasattr(R, 'compose_on_checker'))
-    for s in ('_on_alpha_feather_toggle', '_sync_feather_widgets', '_checker_compose',
+    # R7 需求回退：预览合成方法随「底 = 棋盘格 → 画布底色」一起改名
+    # （`_checker_compose` → `_preview_compose`），名字不再提棋盘格；存在性检查照旧。
+    for s in ('_on_alpha_feather_toggle', '_sync_feather_widgets', '_preview_compose',
               '_preview_render_mode_img', '_is_alpha_mode'):
         check(f'A03 ConfigWizard.{s} 存在', hasattr(R.ConfigWizard, s))
 
@@ -375,27 +381,33 @@ def test_save_consistency(tmp, saved):
 
 
 def test_preview_compose_modes(tmp, saved):
-    section('I. 向导预览按渲染模式合成（兼容=硬边 / 增强=颜色到棋盘格平滑过渡）')
+    section('I. 向导预览按渲染模式合成（兼容=硬边 / 增强=颜色到底色平滑过渡；底=画布底色，R7 起不用棋盘格）')
     img = _make_png(os.path.join(tmp, 'r1d.png'))
     wiz = _make_wiz({'image': img}, saved)
     try:
-        if not hasattr(wiz, '_checker_compose'):
-            check('I01 兼容模式预览合成 = 硬边', False, '_checker_compose 未实现')
-            check('I02 ★增强模式预览合成 = 平滑过渡', False, '_checker_compose 未实现')
+        if not hasattr(wiz, '_preview_compose'):
+            check('I01 兼容模式预览合成 = 硬边', False, '_preview_compose 未实现')
+            check('I02 ★增强模式预览合成 = 平滑过渡', False, '_preview_compose 未实现')
             check('I03 ★增强模式 _effects_cfg 走真羽化', False, '未实现')
             check('I04 兼容模式 _effects_cfg 不走真羽化', False, '未实现')
             return
         src = _grad_img(64, 64)
         wiz.var_render.set('compat')
         wiz._update_render_hint()
-        c1 = wiz._checker_compose(src)
+        c1 = wiz._preview_compose(src)
         wiz.var_render.set('alpha')
         wiz._update_render_hint()
-        c2 = wiz._checker_compose(src)
+        c2 = wiz._preview_compose(src)
         n1, n2 = len(_colors(c1)), len(_colors(c2))
         check('I01 兼容模式合成：alpha 二值化 → 硬边（颜色少）', n1 <= 4, f'{n1} 色')
-        check('I02 ★增强模式合成：逐像素半透明 → 颜色到棋盘格的平滑过渡',
+        check('I02 ★增强模式合成：逐像素半透明 → 颜色到底色的平滑过渡',
               n2 > 20, f'{n2} 色')
+        # v2.0-R7 新增：预览底已从棋盘格改成画布底色 —— 合成图里不许再出现棋盘格深色。
+        # 判别力：R7 之前（预览走 compose_on_checker）这一条必然 FAIL。
+        check('I02b ★合成图不含棋盘格深色（R7：预览底 = 画布底色，不是棋盘格）',
+              not (R.CHECKER_DARK in _colors(c1) or R.CHECKER_DARK in _colors(c2)),
+              f'深色={R.CHECKER_DARK} 兼容图含={R.CHECKER_DARK in _colors(c1)} '
+              f'增强图含={R.CHECKER_DARK in _colors(c2)}')
         check('I03 ★增强模式 _effects_cfg：羽化开启 + 走逐像素真羽化',
               bool(wiz._effects_cfg().get('feather_enabled'))
               and wiz._effects_cfg().get('true_alpha') is True,
