@@ -232,6 +232,37 @@ def kill(dlg=None, root=None):
         pass
 
 
+def _interleaved_open_cost(root, big, old_mod, n=3):
+    """交替取样「新 → 改前」各开一次、各取 min；返回 (new_ms, new_dlg, new_samples, old_ms, old_samples)。
+
+    为什么必须交替：单侧独立测量在本机负载波动下完全不可比 —— 同一份代码实测 86.5ms ~
+    576.7ms（同一轮内的三个样本都能差 2.7 倍）。两侧各自取 min 还不够，因为它们落在不同
+    的时间窗里；交替取样让新/旧经历同一段负载环境。**只改测量方法，判据一字未改**
+    （仍是「新 ≤ 改前 + 60ms」）。
+    """
+    new_s, old_s = [], []
+    last_new = last_old = None
+    kill(R.ImagePreprocessDialog(root, big), None)          # 预热：付掉 PIL/Tk 冷启动
+    if old_mod is not None:
+        kill(old_mod.ImagePreprocessDialog(root, big), None)
+    for _ in range(max(1, int(n))):
+        t0 = time.perf_counter()
+        d = R.ImagePreprocessDialog(root, big)
+        new_s.append((time.perf_counter() - t0) * 1000.0)
+        if last_new is not None:
+            kill(last_new, None)
+        last_new = d
+        if old_mod is not None:
+            t0 = time.perf_counter()
+            d2 = old_mod.ImagePreprocessDialog(root, big)
+            old_s.append((time.perf_counter() - t0) * 1000.0)
+            if last_old is not None:
+                kill(last_old, None)
+            last_old = d2
+    kill(last_old, None)
+    return min(new_s), last_new, new_s, (min(old_s) if old_s else None), old_s
+
+
 def dump_table(rows, title):
     print('    表：%s' % title)
     print('      %-12s %-30s %6s %6s %7s %7s' % ('控件', '文案', 'y', 'h', '底边', 'mapped'))
@@ -479,17 +510,17 @@ def test_c_small_screen(tmp, gif):
 
 
 # ================= D 段 =================
-def test_d_r6_kept(tmp, big, before_cost):
+def test_d_r6_kept(tmp, big, before_cost, old_mod):
     section('D R6 动图预览功能不许砍 + 打开耗时同量级 + 仍按需解码')
     root = _new_root()
     dlg = None
     try:
-        # 预热一次（丢弃）：第一次打开大 GIF 要付 PIL/Tk 冷启动，两边都预热才是同量级对比
-        warm = R.ImagePreprocessDialog(root, big)
-        kill(warm, None)
-        t_new, dlg = ms(lambda: R.ImagePreprocessDialog(root, big), 1)
-        note('大 GIF（%dx%d × %d 帧）打开耗时 = %.1f ms；改前 %.1f ms'
-             % (BIG_W, BIG_H, BIG_N, t_new, (before_cost or {}).get('t_open', float('nan'))))
+        # 交替取样（新/旧同处一段负载环境；判据不变）= 见 _interleaved_open_cost
+        t_new, dlg, samples_new, t_old, samples_old = _interleaved_open_cost(root, big, old_mod, n=3)
+        note('大 GIF（%dx%d × %d 帧）打开耗时：新 %.1f ms（样本 %s，取 min）/ 改前 %s ms（样本 %s，取 min）'
+             % (BIG_W, BIG_H, BIG_N, t_new, ['%.1f' % v for v in samples_new],
+                ('%.1f' % t_old) if t_old is not None else 'N/A',
+                ['%.1f' % v for v in samples_old]))
         check('D1 ★播放/暂停/逐帧/帧号控件与 API 全在（R8 没砍 R6 功能）',
               hasattr(dlg, 'btn_play') and hasattr(dlg, 'lbl_frame')
               and hasattr(dlg, '_toggle_preview') and hasattr(dlg, '_preview_step')
@@ -497,9 +528,13 @@ def test_d_r6_kept(tmp, big, before_cost):
               'btn_play/lbl_frame/_toggle_preview/_preview_step/_preview_goto/preview_idx')
         check('D2 帧号标签标出总帧数', str(BIG_N) in str(dlg.lbl_frame.cget('text')),
               repr(dlg.lbl_frame.cget('text')))
-        check('D3 ★打开耗时与改前同量级（≤ 改前 + 60ms）',
-              t_new <= (before_cost or {}).get('t_open', t_new + 1) + 60,
-              f'新 {t_new:.1f} ms vs 改前 {(before_cost or {}).get("t_open", float("nan")):.1f} ms')
+        if t_old is None:
+            skip('D3 打开耗时与改前同量级', '改前模块不可用（对照缺失）')
+        else:
+            check('D3 ★打开耗时与改前同量级（≤ 改前 + 60ms，交替取样取 min）',
+                  t_new <= t_old + 60,
+                  f'新 {t_new:.1f} ms（{["%.1f" % v for v in samples_new]}） vs 改前 {t_old:.1f} ms'
+                  f'（{["%.1f" % v for v in samples_old]}）')
         check('D4 ★打开仍只解码首帧（按需解码没被滚动容器吞掉）',
               int(getattr(dlg, '_decode_calls', 999)) <= 1,
               f'_decode_calls={getattr(dlg, "_decode_calls", "N/A")}')
@@ -623,26 +658,11 @@ def main():
         png = make_png(os.path.join(tmp, 'static.png'))
         old_mod, why = load_old_module(tmp)
         note('改前模块：%s' % why)
-        # 改前基线：打开同一大 GIF 的耗时（对照 D3）——同样预热一次再计时
-        before_cost = {}
-        if old_mod is not None:
-            R.HERE = tmp
-            rootb = _new_root()
-            od = None
-            try:
-                warm = old_mod.ImagePreprocessDialog(rootb, big)
-                kill(warm, None)
-                t_old, od = ms(lambda: old_mod.ImagePreprocessDialog(rootb, big), 1)
-                before_cost['t_open'] = t_old
-                note('改前打开大 GIF（预热后）= %.1f ms' % t_old)
-            finally:
-                kill(od, rootb)
-            R.HERE = real_here
         R.HERE = tmp
         test_a_anim_visible(tmp, gif)
         test_b_static_unchanged(tmp, png, gif, old_mod)
         test_c_small_screen(tmp, gif)
-        test_d_r6_kept(tmp, big, before_cost)
+        test_d_r6_kept(tmp, big, None, old_mod)     # 耗时对照在 D 段内交替取样
         test_e_inventory(tmp, gif, png, old_mod)
         test_f_cleanup(tmp, gif)
     finally:
