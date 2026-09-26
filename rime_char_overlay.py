@@ -46,6 +46,21 @@ v2.0-①b 真 alpha 分层窗实装（升级一，第三步）：
   真渐变（圆角/羽化边缘不再硬边）、含品红的图不再被抠穿、透明区点击穿透。
   推送时机：动图跟 _anim_tick 每帧推；静态图只在首次显示/移动/缩放/换图/特效变化推一次。
   向导 ⑪ 渲染模式可一键切换（兼容/增强）；alpha 下不放 Label 贴图，交互事件照旧挂 Tk 窗。
+
+v2.0-② 套层皮肤（升级二，多图层）：
+  一个皮肤 = 多个图片图层（默认 1 层 = 老行为）。皮肤档案升级为
+  {schema:2, layers:[{image, anchor, offset_x, offset_y, scale, flip, effects, z,
+  follow_width_ratio}], 全套 v1.6 旧字段}；老单图档案读进来自动包成单元素图层列表，
+  单层时布局与 v1.6 逐位一致（plan_layer_layout 单层退化 = 原 _calc_target 公式）。
+  锚点 left_edge / right_edge / center + offset 微调；follow_width_ratio 按候选框宽度
+  比例分摊 → 候选框随打字变宽时两侧图层自动拉开、变窄收拢。
+  渲染走「单窗多图」：compose_layers 把各层合成一张 RGBA 画布（各层自身 alpha 保留），
+  只开一个窗口 —— 合成结果交给 ① 的 Renderer（compat 抠色贴 Label / alpha 推分层位图），
+  compat 与 alpha 两条路都能跑多图层；绝不按层开窗（z-order 漂移是历史高发坑）。
+  顶层旧字段（image/side/scale/offset_x/offset_y/flip_h/圆角/羽化）始终是第 0 层（主层）
+  的权威值，layers[0] 只存额外量 —— 老代码读顶层键、老版本程序读该档案都不会跑偏。
+  向导 ⑫ 图层区：图层列表 + 每层可选中调参（贴左/贴右/居中、左右上下微调、这层大小、
+  水平翻转、随候选框变宽往外让 %），预览画布多层绘制（_draw_candidate 层级关系不破）。
 """
 import sys, os, json, time, threading, re, queue, collections
 import tkinter as tk
@@ -385,6 +400,321 @@ def save_config(cfg):
 SKINS_DIR = os.path.join(HERE, 'skins')
 
 
+# ============ ② 套层皮肤：多图层档案（v2.0）============
+# 手册 ② 步 1/2/3：一个皮肤 = 多个图片图层，每层可锚到候选框左/右/边缘并按 offset 微调，
+# 可选 follow_width_ratio 按候选框宽度比例分摊 —— 候选框随打字变宽时两侧图层自动拉开/收拢。
+#
+# 档案形态（写盘）：
+#   {"schema": 2, "layers": [{image, anchor, offset_x, offset_y, scale, flip, effects,
+#                             z, follow_width_ratio}, ...], <全套 v1.6 旧字段>}
+# 兼容口径（硬要求）：
+#   · 老单图 skin.json（无 schema / 无 layers）读进来 → 自动包成**单元素**图层列表；
+#   · 单图层时布局与 v1.6 逐位一致（见 plan_layer_layout：单层退化为老 _calc_target 公式）；
+#   · 顶层旧字段（image / side / scale / offset_x / offset_y / flip_h / 圆角 / 羽化）继续是
+#     第 0 层（主层）的**权威值**，layers[0] 里这些键只存"额外量"，避免两处翻倍。
+LAYER_SCHEMA = 2
+LAYER_ANCHORS = ('left_edge', 'right_edge', 'center')
+LAYER_KEYS = ('image', 'anchor', 'offset_x', 'offset_y', 'scale', 'flip',
+              'effects', 'z', 'follow_width_ratio')
+MAX_LAYERS = 6                  # 图层数上限（防呆：画布宽度随层数线性增长）
+DEFAULT_LAYER_GAP = 8           # 图层与候选框边缘的间距（与 v1.6 的 gap=8 同口径）
+
+
+def anchor_from_side(side):
+    """旧字段 side（left/right/center）→ 图层锚点"""
+    s = str(side or '').strip().lower()
+    if s == 'left':
+        return 'left_edge'
+    if s == 'center':
+        return 'center'
+    return 'right_edge'
+
+
+def side_from_anchor(anchor):
+    """图层锚点 → 旧字段 side（保证老键始终可读）"""
+    a = str(anchor or '').strip().lower()
+    if a == 'left_edge':
+        return 'left'
+    if a == 'center':
+        return 'center'
+    return 'right'
+
+
+def _as_int(v, default=0, lo=None, hi=None):
+    try:
+        n = int(round(float(v)))
+    except Exception:
+        n = int(default)
+    if lo is not None and n < lo:
+        n = lo
+    if hi is not None and n > hi:
+        n = hi
+    return n
+
+
+def _as_float(v, default=0.0, lo=None, hi=None):
+    try:
+        f = float(v)
+    except Exception:
+        f = float(default)
+    if lo is not None and f < lo:
+        f = lo
+    if hi is not None and f > hi:
+        f = hi
+    return f
+
+
+def normalize_layer(ld, skin_dir=None):
+    """单个图层 → 规范形态（键齐全、类型正确、越界值夹紧）。非法输入不抛异常。"""
+    d = ld if isinstance(ld, dict) else {}
+    img = str(d.get('image') or '').strip()
+    if img and skin_dir and not os.path.isabs(img):
+        img = os.path.normpath(os.path.join(skin_dir, img))
+    anc = str(d.get('anchor') or '').strip().lower()
+    eff = d.get('effects') if isinstance(d.get('effects'), dict) else {}
+    return {
+        'image': img,
+        'anchor': anc if anc in LAYER_ANCHORS else 'right_edge',
+        'offset_x': _as_int(d.get('offset_x'), 0, -1000, 1000),
+        'offset_y': _as_int(d.get('offset_y'), 0, -1000, 1000),
+        'scale': _as_float(d.get('scale'), 1.0, 0.2, 2.0),
+        'flip': bool(d.get('flip')),
+        'effects': {
+            'corner_enabled': bool(eff.get('corner_enabled')),
+            'corner_radius': _as_int(eff.get('corner_radius'), 24, 0, 120),
+            'feather_enabled': bool(eff.get('feather_enabled')),
+            'feather_radius': _as_int(eff.get('feather_radius'), 24, 0, 80),
+        },
+        'z': _as_int(d.get('z'), 0, -99, 99),
+        'follow_width_ratio': _as_float(d.get('follow_width_ratio'), 0.0, -1.0, 1.0),
+    }
+
+
+def make_layer_from_cfg(cfg, skin_dir=None):
+    """老单图 cfg（顶层字段）→ 第 0 层（主层）。
+
+    offset_x/offset_y 一律归零：顶层 cfg 的 offset 才是权威（否则两处相加翻倍）。
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    return normalize_layer({
+        'image': cfg.get('image') or '',
+        'anchor': anchor_from_side(cfg.get('side')),
+        'offset_x': 0, 'offset_y': 0,
+        'scale': cfg.get('scale', 1.0),
+        'flip': cfg.get('flip_h', False),
+        'effects': {
+            'corner_enabled': cfg.get('corner_enabled', False),
+            'corner_radius': cfg.get('corner_radius', 24),
+            'feather_enabled': cfg.get('feather_enabled', False),
+            'feather_radius': cfg.get('feather_radius', 24),
+        },
+        'z': 0, 'follow_width_ratio': 0.0,
+    }, skin_dir=skin_dir)
+
+
+def resolve_layers(cfg, skin_dir=None):
+    """cfg → 运行时图层列表（每个元素键齐全）。
+
+    · 老档案（无 layers）→ 单元素列表，参数全部来自顶层字段（单层退化等价的关键）
+    · 第 0 层：anchor/scale/flip/effects 与 offset 以顶层字段为准（顶层 offset 并入层内）
+    · 其它层：完全用自己的字段
+    · 按 z 稳定升序（画布从下往上叠）
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    raw = cfg.get('layers')
+    layers = []
+    if isinstance(raw, list) and raw:
+        for x in raw:
+            l = normalize_layer(x, skin_dir=skin_dir)
+            if l.get('image'):
+                layers.append(l)
+    if not layers:
+        return [make_layer_from_cfg(cfg, skin_dir=skin_dir)]
+    layers = layers[:MAX_LAYERS]
+    layers.sort(key=lambda l: l.get('z', 0))
+    main = make_layer_from_cfg(cfg, skin_dir=skin_dir)
+    l0 = dict(layers[0])
+    # 第 0 层（主层）：锚点/缩放/翻转/特效一律以顶层兼容字段为权威 —— 向导的
+    # ③ 贴边方向 / ④ 缩放 / 水平翻转 / ⑨ 特效 编辑的就是主层，滚轮缩放改的也是顶层 scale
+    l0['anchor'] = main['anchor']
+    l0['scale'] = main['scale']
+    l0['flip'] = main['flip']
+    l0['effects'] = main['effects']
+    if not l0.get('image'):
+        l0['image'] = main['image']
+    # 顶层 offset 并入第 0 层（顶层是权威；层内 offset 是额外微调）
+    l0['offset_x'] = _as_int(l0.get('offset_x'), 0, -1000, 1000) \
+        + _as_int(cfg.get('offset_x'), 0, -1000, 1000)
+    l0['offset_y'] = _as_int(l0.get('offset_y'), 0, -1000, 1000) \
+        + _as_int(cfg.get('offset_y'), 0, -1000, 1000)
+    layers[0] = l0
+    return layers
+
+
+def save_layers_into_cfg(cfg, layers=None):
+    """把图层写回档案形态：schema 2 + layers + 顶层兼容字段同步（原地改并返回 cfg）。
+
+    第 0 层存盘时 offset 归零（顶层 offset 才是权威）；其余字段双向对齐，
+    保证老代码读顶层键时看到的就是主层的值。
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    layers = layers if layers is not None else resolve_layers(cfg)
+    layers = [normalize_layer(x) for x in layers if isinstance(x, dict) and x.get('image')]
+    if not layers:
+        layers = [make_layer_from_cfg(cfg)]
+    layers = layers[:MAX_LAYERS]
+    arch = [dict(x, effects=dict(x.get('effects') or {})) for x in layers]
+    arch[0]['offset_x'] = 0
+    arch[0]['offset_y'] = 0
+    cfg['schema'] = LAYER_SCHEMA
+    cfg['layers'] = arch
+    cfg['image'] = arch[0]['image']
+    cfg['side'] = side_from_anchor(arch[0]['anchor'])
+    cfg['scale'] = arch[0]['scale']
+    cfg['flip_h'] = bool(arch[0]['flip'])
+    eff = arch[0]['effects']
+    cfg['corner_enabled'] = bool(eff.get('corner_enabled'))
+    cfg['corner_radius'] = _as_int(eff.get('corner_radius'), 24, 0, 120)
+    cfg['feather_enabled'] = bool(eff.get('feather_enabled'))
+    cfg['feather_radius'] = _as_int(eff.get('feather_radius'), 24, 0, 80)
+    return cfg
+
+
+def migrate_skin_cfg(cfg, skin_dir=None):
+    """老/新皮肤档案 → 统一档案形态（schema 2 + 单元素或多元图层列表）。
+
+    纯函数：不改入参；幂等；旧字段一个不丢（只多不少）。
+    """
+    out = dict(cfg or {})
+    raw = out.get('layers')
+    if isinstance(raw, list) and raw:
+        layers = []
+        for x in raw:
+            l = normalize_layer(x, skin_dir=skin_dir)
+            if l.get('image'):
+                layers.append(l)
+        if not layers:
+            layers = [make_layer_from_cfg(out, skin_dir=skin_dir)]
+    else:
+        layers = [make_layer_from_cfg(out, skin_dir=skin_dir)]
+    layers = sorted(layers, key=lambda l: l.get('z', 0))[:MAX_LAYERS]
+    layers[0] = dict(layers[0])
+    layers[0]['offset_x'] = 0       # 顶层 offset 是权威（档案形态里主层不再重复存）
+    layers[0]['offset_y'] = 0
+    out['schema'] = LAYER_SCHEMA
+    out['layers'] = layers
+    return out
+
+
+def _rect_tuple(rect):
+    """候选框矩形 → (left, top, right, bottom)；支持 wintypes.RECT 或 4 元组"""
+    if rect is None:
+        return 0, 0, 0, 0
+    try:
+        if hasattr(rect, 'left'):
+            return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+        l, t, r, b = rect
+        return int(l), int(t), int(r), int(b)
+    except Exception:
+        return 0, 0, 0, 0
+
+
+def plan_layer_layout(layers, sizes, rect, gap=DEFAULT_LAYER_GAP, main_off=(0, 0)):
+    """② 步 3：一次算出全部图层的目标坐标（纯函数、无状态、可预览可单测）。
+
+    返回 (win_x, win_y, win_w, win_h, placements)：
+      · win_*  = 合成画布（= 唯一的那个透明窗）的屏幕位置与尺寸（各层的包围盒）
+      · placements = [(层号, 画布内 dx, 画布内 dy), ...] —— 与 layers 一一对应
+
+    锚点规则（手册 ② 步 2）：
+      left_edge  → 候选框左边缘外侧：left - 层宽 - gap
+      right_edge → 候选框右边缘外侧：right + gap
+      center     → 水平居中于候选框：(cw - 层宽) / 2
+    follow_width_ratio（可选）额外按候选框宽度比例把该层继续向外推（左右同步拉开/收拢）。
+    单图层 + ratio=0 时逐位退化为 v1.6 的 _calc_target 公式（兼容硬要求）。
+    """
+    left, top, right, bottom = _rect_tuple(rect)
+    cw, ch = right - left, bottom - top
+    places, boxes = [], []
+    mo_x = _as_int((main_off or (0, 0))[0], 0)
+    mo_y = _as_int((main_off or (0, 0))[1], 0)
+    for i, ld in enumerate(layers or []):
+        if i >= len(sizes or []):
+            break
+        try:
+            lw, lh = int(sizes[i][0]), int(sizes[i][1])
+        except Exception:
+            continue
+        if lw <= 0 or lh <= 0:
+            continue
+        d = ld if isinstance(ld, dict) else {}
+        anc = d.get('anchor', 'right_edge')
+        ox = _as_int(d.get('offset_x'), 0)
+        oy = _as_int(d.get('offset_y'), 0)
+        if i == 0:
+            ox += mo_x
+            oy += mo_y
+        if anc == 'left_edge':
+            lx = left - lw - gap + ox
+        elif anc == 'center':
+            lx = left + (cw - lw) // 2 + ox
+        else:
+            lx = right + gap + ox
+        ratio = _as_float(d.get('follow_width_ratio'), 0.0)
+        if ratio:
+            spread = int(round(cw * ratio))
+            lx += -spread if anc == 'left_edge' else spread
+        ly = top + (ch - lh) // 2 + oy
+        boxes.append((i, lx, ly, lw, lh))
+    if not boxes:
+        return 0, 0, 0, 0, []
+    wx = min(b[1] for b in boxes)
+    wy = min(b[2] for b in boxes)
+    ww = max(b[1] + b[3] for b in boxes) - wx
+    wh = max(b[2] + b[4] for b in boxes) - wy
+    places = [(i, lx - wx, ly - wy) for (i, lx, ly, _lw, _lh) in boxes]
+    return int(wx), int(wy), int(ww), int(wh), places
+
+
+def compose_layers(frames, size, placements, Image=None):
+    """② 步 4「单窗多图」：把各层帧合成到一张画布（各层自身 alpha 原样保留）。
+
+    frames     : 与图层同序的 RGBA 帧（None 表示该层跳过）
+    size       : (w, h) 画布尺寸
+    placements : plan_layer_layout 的产出（层号 → 画布内 dx/dy）
+    越界/负偏移一律按交集裁剪，绝不抛异常。
+    """
+    if Image is None:
+        Image = _pil()[0]
+    w = max(0, int((size or (0, 0))[0]))
+    h = max(0, int((size or (0, 0))[1]))
+    canvas = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    if w <= 0 or h <= 0:
+        return canvas
+    pos = {}
+    for item in (placements or []):
+        try:
+            pos[int(item[0])] = (int(item[1]), int(item[2]))
+        except Exception:
+            continue
+    for idx, fr in enumerate(frames or []):
+        if fr is None:
+            continue
+        try:
+            src = fr if fr.mode == 'RGBA' else fr.convert('RGBA')
+        except Exception:
+            continue
+        dx, dy = pos.get(idx, (0, 0))
+        sw, sh = src.size
+        x0, y0 = max(0, dx), max(0, dy)
+        x1, y1 = min(w, dx + sw), min(h, dy + sh)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        crop = src.crop((x0 - dx, y0 - dy, x1 - dx, y1 - dy))
+        canvas.alpha_composite(crop, (x0, y0))
+    return canvas
+
+
 def _valid_skin_name(name):
     """皮肤名合法性：1-40 字符，中英文/数字/空格/横线/下划线；防路径穿越"""
     if not name or len(name) > 40:
@@ -394,7 +724,11 @@ def _valid_skin_name(name):
 
 
 def list_skins():
-    """列出所有已保存皮肤：返回 [(名称, cfg), ...] 按名称排序；损坏条目跳过"""
+    """列出所有已保存皮肤：返回 [(名称, cfg), ...] 按名称排序；损坏条目跳过。
+
+    v2.0-②：读到的档案一律过 migrate_skin_cfg —— 老单图档案在此自动包成单元素图层
+    列表（schema 2），调用方拿到的永远是统一形态；图片缺失的档案照旧跳过。
+    """
     if not os.path.isdir(SKINS_DIR):
         return []
     out = []
@@ -406,6 +740,7 @@ def list_skins():
         try:
             with open(j, encoding='utf-8') as f:
                 cfg = json.load(f)
+            cfg = migrate_skin_cfg(cfg, skin_dir=p)
             cfg['name'] = d
             img = cfg.get('image')
             if img and os.path.exists(img):
@@ -416,7 +751,12 @@ def list_skins():
 
 
 def save_skin(name, cfg):
-    """把当前配置 + 图片副本保存为皮肤档案；返回保存后的 cfg（含 name），失败抛异常"""
+    """把当前配置 + 图片副本保存为皮肤档案；返回保存后的 cfg（含 name），失败抛异常。
+
+    v2.0-②：档案升级为 {schema:2, layers:[...], 兼容旧字段}。每层图片都以
+    image.<ext> / layer1.<ext> / layer2.<ext> … 复制进 skins/<名>/，顶层旧字段
+    与第 0 层（主层）保持同步 —— 老版本程序读这个档案仍能正常显示主图。
+    """
     if not _valid_skin_name(name):
         raise ValueError('皮肤名称限 1-40 字符（中文/字母/数字/空格/横线）')
     src = cfg.get('image')
@@ -424,13 +764,26 @@ def save_skin(name, cfg):
         raise ValueError('图片不存在，无法保存皮肤')
     d = os.path.join(SKINS_DIR, name)
     os.makedirs(d, exist_ok=True)
-    ext = os.path.splitext(src)[1].lower() or '.png'
-    dst_img = os.path.join(d, 'image' + ext)
-    if os.path.normpath(src) != os.path.normpath(dst_img):
-        import shutil
-        shutil.copy2(src, dst_img)
+    layers = resolve_layers(cfg)
+    new_layers = []
+    for i, ld in enumerate(layers):
+        s = ld.get('image')
+        if not s or not os.path.exists(s):
+            if i == 0:
+                raise ValueError('图片不存在，无法保存皮肤')
+            continue                      # 缺图的从层直接丢弃（不写坏档案）
+        ext = os.path.splitext(s)[1].lower() or '.png'
+        dst_img = os.path.join(d, ('image' if i == 0 else f'layer{i}') + ext)
+        if os.path.normpath(s) != os.path.normpath(dst_img):
+            import shutil
+            shutil.copy2(s, dst_img)
+        nl = dict(ld)
+        nl['image'] = dst_img
+        new_layers.append(nl)
+    if not new_layers:
+        raise ValueError('图片不存在，无法保存皮肤')
     scfg = dict(cfg)
-    scfg['image'] = dst_img
+    save_layers_into_cfg(scfg, new_layers)
     scfg['name'] = name
     with open(os.path.join(d, 'skin.json'), 'w', encoding='utf-8') as f:
         json.dump(scfg, f, ensure_ascii=False, indent=2)
@@ -2170,6 +2523,32 @@ def apply_display_effects(img_rgba, cfg, Image=None):
     return out
 
 
+def decode_anim_frame_rgba(overlay, idx):
+    """动图单帧解码到 **RGBA**（seek → RGBA → 缩放 → 特效），不做抠色。
+
+    v2.0-② 模块级实现（不依赖 overlay 的其它方法）：
+      · 单层老路径由 FollowOverlay._decode_frame 调它 → 再走渲染层 prepare；
+      · 多图层路径直接拿它当合成输入（合成必须在抠色之前）；
+      · 测试桩（只有 _Image / anim_src / anim_n / _base_h / cfg）也能直接调。
+    """
+    src = getattr(overlay, 'anim_src', None)
+    if src is None:
+        return None
+    Image = getattr(overlay, '_Image', None)
+    if Image is None:
+        return None
+    n = int(getattr(overlay, 'anim_n', 1) or 1)
+    src.seek(int(idx) % n)
+    img = src.convert('RGBA')
+    base_h = getattr(overlay, '_base_h', 300.0)
+    if img.height > 0:
+        ratio = base_h / img.height
+        img = img.resize((max(1, int(img.width * ratio)), max(1, int(base_h))),
+                         Image.LANCZOS)
+    cfg = getattr(overlay, 'cfg', None) or {}
+    return apply_display_effects(img, cfg, Image)    # 与静态图一致的特效管线
+
+
 def add_glow(img_rgba, accent, radius_ratio=0.35, alpha=90):
     try:
         from PIL import ImageDraw
@@ -3480,8 +3859,80 @@ class ConfigWizard:
         self.lbl_render_hint.pack(anchor='w', pady=(0, 4))
         self._update_render_hint()
 
-        # ⑫ 皮肤管理（图片 + 全套参数整套切换）
-        skin_box = tk.LabelFrame(adv, text='💾 ⑫ 皮肤管理',
+        # ⑫ 图层（v2.0-② 套层皮肤）：一个皮肤 = 多个图片图层，各层可锚到候选框左/右/中间
+        lay_box = tk.LabelFrame(adv, text='🧩 ⑫ 图层（可叠多张）',
+                                font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=4)
+        lay_box.pack(fill='x', pady=(4, 0))
+        self.layer_list = tk.Listbox(lay_box, height=4, width=27,
+                                     font=('Microsoft YaHei', 9), exportselection=False)
+        self.layer_list.pack(anchor='w')
+        self.layer_list.bind('<<ListboxSelect>>', lambda _e: self._on_layer_select())
+        lay_btns = tk.Frame(lay_box)
+        lay_btns.pack(anchor='w', pady=(2, 2))
+        self.btn_layer_add = tk.Button(lay_btns, text='➕ 加一张图', command=self._layer_add,
+                                       font=('Microsoft YaHei', 9))
+        self.btn_layer_add.pack(side='left', padx=(0, 2))
+        self.btn_layer_del = tk.Button(lay_btns, text='🗑 删这层', command=self._layer_delete,
+                                       font=('Microsoft YaHei', 9))
+        self.btn_layer_del.pack(side='left', padx=(0, 2))
+        tk.Button(lay_btns, text='↑ 上移', command=lambda: self._layer_move(-1),
+                  font=('Microsoft YaHei', 8)).pack(side='left', padx=(0, 2))
+        tk.Button(lay_btns, text='↓ 下移', command=lambda: self._layer_move(1),
+                  font=('Microsoft YaHei', 8)).pack(side='left')
+
+        tk.Label(lay_box, text='选中层贴哪儿:', fg='#555',
+                 font=('Microsoft YaHei', 9)).pack(anchor='w')
+        row_la = tk.Frame(lay_box)
+        row_la.pack(anchor='w')
+        self.var_layer_anchor = tk.StringVar(master=self.root, value='right_edge')
+        for _t, _v in (('贴左边', 'left_edge'), ('贴右边', 'right_edge'), ('居中', 'center')):
+            tk.Radiobutton(row_la, text=_t, variable=self.var_layer_anchor, value=_v,
+                           font=('Microsoft YaHei', 8),
+                           command=self._on_layer_param_change).pack(side='left')
+        row_lp = tk.Frame(lay_box)
+        row_lp.pack(anchor='w', pady=(1, 0))
+        tk.Label(row_lp, text='左右', font=('Microsoft YaHei', 8)).pack(side='left')
+        self.var_lay_offx = tk.IntVar(master=self.root, value=0)
+        tk.Scale(row_lp, from_=-200, to=200, orient='horizontal', length=86, sliderlength=12,
+                 variable=self.var_lay_offx, command=lambda _v: self._on_layer_param_change(),
+                 font=('Microsoft YaHei', 8)).pack(side='left')
+        tk.Label(row_lp, text='上下', font=('Microsoft YaHei', 8)).pack(side='left')
+        self.var_lay_offy = tk.IntVar(master=self.root, value=0)
+        tk.Scale(row_lp, from_=-200, to=200, orient='horizontal', length=86, sliderlength=12,
+                 variable=self.var_lay_offy, command=lambda _v: self._on_layer_param_change(),
+                 font=('Microsoft YaHei', 8)).pack(side='left')
+        row_ls = tk.Frame(lay_box)
+        row_ls.pack(anchor='w')
+        tk.Label(row_ls, text='这层大小', font=('Microsoft YaHei', 8)).pack(side='left')
+        self.var_lay_scale = tk.DoubleVar(master=self.root, value=1.0)
+        tk.Scale(row_ls, from_=0.2, to=2.0, resolution=0.1, orient='horizontal', length=86,
+                 sliderlength=12, variable=self.var_lay_scale,
+                 command=lambda _v: self._on_layer_param_change(),
+                 font=('Microsoft YaHei', 8)).pack(side='left')
+        self.var_lay_flip = tk.BooleanVar(master=self.root, value=False)
+        tk.Checkbutton(row_ls, text='水平翻转', variable=self.var_lay_flip,
+                       font=('Microsoft YaHei', 8),
+                       command=self._on_layer_param_change).pack(side='left')
+        row_lr = tk.Frame(lay_box)
+        row_lr.pack(anchor='w')
+        self.var_lay_follow = tk.BooleanVar(master=self.root, value=False)
+        tk.Checkbutton(row_lr, text='随候选框变宽往外让', variable=self.var_lay_follow,
+                       font=('Microsoft YaHei', 8),
+                       command=self._on_layer_param_change).pack(side='left')
+        self.var_lay_follow_r = tk.IntVar(master=self.root, value=30)
+        tk.Scale(row_lr, from_=0, to=60, orient='horizontal', length=70, sliderlength=12,
+                 variable=self.var_lay_follow_r,
+                 command=lambda _v: self._on_layer_param_change(),
+                 font=('Microsoft YaHei', 8)).pack(side='left')
+        tk.Label(row_lr, text='%', font=('Microsoft YaHei', 8)).pack(side='left')
+        self.lbl_layer_hint2 = tk.Label(lay_box, text='', fg='#888',
+                                        font=('Microsoft YaHei', 8), justify='left',
+                                        wraplength=300)
+        self.lbl_layer_hint2.pack(anchor='w', pady=(2, 0))
+        self._layer_sync_from_cfg()
+
+        # ⑬ 皮肤管理（图片 + 全套参数整套切换）
+        skin_box = tk.LabelFrame(adv, text='💾 ⑬ 皮肤管理',
                                  font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=4)
         skin_box.pack(fill='x', pady=(2, 0))
         self.skin_var = tk.StringVar(master=self.root)
@@ -3516,17 +3967,17 @@ class ConfigWizard:
         self.lbl_scheme_hint.pack(anchor='w', pady=(2, 0))
         self._refresh_skin_list()
 
-        # ⑬ 开机自启（真相 = 启动文件夹快捷方式，勾选态直接读实际状态）
+        # ⑭ 开机自启（真相 = 启动文件夹快捷方式，勾选态直接读实际状态）
         row_start = tk.Frame(adv)
         row_start.pack(anchor='w', pady=(6, 0))
         self.var_autostart = tk.BooleanVar(master=self.root, value=autostart_installed())
-        tk.Checkbutton(row_start, text='⑬ 开机自启（静默到托盘）',
+        tk.Checkbutton(row_start, text='⑭ 开机自启（静默到托盘）',
                        variable=self.var_autostart,
                        font=('Microsoft YaHei', 10)).pack(side='left')
         self.lbl_autostart = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8))
         self.lbl_autostart.pack(anchor='w', pady=(0, 2))
 
-        # ⑬ 按钮行（整行）
+        # ⑮ 按钮行（整行）
         row8 = tk.Frame(frm)
         row8.pack(fill='x', pady=6)
         tk.Button(row8, text='保存并启动', command=self._save_and_start,
@@ -3571,6 +4022,57 @@ class ConfigWizard:
     def _cleanup_junk(self):
         """🧹 清理程序目录垃圾（白名单之外、非保护类型、非正在使用的图片；走回收站）"""
         cleanup_junk_files(extra_keep=[self.cfg.get('image', '')], parent=self.root)
+
+    # ---------- ② 多层预览（向导）----------
+    def _preview_specs(self):
+        """预览用图层列表：只有 ≥2 层才返回（单层返回 [] → 预览走 v1.6 原路径，行为零变化）。
+
+        第 0 层的锚点/缩放/偏移取**向导当前 UI 值**（滑块还没写回 cfg 时要即时可见）。
+        """
+        try:
+            layers = resolve_layers(self.cfg)
+            if len(layers) <= 1:
+                return []
+            l0 = dict(layers[0])
+            try:
+                l0['anchor'] = anchor_from_side(self.var_side.get())
+                l0['scale'] = round(float(self.var_scale.get()), 2)
+                l0['flip'] = bool(self.var_flip.get())
+                l0['offset_x'] = int(self.var_offx.get())
+                l0['offset_y'] = int(self.var_offy.get())
+                l0['effects'] = {k: v for k, v in self._effects_cfg().items() if k != 'flip_h'}
+            except Exception:
+                pass
+            layers[0] = l0
+            return layers
+        except Exception:
+            return []
+
+    def _preview_layer_imgs(self, layers):
+        """多层预览：逐层出 PIL 图（缩放 / 特效口径与运行时一致）。失败的层返回 None。"""
+        out = []
+        for i, ld in enumerate(layers):
+            im = None
+            try:
+                if i == 0:
+                    im = self._get_preview_img()
+                else:
+                    with self._Image.open(ld.get('image')) as _im:
+                        im = _im.convert('RGBA')
+                if im is None:
+                    raise ValueError('图片加载失败')
+                base_h = 300 * float(ld.get('scale', 1.0) or 1.0)
+                if im.height > 0:
+                    ratio = base_h / im.height
+                    im = im.resize((max(1, int(im.width * ratio)), max(1, int(base_h))),
+                                   self._Image.BILINEAR)
+                eff = dict(ld.get('effects') or {})
+                eff['flip_h'] = bool(ld.get('flip'))
+                im = apply_display_effects(im, eff, self._Image)
+            except Exception:
+                im = None
+            out.append(im)
+        return out
 
     def _get_preview_img(self):
         """预览图片缓存：文件未变时复用已打开的图，避免每次滑块都重开大图。
@@ -3728,6 +4230,203 @@ class ConfigWizard:
         except Exception:
             self.lbl_keyhint.config(text='')
 
+    # ---------- ② 图层（套层皮肤）----------
+    def _layers(self):
+        """当前编辑中的图层列表（老 cfg 没有 layers 时自动包成单元素列表）。"""
+        if not isinstance(self.cfg.get('layers'), list) or not self.cfg['layers']:
+            self.cfg = migrate_skin_cfg(self.cfg)
+        return self.cfg['layers']
+
+    def _cur_layer_index(self):
+        try:
+            sel = self.layer_list.curselection()
+            i = int(sel[0]) if sel else 0
+        except Exception:
+            i = 0
+        return max(0, min(i, len(self._layers()) - 1))
+
+    def _layer_label(self, i, ld):
+        """列表项文案（大白话：第几层 + 贴哪边 + 文件名）"""
+        where = {'left_edge': '贴左', 'right_edge': '贴右', 'center': '居中'}.get(
+            ld.get('anchor'), '贴右')
+        name = os.path.basename(ld.get('image') or '') or '（未选图）'
+        tag = f'第{i + 1}层（主图）' if i == 0 else f'第{i + 1}层'
+        return f'{tag} · {where} · {name}'
+
+    def _layer_sync_from_cfg(self):
+        """把 cfg 里的图层刷进列表控件（打开向导 / 切皮肤 / 增删层后调用）。"""
+        try:
+            layers = self._layers()
+            self.layer_list.delete(0, 'end')
+            for i, ld in enumerate(layers):
+                self.layer_list.insert('end', self._layer_label(i, ld))
+            keep = max(0, min(int(getattr(self, '_layer_sel', 0)), len(layers) - 1))
+            self.layer_list.selection_clear(0, 'end')
+            self.layer_list.selection_set(keep)
+            self._layer_sel = keep
+            self._on_layer_select()
+        except Exception:
+            pass
+
+    def _layer_hint(self, i):
+        if i == 0:
+            return ('第 1 层是主图：和左侧 ③ 贴边方向 / ④ 缩放 / 水平翻转 / ⑤⑥ 微调是同一份设置；'
+                    '另外两层都叠在它周围。')
+        return ('这一层跟着候选框走：贴左/贴右/居中任选；勾「随候选框变宽往外让」后，'
+                '打字时候选框变宽 → 它会按比例再往外让一点。')
+
+    def _on_layer_select(self, _e=None):
+        """选中某层 → 回显该层参数（第 1 层与左侧主参数双向同步）。"""
+        try:
+            sel = self.layer_list.curselection()
+            if not sel:
+                return
+            i = int(sel[0])
+            layers = self._layers()
+            if i >= len(layers):
+                return
+            self._layer_sel = i
+            ld = layers[i]
+            self._layer_loading = True
+            if i == 0:
+                self.var_layer_anchor.set(anchor_from_side(self.cfg.get('side')))
+                self.var_lay_offx.set(int(self.cfg.get('offset_x', 0) or 0))
+                self.var_lay_offy.set(int(self.cfg.get('offset_y', 0) or 0))
+                self.var_lay_scale.set(float(self.cfg.get('scale', 1.0) or 1.0))
+                self.var_lay_flip.set(bool(self.cfg.get('flip_h', False)))
+            else:
+                self.var_layer_anchor.set(ld.get('anchor', 'right_edge'))
+                self.var_lay_offx.set(int(ld.get('offset_x', 0) or 0))
+                self.var_lay_offy.set(int(ld.get('offset_y', 0) or 0))
+                self.var_lay_scale.set(float(ld.get('scale', 1.0) or 1.0))
+                self.var_lay_flip.set(bool(ld.get('flip', False)))
+            r = abs(float(ld.get('follow_width_ratio', 0.0) or 0.0))
+            self.var_lay_follow.set(r > 1e-9)
+            self.var_lay_follow_r.set(int(round(r * 100)))
+            self.lbl_layer_hint2.config(text=self._layer_hint(i))
+        except Exception:
+            pass
+        finally:
+            self._layer_loading = False
+
+    def _on_layer_param_change(self, *_a):
+        """把控件上的层参数写回 cfg（第 1 层写顶层兼容字段，保证与主参数同一份数据）。"""
+        if getattr(self, '_layer_loading', False):
+            return
+        try:
+            i = self._cur_layer_index()
+            layers = self._layers()
+            if i >= len(layers):
+                return
+            ld = layers[i]
+            anc = self.var_layer_anchor.get()
+            ld['anchor'] = anc if anc in LAYER_ANCHORS else 'right_edge'
+            ld['follow_width_ratio'] = (int(self.var_lay_follow_r.get()) / 100.0
+                                        if self.var_lay_follow.get() else 0.0)
+            ox = int(self.var_lay_offx.get())
+            oy = int(self.var_lay_offy.get())
+            sc = round(float(self.var_lay_scale.get()), 2)
+            fl = bool(self.var_lay_flip.get())
+            if i == 0:
+                self.cfg['side'] = side_from_anchor(ld['anchor'])
+                self.cfg['offset_x'] = ox
+                self.cfg['offset_y'] = oy
+                self.cfg['scale'] = sc
+                self.cfg['flip_h'] = fl
+                ld['offset_x'] = 0       # 主层：顶层 offset 才是权威（防翻倍）
+                ld['offset_y'] = 0
+                ld['scale'] = sc
+                ld['flip'] = fl
+                # 左侧主参数控件跟着走（同一份数据，两处显示必须一致）
+                for name, v in (('var_side', self.cfg['side']), ('var_scale', sc),
+                                ('var_offx', ox), ('var_offy', oy), ('var_flip', fl)):
+                    w = getattr(self, name, None)
+                    if w is not None:
+                        try:
+                            w.set(v)
+                        except Exception:
+                            pass
+            else:
+                ld['offset_x'] = ox
+                ld['offset_y'] = oy
+                ld['scale'] = sc
+                ld['flip'] = fl
+            self.layer_list.delete(i)
+            self.layer_list.insert(i, self._layer_label(i, ld))
+            self.layer_list.selection_clear(0, 'end')
+            self.layer_list.selection_set(i)
+            self.lbl_layer_hint2.config(text=self._layer_hint(i))
+            self._update_preview()
+        except Exception:
+            pass
+
+    def _layer_add(self):
+        """加一个图层（选图；默认贴到主图的另一侧 —— 左右夹持是最常见的套层用法）。"""
+        try:
+            layers = self._layers()
+            if len(layers) >= MAX_LAYERS:
+                messagebox.showinfo('图层已满',
+                                    f'最多 {MAX_LAYERS} 层（再多屏幕也放不下了）', parent=self.root)
+                return
+            path = filedialog.askopenfilename(
+                title='选一张图作为新图层',
+                filetypes=[('图片文件', '*.png *.jpg *.jpeg *.webp *.gif *.bmp'),
+                           ('所有文件', '*.*')], parent=self.root)
+            if not path:
+                return
+            main_anchor = layers[0].get('anchor', 'right_edge')
+            anc = 'left_edge' if main_anchor != 'left_edge' else 'right_edge'
+            z = max([int(x.get('z', 0) or 0) for x in layers] or [0]) + 1
+            layers.append(normalize_layer({'image': path, 'anchor': anc, 'z': z}))
+            self.cfg['layers'] = layers
+            self._layer_sel = len(layers) - 1
+            self._layer_sync_from_cfg()
+            self._update_preview()
+        except Exception as e:
+            messagebox.showerror('加图层失败', str(e), parent=self.root)
+
+    def _layer_delete(self):
+        """删掉选中的图层。第 1 层（主图）保底不可删 —— 否则整条叠加链失去基准。"""
+        try:
+            i = self._cur_layer_index()      # 实时读列表选中（不依赖缓存，程序化选择也准）
+            layers = self._layers()
+            if len(layers) <= 1:
+                messagebox.showinfo('只剩一层',
+                                    '至少要留一张图（第 1 层是主图）', parent=self.root)
+                return
+            if i == 0:
+                messagebox.showinfo('第 1 层不能删',
+                                    '第 1 层是主图，其它层都跟着它叠。\n想换主图请直接点「① 选择图片」。',
+                                    parent=self.root)
+                return
+            layers.pop(i)
+            for k, ld in enumerate(layers):
+                ld['z'] = k
+            self.cfg['layers'] = layers
+            self._layer_sel = max(0, i - 1)
+            self._layer_sync_from_cfg()
+            self._update_preview()
+        except Exception as e:
+            messagebox.showerror('删图层失败', str(e), parent=self.root)
+
+    def _layer_move(self, delta):
+        """调整叠放顺序（z）：列表里越靠后越在上层。"""
+        try:
+            i = self._cur_layer_index()      # 实时读列表选中
+            layers = self._layers()
+            j = i + int(delta)
+            if i < 0 or i >= len(layers) or j < 0 or j >= len(layers):
+                return
+            layers[i], layers[j] = layers[j], layers[i]
+            for k, ld in enumerate(layers):
+                ld['z'] = k
+            save_layers_into_cfg(self.cfg, layers)   # 第 1 层可能换了 → 顶层兼容字段跟着同步
+            self._layer_sel = j
+            self._layer_sync_from_cfg()
+            self._update_preview()
+        except Exception:
+            pass
+
     # ---------- 皮肤管理 ----------
     def _refresh_skin_list(self):
         """刷新皮肤下拉框；保留当前选中（若还在）"""
@@ -3779,6 +4478,7 @@ class ConfigWizard:
         img = cfg.get('image', '')
         self.lbl_img.config(text=os.path.basename(img) + f'（皮肤: {name}）', fg='#2e7d32')
         self.btn_prep.config(state='normal' if img else 'disabled')
+        self._layer_sync_from_cfg()      # ② 套层：切皮肤后图层列表跟着换（含各层参数）
         self._update_preview()
         self._update_key_hint()
         # ③ 配色绑定回显：皮肤档案存了配色名 → 提示行回显（切皮肤时由外挂整套恢复）
@@ -3824,6 +4524,12 @@ class ConfigWizard:
         tcfg['scale'] = round(float(self.var_scale.get()), 2)
         tcfg['offset_x'] = int(self.var_offx.get())
         tcfg['offset_y'] = int(self.var_offy.get())
+        try:
+            _lyr = self._layers()
+            _lyr[0]['image'] = tcfg.get('image') or _lyr[0].get('image')
+            save_layers_into_cfg(tcfg, _lyr)     # ② 套层：多图层一起进档案
+        except Exception:
+            pass
         try:
             save_skin(name, tcfg)
         except ValueError as e:
@@ -4095,7 +4801,50 @@ class ConfigWizard:
         img = None
         new_w = new_h = 0
         ix = iy = 0
-        if self.cfg.get('image') and self.PIL:
+        self._preview_layers = []          # ② 多层预览：(x, y, PIL图, PhotoImage)
+        preview_layers = self._preview_specs()
+        multi = len(preview_layers) > 1
+        if not multi and not self.cfg.get('image'):
+            multi = False
+        if multi and self.PIL:
+            try:
+                imgs = self._preview_layer_imgs(preview_layers)
+                sizes = [(im.size[0], im.size[1]) if im is not None else (0, 0) for im in imgs]
+                wx0, wy0, ww, wh, pl = plan_layer_layout(preview_layers, sizes,
+                                                         (0, 0, cw, ch))
+                if ww > 0 and wh > 0:
+                    fit = min((self.CV_W - 30) / float(ww),
+                              (self.CV_H - 40) / float(wh), 1.0)
+                    if fit < 1.0:
+                        imgs = [None if im is None else
+                                im.resize((max(1, int(im.size[0] * fit)),
+                                           max(1, int(im.size[1] * fit))), self._Image.LANCZOS)
+                                for im in imgs]
+                        sizes = [(im.size[0], im.size[1]) if im is not None else (0, 0)
+                                 for im in imgs]
+                        cw, ch = max(1, int(cw * fit)), max(1, int(ch * fit))
+                        wx0, wy0, ww, wh, pl = plan_layer_layout(preview_layers, sizes,
+                                                                 (0, 0, cw, ch))
+                    base_x = (self.CV_W - cw) // 2
+                    base_y = (360 - ch) // 2
+                    pos = {p[0]: (p[1], p[2]) for p in pl}
+                    for k, im in enumerate(imgs):
+                        if im is None:
+                            continue
+                        dx, dy = pos.get(k, (0, 0))
+                        px, py = base_x + wx0 + dx, base_y + wy0 + dy
+                        tk_im = self._ImageTk.PhotoImage(im, master=self.root)
+                        self._photo_refs.append(tk_im)
+                        if len(self._photo_refs) > MAX_LAYERS + 2:
+                            _release_photo(self._photo_refs.pop(0))
+                        self._preview_layers.append((px, py, im, tk_im))
+                    self.tk_img = None
+            except Exception as e:
+                cv.create_text(380, 180, text=f'图层预览失败: {e}', fill='red',
+                               font=('Microsoft YaHei', 9))
+                self._preview_layers = []
+                self.tk_img = None
+        elif self.cfg.get('image') and self.PIL:
             try:
                 img = self._get_preview_img()
                 if img is None:
@@ -4181,6 +4930,12 @@ class ConfigWizard:
         below_overlap = (layer == 'below' and side == 'center')
 
         def _draw_img_layer():
+            if self._preview_layers:      # ② 多层：每层各画一份（含虚线框，便于看清各自范围）
+                for _px, _py, _im, _tk in self._preview_layers:
+                    cv.create_image(_px, _py, anchor='nw', image=_tk)
+                    cv.create_rectangle(_px, _py, _px + _im.size[0], _py + _im.size[1],
+                                        outline='#ff6a00', dash=(4, 2))
+                return
             if img is not None:
                 cv.create_image(ix, iy, anchor='nw', image=self.tk_img)
                 cv.create_rectangle(ix, iy, ix + new_w, iy + new_h,
@@ -4300,6 +5055,13 @@ class ConfigWizard:
         self.cfg.pop('feather_dither', None)   # 旧字段清理（点阵羽化已成为唯一实现）
         # 渲染模式（v2.0-①）：UI 只有中文选项，写回时归一成 compat/alpha（非法值回落 compat）
         self.cfg['render_mode'] = resolve_render_mode({'render_mode': self.var_render.get()})
+        # ② 套层（v2.0-②）：图层列表与顶层兼容字段对齐后一起存（schema 2 + layers）
+        try:
+            _lyr = self._layers()
+            _lyr[0]['image'] = self.cfg['image']   # 主图可能刚换成预处理持久化副本，同步给第 0 层
+            save_layers_into_cfg(self.cfg, _lyr)
+        except Exception as _e:
+            _write_log(f'[套层] 图层写回失败: {_e}')
         # 开机自启（真相 = 启动文件夹快捷方式；勾选态与实际同步后才算完成）
         want_start = bool(self.var_autostart.get())
         ok, msg = set_autostart(want_start, force=want_start)
@@ -4619,6 +5381,9 @@ class FollowOverlay:
         Image = self._Image
         base_h = self.cfg.get('base_height', 300) * self.cfg.get('scale', 1.0)
         self._base_h = base_h
+        layers = self._layer_specs()
+        multi = self._layers_active()      # ② 套层：>1 层才走「单窗多图合成」路径
+        self._layer_raw = []               # 各层原始 RGBA 帧（抠色前），合成与抠色键都用它
         src = Image.open(img_path)
         try:
             n = int(getattr(src, 'n_frames', 1) or 1)
@@ -4629,11 +5394,18 @@ class FollowOverlay:
             self.anim_src = src
             self.anim_n = n
             self.key_rgb = self._pick_anim_key(Image, n)
-            self.img = self._decode_frame(0)
-            if self.img is None:      # 解码失败 → 退回静态首帧路径
-                self.anim_src, self.anim_n = None, 0
-                raise ValueError('首帧解码失败')
-            self._frame_cache[self.anim_idx] = self.img
+            if multi:
+                f0 = self._decode_frame_rgba(0)
+                if f0 is None:
+                    self.anim_src, self.anim_n = None, 0
+                    raise ValueError('首帧解码失败')
+                self._layer_raw = [f0]
+            else:
+                self.img = self._decode_frame(0)
+                if self.img is None:      # 解码失败 → 退回静态首帧路径
+                    self.anim_src, self.anim_n = None, 0
+                    raise ValueError('首帧解码失败')
+                self._frame_cache[self.anim_idx] = self.img
             self.raw_img = None
         else:
             # ---- 静态图：原管线（行为与 v1.5 一致）----
@@ -4644,23 +5416,34 @@ class FollowOverlay:
                 img = img.resize((new_w, max(1, int(base_h))), Image.LANCZOS)
             # 显示期特效（圆角 / 高斯模糊）——在选抠色键之前做（模糊会改颜色分布）
             img = apply_display_effects(img, self.cfg, Image)
-            # 动态颜色键：统计颜色并集，选图中不存在的颜色当抠色键（消灭「图含品红被误抠」）
-            self.key_rgb = renderer.pick_key([img], Image)
-            # 渲染层出帧（compat = 修复紫边：缩放后 alpha 二值化 + 透明区填键色）
-            img = renderer.flatten(img, self.key_rgb, Image)
-            self.raw_img = img.copy()
-            old = getattr(self, 'img', None)
-            self.img = renderer.to_photo(img)
-            if old is not None:
-                renderer.release(old)  # 显式释放旧 tcl image（热重载/切皮肤同步清理）
+            if multi:
+                self._layer_raw = [img]    # 未抠色的原始帧：合成必须在抠色之前
+            else:
+                # 动态颜色键：统计颜色并集，选图中不存在的颜色当抠色键（消灭「图含品红被误抠」）
+                self.key_rgb = renderer.pick_key([img], Image)
+                # 渲染层出帧（compat = 修复紫边：缩放后 alpha 二值化 + 透明区填键色）
+                img = renderer.flatten(img, self.key_rgb, Image)
+                self.raw_img = img.copy()
+                old = getattr(self, 'img', None)
+                self.img = renderer.to_photo(img)
+                if old is not None:
+                    renderer.release(old)  # 显式释放旧 tcl image（热重载/切皮肤同步清理）
         self.img_mtime = os.path.getmtime(img_path)
         # 不画光环（纯图片）
         self.cur_accent = None
-        # 窗口透明色 / 背景 / Label 底色全部跟随动态键色（渲染层统一应用：
-        # compat = -transparentcolor + 键色底；alpha 实装后改推分层位图）
-        renderer.apply_window(self.key_rgb)
-        renderer.apply_label(getattr(self, 'label', None), self.img, self.key_rgb)
-        self.w, self.h = self.img.width(), self.img.height()
+        if multi:
+            # ② 步 4 单窗多图：各层原始帧 → 合成画布 → 渲染层出图（compat/alpha 同一入口）
+            for i, ld in enumerate(layers):
+                if i == 0:
+                    continue
+                self._layer_raw.append(self._layer_raw_frame(i, ld, Image))
+            self._compose_into_renderer(layers)
+        else:
+            # 窗口透明色 / 背景 / Label 底色全部跟随动态键色（渲染层统一应用：
+            # compat = -transparentcolor + 键色底；alpha = 推分层位图）
+            renderer.apply_window(self.key_rgb)
+            renderer.apply_label(getattr(self, 'label', None), self.img, self.key_rgb)
+            self.w, self.h = self.img.width(), self.img.height()
         self.layer = self.cfg.get('layer', 'above')  # 热重载/切皮肤/缩放重载后同步图层配置
         # 新图已挂上 Label，再释放旧帧序列的 tcl image（避免切换瞬间画布指向已删 image）
         for _p in old_frames:
@@ -4709,21 +5492,22 @@ class FollowOverlay:
             _renderer_of(self).cfg = cfg   # 换的是同一个全局开关 → 只更新 cfg 引用
         return self.render_mode
 
+    def _decode_frame_rgba(self, idx):
+        """按需解码单帧到 **RGBA**（seek → RGBA → 缩放 → 特效），不做抠色。
+
+        v2.0-② 拆出的中间层：多图层合成必须在抠色之前拿到原始帧，所以先解码到 RGBA，
+        再由 _decode_frame（单层老路径）走渲染层 prepare —— 老路径行为逐位不变。
+        实现放在模块级函数里：测试桩对象（只有 _Image/anim_src/_base_h）直接调
+        _decode_frame 时也不必补齐本方法。
+        """
+        return decode_anim_frame_rgba(self, idx)
+
     def _decode_frame(self, idx):
         """按需解码单帧：seek → RGBA → 缩放 → 抠色（渲染层）→ PhotoImage（不写 self.img）。"""
-        src = self.anim_src
-        if src is None:
+        img = decode_anim_frame_rgba(self, idx)
+        if img is None:
             return None
-        Image = self._Image
-        src.seek(idx % self.anim_n)
-        img = src.convert('RGBA')
-        base_h = getattr(self, '_base_h', 300.0)
-        if img.height > 0:
-            ratio = base_h / img.height
-            img = img.resize((max(1, int(img.width * ratio)), max(1, int(base_h))),
-                             Image.LANCZOS)
-        img = apply_display_effects(img, self.cfg, Image)   # 与静态图一致的特效管线
-        return _renderer_of(self).prepare(img, self.key_rgb, Image)
+        return _renderer_of(self).prepare(img, self.key_rgb, self._Image)
 
     def _get_frame(self, idx):
         """取帧（LRU 缓存，上限 ANIM_CACHE_MAX 张）：命中即置为最近使用，
@@ -4815,6 +5599,18 @@ class FollowOverlay:
             except Exception:
                 dur = 100
             self.anim_idx = nxt
+            if self._layers_active():
+                # ② 套层 + 动图：第 0 层换帧 → 整张画布重新合成（其余层静止），
+                # 抠色键沿用 load_char 时算好的值（多帧颜色并集），不每帧重算
+                fr = self._decode_frame_rgba(nxt)
+                if fr is not None:
+                    raws = getattr(self, '_layer_raw', None)
+                    if raws:
+                        raws[0] = fr
+                    self._compose_into_renderer(key=self.key_rgb, apply=False)
+                    self._push_render_frame()
+                self._schedule_anim(dur)
+                return
             photo = self._get_frame(nxt)
             if photo is not None:
                 self.img = photo
@@ -5087,30 +5883,218 @@ class FollowOverlay:
             return False
 
     def _calc_target(self, rect):
-        """候选框 rect → 贴边目标 (x, y)（逻辑与改造前一致，含用户微调偏移）。"""
-        cw, ch = rect.right - rect.left, rect.bottom - rect.top
-        side = self.cfg.get('side', 'right')
-        gap = 8
-        if side == 'left':
-            x = rect.left - self.w - gap + self.off_x + self.cfg.get('offset_x', 0)
-        elif side == 'right':
-            x = rect.right + gap + self.off_x + self.cfg.get('offset_x', 0)
-        else:  # center：水平居中于候选框（配合图层叠放）
-            x = rect.left + (cw - self.w) // 2 + self.off_x + self.cfg.get('offset_x', 0)
-        y = rect.top + (ch - self.h) // 2 + self.off_y + self.cfg.get('offset_y', 0)
-        return int(x), int(y)
+        """候选框 rect → 贴边目标 (x, y)（逻辑与改造前一致，含用户微调偏移）。
 
-    def _move_to(self, x, y):
+        v2.0-②：改为委托 _calc_layer_targets —— 单图层时两者逐位相同（B_test 守），
+        多图层时这里返回的是「合成画布」的左上角（全部图层的包围盒原点）。
+        """
+        wx, wy, _ww, _wh, _pl = self._calc_layer_targets(rect)
+        return int(wx), int(wy)
+
+    # ---------- ② 套层皮肤：多图层布局（v2.0）----------
+    def _layer_specs(self):
+        """当前 cfg 解析出的图层列表（运行时形态：键齐全、路径已解析）。"""
+        try:
+            return resolve_layers(self.cfg if isinstance(self.cfg, dict) else {})
+        except Exception:
+            return []
+
+    def _layers_active(self):
+        """是否走「单窗多图合成」路径。只有 >1 层才启用 —— 单层严格退化为 v1.6 老路径。"""
+        try:
+            return bool(self.PIL) and len(self._layer_specs()) > 1
+        except Exception:
+            return False
+
+    def _layout_rect(self):
+        """布局参考矩形：优先当前缓存候选框的真实矩形；没有则用上次已知的，再退化为空矩形。
+
+        空矩形（0,0,0,0）只影响"首次加载时画布多大"—— 每次定位都会用真 rect 重算，
+        所以无候选框时算出来的画布尺寸不会漏到屏幕上。
+        """
+        try:
+            if self._cached_hwnd and user32.IsWindow(self._cached_hwnd):
+                r = wintypes.RECT()
+                if user32.GetWindowRect(self._cached_hwnd, ctypes.byref(r)):
+                    self._last_rect = (int(r.left), int(r.top), int(r.right), int(r.bottom))
+                    return self._last_rect
+        except Exception:
+            pass
+        return getattr(self, '_last_rect', None) or (0, 0, 0, 0)
+
+    def _layer_dims(self, Image=None, layers=None):
+        """各图层的显示尺寸 [(w,h), ...]（与 load_char 同一缩放口径：高度 = base_height×scale）。"""
+        Image = Image or getattr(self, '_Image', None)
+        layers = layers if layers is not None else self._layer_specs()
+        if Image is None:
+            return []
+        base_h = self.cfg.get('base_height', 300)
+        out = []
+        for ld in layers:
+            w = h = 0
+            try:
+                with Image.open(ld.get('image')) as _im:
+                    src = _im.convert('RGBA')
+                bh = base_h * float(ld.get('scale', 1.0) or 1.0)
+                if src.height > 0:
+                    ratio = bh / src.height
+                    src = src.resize((max(1, int(src.width * ratio)), max(1, int(bh))),
+                                     Image.LANCZOS)
+                w, h = int(src.size[0]), int(src.size[1])
+            except Exception:
+                w = h = 0
+            out.append((w, h))
+        return out
+
+    def _calc_layer_targets(self, rect):
+        """② 步 3：一次算出全部图层的目标坐标（返回窗口位置/尺寸 + 各层画布内偏移）。
+
+        单图层时窗口尺寸取 self.w/self.h（与 v1.6 的 PhotoImage 尺寸同源），
+        保证 _calc_target 结果与改造前逐位一致 —— 老路径零漂移。
+        """
+        layers = self._layer_specs()
+        if self._layers_active():
+            dims = self._layer_dims(self._Image, layers)
+        else:
+            dims = [(int(getattr(self, 'w', 0) or 0), int(getattr(self, 'h', 0) or 0))]
+        return plan_layer_layout(layers, dims, rect,
+                                 main_off=(getattr(self, 'off_x', 0), getattr(self, 'off_y', 0)))
+
+    def _plan_targets(self, rect):
+        """候选框 rect → 本次要应用的 (x, y, w, h, size_changed)。
+
+        单层：w/h 返回 None → _move_to 走 SWP_NOSIZE（与 v1.6 逐位一致），size_changed 恒 False。
+        多层：w/h = 合成画布尺寸；画布尺寸变了就先把位图重新合成（只在候选框宽度
+        变化时发生，属低频），并同步一次 Tk geometry 记账 —— 这就是「两侧图层自动
+        拉开/收拢」的实现点：位置与尺寸在同一次 SetWindowPos 里一起生效，无中间态。
+
+        size_changed 必须回传给调用方：候选框"只变宽不移动"时窗口坐标一模一样，
+        只看坐标的死区判断会把整条 resize 路径吞掉（实测窗口会停在旧宽度）。
+        """
+        wx, wy, ww, wh, _pl = self._calc_layer_targets(rect)
+        if not self._layers_active():
+            return int(wx), int(wy), None, None, False
+        ww, wh = int(ww), int(wh)
+        changed = (ww, wh) != tuple(getattr(self, '_canvas_size', None) or (0, 0))
+        if changed:
+            try:
+                self._compose_into_renderer()
+            except Exception as e:
+                try:
+                    _write_log(f'[套层] 候选框变宽后重合成失败: {e}')
+                except Exception:
+                    pass
+            try:
+                self.root.geometry(f'{ww}x{wh}+{int(wx)}+{int(wy)}')
+            except Exception:
+                pass
+        return int(wx), int(wy), ww, wh, changed
+
+    def _layer_raw_frame(self, idx, ld, Image):
+        """取第 idx 层的原始 RGBA 帧（缩放 + 特效后、抠色前）。命中 _layer_raw 缓存即复用。"""
+        raws = getattr(self, '_layer_raw', None) or []
+        if 0 <= idx < len(raws) and raws[idx] is not None:
+            return raws[idx]
+        try:
+            with Image.open(ld.get('image')) as _im:
+                src = _im.convert('RGBA')
+            bh = self.cfg.get('base_height', 300) * float(ld.get('scale', 1.0) or 1.0)
+            if src.height > 0:
+                ratio = bh / src.height
+                src = src.resize((max(1, int(src.width * ratio)), max(1, int(bh))),
+                                 Image.LANCZOS)
+            eff = ld.get('effects') or {}
+            fx = dict(self.cfg)
+            fx.update({k: eff.get(k) for k in ('corner_enabled', 'corner_radius',
+                                               'feather_enabled', 'feather_radius')
+                       if k in eff})
+            fx['flip_h'] = False        # 翻转按「层」判定，不让顶层 flip_h 重复生效
+            src = apply_display_effects(src, fx, Image)
+            if ld.get('flip'):
+                src = src.transpose(Image.FLIP_LEFT_RIGHT)
+            return src
+        except Exception:
+            return None
+
+    def _compose_frame(self, layers=None, sizes=None, out_frames=None):
+        """② 步 4：把全部图层合成成一张 RGBA 画布（单窗多图，各层自身 alpha 保留）。
+
+        返回 canvas（RGBA 图）；无有效图层时返回 None。
+        out_frames 非空时回传各层原始帧（抠色键要用），避免重复解码。
+        """
+        if not self.PIL:
+            return None
+        Image = self._Image
+        layers = layers if layers is not None else self._layer_specs()
+        if not layers:
+            return None
+        dims = sizes if sizes is not None else self._layer_dims(Image, layers)
+        rect = self._layout_rect()
+        wx, wy, ww, wh, pl = plan_layer_layout(
+            layers, dims, rect,
+            main_off=(getattr(self, 'off_x', 0), getattr(self, 'off_y', 0)))
+        if ww <= 0 or wh <= 0:
+            return None
+        frames = [self._layer_raw_frame(i, ld, Image) for i, ld in enumerate(layers)]
+        if out_frames is not None:
+            out_frames.extend(frames)
+        return compose_layers(frames, (ww, wh), pl, Image)
+
+    def _compose_into_renderer(self, layers=None, key=None, apply=True):
+        """合成 → 交给渲染层出图（compat = 键色抠色 + Label；alpha = 保留 RGBA 推位图）。
+
+        这是 ② 与 ① 的接口点：合成只做一次，抠色/贴图/推位图的差别全部留在 Renderer 里。
+        key 给定则复用现有抠色键（动图逐帧不重算，避免每帧统计颜色）；
+        apply=False 表示窗口级设置不动，只换帧（动图节拍路径）。
+        """
+        renderer = _renderer_of(self)
+        frames = []
+        canvas = self._compose_frame(layers, out_frames=frames)
+        if canvas is None:
+            return None
+        if key is not None:
+            self.key_rgb = key
+        else:
+            raws = [r for r in frames if r is not None]
+            self.key_rgb = renderer.pick_key(raws or [canvas], self._Image)
+        flat = renderer.flatten(canvas, self.key_rgb, self._Image)
+        self.raw_img = flat.copy() if hasattr(flat, 'copy') else flat
+        old = getattr(self, 'img', None)
+        self.img = renderer.to_photo(flat)
+        if apply:
+            renderer.apply_window(self.key_rgb)
+            renderer.apply_label(getattr(self, 'label', None), self.img, self.key_rgb)
+        else:
+            renderer.apply_photo_only(getattr(self, 'label', None), self.img)
+        try:
+            self.w, self.h = self.img.width(), self.img.height()
+        except Exception:
+            self.w, self.h = canvas.size
+        self._canvas_size = (int(self.w), int(self.h))
+        if old is not None:
+            renderer.release(old)
+        return canvas
+
+    def _move_to(self, x, y, w=None, h=None):
         """主定位路径：SetWindowPos 一次完成「移动 + HWND_TOPMOST」，
         顺带 SWP_NOACTIVATE。窗口显示/隐藏统一由 deiconify/withdraw 管理
         （避免 Tk withdraw 状态与 SWP_SHOWWINDOW 状态机打架）。
-        维护 _x/_y 镜像（Tk 的 winfo 在此之后可能过时，以镜像为准）。"""
+        维护 _x/_y 镜像（Tk 的 winfo 在此之后可能过时，以镜像为准）。
+
+        v2.0-②：多图层时 w/h 给出「合成画布」尺寸 → 一次 SetWindowPos 同时移动 + 改尺寸
+        （候选框变宽时画布跟着变宽，两侧图层自然拉开，无中间态、无残影）。
+        单图层时 w/h 不传 → 严格保持 v1.6 的 SWP_NOSIZE 行为。
+        """
         top = self._top_hwnd()
         if not top:
             return False
         try:
-            ok = user32.SetWindowPos(top, HWND_TOPMOST, int(x), int(y), 0, 0,
-                                     SWP_NOACTIVATE | SWP_NOSIZE)
+            if w is None or h is None:
+                ok = user32.SetWindowPos(top, HWND_TOPMOST, int(x), int(y), 0, 0,
+                                         SWP_NOACTIVATE | SWP_NOSIZE)
+            else:
+                ok = user32.SetWindowPos(top, HWND_TOPMOST, int(x), int(y), int(w), int(h),
+                                         SWP_NOACTIVATE)
         except Exception:
             return False
         if ok:
@@ -5141,12 +6125,14 @@ class FollowOverlay:
                     cw = rect.right - rect.left
                     ch = rect.bottom - rect.top
                     if cw > 0 and ch > 0 and ch < cw * 4 and cw < 1300 and ch < 1000:
-                        x, y = self._calc_target(rect)
-                        # 死区：窗口已显示且位置变化 <2px 不移动（省一次系统调用与重绘）
-                        if self.visible and abs(x - self._x) < 2 and abs(y - self._y) < 2:
+                        x, y, w, h, size_changed = self._plan_targets(rect)
+                        # 死区：窗口已显示、位置变化 <2px 且画布尺寸未变 → 不移动
+                        # （省一次系统调用与重绘；尺寸变了必须走完整路径，否则窗口停在旧宽度）
+                        if (self.visible and not size_changed
+                                and abs(x - self._x) < 2 and abs(y - self._y) < 2):
                             self._apply_layer(self._cached_hwnd)  # 成功定位后同步图层（事件驱动，频率低）
                             return True
-                        moved = self._move_to(x, y)
+                        moved = self._move_to(x, y, w, h)
                         self._pos_dirty = False
                         if not self.visible:
                             self.root.deiconify()
