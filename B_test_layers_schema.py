@@ -1046,6 +1046,35 @@ def test_wizard(tmp, gui_ok):
         check('G20 第 0 层不可删（主层保底）',
               _layer_delete_main_guard(wiz), '主层仍在')
 
+        # ---- 上移 / 下移（改叠放顺序 z；换主层时顶层兼容字段跟着同步）----
+        wiz.cfg['layers'] = [R.normalize_layer({'image': a, 'anchor': 'left_edge', 'z': 0}),
+                             R.normalize_layer({'image': b, 'anchor': 'right_edge', 'z': 1}),
+                             R.normalize_layer({'image': c, 'anchor': 'center', 'z': 2})]
+        wiz._layer_sel = 0
+        wiz._layer_sync_from_cfg()
+        names0 = [os.path.basename(x['image']) for x in wiz.cfg['layers']]
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(2)
+        wiz._layer_move(-1)
+        names1 = [os.path.basename(x['image']) for x in wiz.cfg['layers']]
+        check('G23 上移：第 3 层与第 2 层换序',
+              names1[0] == names0[0] and names1[1] == names0[2] and names1[2] == names0[1],
+              f'{names0} → {names1}')
+        check('G24 换序后 z 重排为 0/1/2',
+              [int(x.get('z', -1)) for x in wiz.cfg['layers']] == [0, 1, 2],
+              str([x.get('z') for x in wiz.cfg['layers']]))
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(1)
+        wiz._layer_move(-1)
+        _l0 = wiz.cfg['layers'][0]
+        check('G25 换主层后顶层 side 同步新主层的锚点',
+              wiz.cfg.get('side') == R.side_from_anchor(_l0.get('anchor')),
+              f'side={wiz.cfg.get("side")} anchor={_l0.get("anchor")} '
+              f'img={os.path.basename(_l0.get("image", ""))}')
+        check('G26 换主层后顶层 image 指向新主层',
+              os.path.normpath(wiz.cfg.get('image', '')) == os.path.normpath(_l0['image']),
+              f'{wiz.cfg.get("image")} vs {_l0["image"]}')
+
         # 保存回 cfg：schema/layers 都要带出去
         wiz._save_and_start()
         check('G21 保存后 cfg 带 schema:2', int(wiz.cfg.get('schema', 0)) == 2,
