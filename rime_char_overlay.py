@@ -4960,20 +4960,31 @@ class ConfigWizard:
           · self.adv_body       = 内容区（各列都在它下面），折叠时 pack_forget
         折叠后由 _fit_window_height() 重算：窗口跟着变矮、滚动条按需收回。列骨架
         (adv_cols / _adv_col_of) 与展开态完全一致，折叠只是「不 pack 内容区」。
+
+        v2.0-R15（第四轮 N1）：标题按钮由「9pt 窄字条」改成**整行大按钮**（可点区域
+        显著变大），并且 `_adv_collapsed` 初值由 False 改 True —— 向导打开时**默认折叠**
+        （窗口直接是矮的那一版，用户想调 ⑧~⑭ 再点标题展开）。
         """
         n = int(self._adv_column_count())
         self.adv_area = tk.Frame(body)
         self.adv_area.pack(fill='x', pady=(8, 0))
         head = tk.Frame(self.adv_area)
         head.pack(fill='x')
-        self.btn_adv_toggle = tk.Button(head, text='', font=('Microsoft YaHei', 9),
-                                        anchor='w', relief='flat', bd=0, fg='#555',
-                                        activeforeground='#000', cursor='hand2',
+        # v2.0-R15（用户第四轮原话「折叠按钮做大点；默认折叠状态。」）：
+        #   ① 标题按钮做成**整行大按钮**：font 11 bold + padx=14/pady=6 内边距 +
+        #      relief='groove' 可见按钮外观 + fill='x'/expand=True 占满整行 →
+        #      可点区域从 R12 的 271×26px（7046 px²）变成整行，点哪儿都能展开/折叠。
+        #   ② 初态改折叠：`_adv_collapsed = True`（见本函数末尾），向导打开就是矮的那版。
+        self.btn_adv_toggle = tk.Button(head, text='', font=('Microsoft YaHei', 11, 'bold'),
+                                        anchor='w', relief='groove', bd=2,
+                                        padx=14, pady=6, bg='#eef2f7', fg='#333',
+                                        activebackground='#dde6f0', activeforeground='#000',
+                                        cursor='hand2', justify='left',
                                         command=self._toggle_adv_collapse)
-        self.btn_adv_toggle.pack(side='left')
+        self.btn_adv_toggle.pack(side='left', fill='x', expand=True)
         self.lbl_adv_hint = tk.Label(head, text='（折叠只是收起来，设置不会丢）',
                                      fg='#999', font=('Microsoft YaHei', 8))
-        self.lbl_adv_hint.pack(side='left', padx=(6, 0))
+        self.lbl_adv_hint.pack(side='left', padx=(8, 0))
         self.adv_body = tk.Frame(self.adv_area, padx=8, pady=6)
         self.adv_body.pack(fill='x')
         cols = []
@@ -4990,8 +5001,8 @@ class ConfigWizard:
                 ('layer', 'fx', 'feather', 'lay', 'skin', 'start'))}
         col_of = {k: max(0, min(v, n - 1)) for k, v in col_of.items()}
         self._adv_col_of = col_of
-        self._adv_collapsed = False
-        self._apply_adv_collapsed()       # 初态 = 展开（标题行/内容区与状态一致）
+        self._adv_collapsed = True
+        self._apply_adv_collapsed()       # v2.0-R15：初态 = 折叠（用户「默认折叠状态」）
         return cols, col_of
 
     # ---------- v2.0-R12 布局：⚙ 高级设置可折叠 ----------
