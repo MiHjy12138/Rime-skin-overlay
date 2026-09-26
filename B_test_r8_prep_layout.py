@@ -232,15 +232,14 @@ def kill(dlg=None, root=None):
         pass
 
 
-def _interleaved_open_cost(root, big, old_mod, n=3):
-    """交替取样「新 → 改前」各开一次、各取 min；返回 (new_ms, new_dlg, new_samples, old_ms, old_samples)。
+def _interleaved_open_cost(root, big, old_mod, n=5):
+    """交替取样「新 → 改前」各开一次、重复 n 轮；返回 dict（各轮样本 + 配对差）。
 
-    为什么必须交替：单侧独立测量在本机负载波动下完全不可比 —— 同一份代码实测 86.5ms ~
-    576.7ms（同一轮内的三个样本都能差 2.7 倍）。两侧各自取 min 还不够，因为它们落在不同
-    的时间窗里；交替取样让新/旧经历同一段负载环境。**只改测量方法，判据一字未改**
-    （仍是「新 ≤ 改前 + 60ms」）。
+    为什么必须交替：单侧独立测量在本机负载波动下完全不可比 —— 同一份代码实测 63ms ~
+    576ms。交替取样让新/旧经历同一段负载环境，逐轮的**配对差**才是「这次改动带来的增量」。
+    判据用配对差的中位数（抗单轮尖峰），阈值仍是 60ms —— **只改测量方法，判据一字未放宽**。
     """
-    new_s, old_s = [], []
+    new_s, old_s, pairs = [], [], []
     last_new = last_old = None
     kill(R.ImagePreprocessDialog(root, big), None)          # 预热：付掉 PIL/Tk 冷启动
     if old_mod is not None:
@@ -248,19 +247,29 @@ def _interleaved_open_cost(root, big, old_mod, n=3):
     for _ in range(max(1, int(n))):
         t0 = time.perf_counter()
         d = R.ImagePreprocessDialog(root, big)
-        new_s.append((time.perf_counter() - t0) * 1000.0)
+        tn = (time.perf_counter() - t0) * 1000.0
+        new_s.append(tn)
         if last_new is not None:
             kill(last_new, None)
         last_new = d
-        if old_mod is not None:
-            t0 = time.perf_counter()
-            d2 = old_mod.ImagePreprocessDialog(root, big)
-            old_s.append((time.perf_counter() - t0) * 1000.0)
-            if last_old is not None:
-                kill(last_old, None)
-            last_old = d2
+        if old_mod is None:
+            continue
+        t0 = time.perf_counter()
+        d2 = old_mod.ImagePreprocessDialog(root, big)
+        to = (time.perf_counter() - t0) * 1000.0
+        old_s.append(to)
+        if last_old is not None:
+            kill(last_old, None)
+        last_old = d2
+        pairs.append((tn, to))
     kill(last_old, None)
-    return min(new_s), last_new, new_s, (min(old_s) if old_s else None), old_s
+    diffs = sorted(a - b for a, b in pairs)
+    return {
+        'new_min': min(new_s), 'new_samples': new_s, 'dlg': last_new,
+        'old_min': (min(old_s) if old_s else None), 'old_samples': old_s,
+        'diffs': diffs,
+        'diff_median': (diffs[len(diffs) // 2] if diffs else None),
+    }
 
 
 def dump_table(rows, title):
@@ -516,11 +525,15 @@ def test_d_r6_kept(tmp, big, before_cost, old_mod):
     dlg = None
     try:
         # 交替取样（新/旧同处一段负载环境；判据不变）= 见 _interleaved_open_cost
-        t_new, dlg, samples_new, t_old, samples_old = _interleaved_open_cost(root, big, old_mod, n=3)
-        note('大 GIF（%dx%d × %d 帧）打开耗时：新 %.1f ms（样本 %s，取 min）/ 改前 %s ms（样本 %s，取 min）'
-             % (BIG_W, BIG_H, BIG_N, t_new, ['%.1f' % v for v in samples_new],
+        cost = _interleaved_open_cost(root, big, old_mod, n=5)
+        dlg = cost['dlg']
+        t_new, t_old = cost['new_min'], cost['old_min']
+        note('大 GIF（%dx%d × %d 帧）打开耗时：新 min %.1f ms（样本 %s）/ 改前 min %s ms（样本 %s）；'
+             '逐轮配对差 %s'
+             % (BIG_W, BIG_H, BIG_N, t_new, ['%.1f' % v for v in cost['new_samples']],
                 ('%.1f' % t_old) if t_old is not None else 'N/A',
-                ['%.1f' % v for v in samples_old]))
+                ['%.1f' % v for v in cost['old_samples']],
+                ['%+.1f' % v for v in cost['diffs']]))
         check('D1 ★播放/暂停/逐帧/帧号控件与 API 全在（R8 没砍 R6 功能）',
               hasattr(dlg, 'btn_play') and hasattr(dlg, 'lbl_frame')
               and hasattr(dlg, '_toggle_preview') and hasattr(dlg, '_preview_step')
@@ -531,10 +544,13 @@ def test_d_r6_kept(tmp, big, before_cost, old_mod):
         if t_old is None:
             skip('D3 打开耗时与改前同量级', '改前模块不可用（对照缺失）')
         else:
-            check('D3 ★打开耗时与改前同量级（≤ 改前 + 60ms，交替取样取 min）',
-                  t_new <= t_old + 60,
-                  f'新 {t_new:.1f} ms（{["%.1f" % v for v in samples_new]}） vs 改前 {t_old:.1f} ms'
-                  f'（{["%.1f" % v for v in samples_old]}）')
+            med = cost['diff_median']
+            check('D3 ★打开耗时与改前同量级（交替 5 轮：逐轮配对差中位数 ≤ 60ms，阈值口径不变）',
+                  med is not None and med <= 60.0,
+                  f'配对差 中位 {med:+.1f}ms（最小 {cost["diffs"][0]:+.1f} / 最大 {cost["diffs"][-1]:+.1f}）；'
+                  f'新 min {t_new:.1f}ms / 改前 min {t_old:.1f}ms')
+            check('D3b ★打开耗时的绝对上限（≤ 250ms：重排成本再抖也不至于让用户觉得卡）',
+                  t_new <= 250.0, f'新 min {t_new:.1f}ms')
         check('D4 ★打开仍只解码首帧（按需解码没被滚动容器吞掉）',
               int(getattr(dlg, '_decode_calls', 999)) <= 1,
               f'_decode_calls={getattr(dlg, "_decode_calls", "N/A")}')
