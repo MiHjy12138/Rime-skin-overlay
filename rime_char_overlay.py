@@ -6218,6 +6218,14 @@ class FollowOverlay:
         self.anim_after = None          # after() 句柄（停止/重载时 cancel）
         self._frame_cache = collections.OrderedDict()  # 帧号 → PhotoImage（LRU）
         self._base_h = 300.0            # 帧缩放基准高度（base_height × scale）
+        # ===== ② 套层运行时缓存/记账（v2.0 R3）=====
+        # _dims_cache：各图层显示尺寸，键 (图路径, base_height×scale) → (w,h)。
+        #   定位路径每帧都要问「各层多大」，缓存前是每帧每层一次 Image.open+解码+LANCZOS
+        #   缩放（实测 3 层 400x600 约 30ms/帧）→ 事件节拍被拖到 45ms+，图跟不上候选框。
+        #   失效点只有一个：load_char（换图/切皮肤/滚轮缩放/热重载都走它）。
+        self._dims_cache = {}
+        self._composed_plan = None      # 最近一次「已合成」的布局指纹 (ww, wh, placements)
+        self._applied_size = (0, 0)     # 最近一次真正落到窗口上的画布尺寸 (w, h)
         self.load_char()
 
         self.label = self.renderer.make_label(self.root, self.img, self.key_rgb)
@@ -6283,6 +6291,10 @@ class FollowOverlay:
         self.anim_src = None
         self.anim_n = 0
         self.anim_idx = 0
+        # R3：图层显示尺寸缓存与「已合成布局」记账一律作废 —— 本函数是「图/配置变了」的唯一入口
+        # （换图、切皮肤、滚轮缩放、热重载、预处理保存都走这里），失效点集中在此最好审计。
+        self._dims_cache = {}
+        self._composed_plan = None
         old_frames = list(getattr(self, '_frame_cache', {}).values())
         self._frame_cache.clear()
         if not self.PIL:
@@ -6781,6 +6793,7 @@ class FollowOverlay:
         geometry 仅在此类低频路径使用；高频跟随一律 SetWindowPos。"""
         try:
             self.root.geometry(f'{self.w}x{self.h}+{int(self._x)}+{int(self._y)}')
+            self._applied_size = (int(self.w), int(self.h))   # R3：geometry 也是真改窗口尺寸
         except Exception:
             pass
         # 尺寸/位置变了 → alpha 下位图要重推一次（compat 无操作）
@@ -6834,29 +6847,73 @@ class FollowOverlay:
             pass
         return getattr(self, '_last_rect', None) or (0, 0, 0, 0)
 
+    def _layer_display_size(self, path, base_h, Image):
+        """单层按 base_h 缩放后的显示尺寸（与 _layer_raw_frame / load_char 同一口径）。
+
+        只在缓存未命中时调用 → 每个 (图, 缩放) 组合一生只付一次「open+解码+LANCZOS」的钱。
+        """
+        try:
+            with Image.open(path) as _im:
+                src = _im.convert('RGBA')
+            if src.height > 0:
+                ratio = base_h / src.height
+                src = src.resize((max(1, int(src.width * ratio)), max(1, int(base_h))),
+                                 Image.LANCZOS)
+            return int(src.size[0]), int(src.size[1])
+        except Exception:
+            return 0, 0
+
     def _layer_dims(self, Image=None, layers=None):
-        """各图层的显示尺寸 [(w,h), ...]（与 load_char 同一缩放口径：高度 = base_height×scale）。"""
+        """各图层的显示尺寸 [(w,h), ...]（与 load_char 同一缩放口径：高度 = base_height×scale）。
+
+        R3：结果按 (图路径, base_height×scale) 缓存 —— 尺寸只随「图/缩放」变，不随时间变。
+        缓存前这里是定位路径上最大的一笔开销：每帧每层一次 Image.open + 解码 + LANCZOS
+        缩放（实测 3 层 400x600 ≈ 30ms/帧），而定位节拍只有 16ms → 图永远慢候选框一拍。
+        失效点：load_char（唯一入口）清空缓存；缓存按本次用到的键裁剪，不会随皮肤切换涨。
+        只缓存**量成功**的结果：坏图/缺图保持改造前的「每帧重试」语义（F3 已知遗留），
+        一旦图恢复可用（或用户重选图 → load_char）就能自动补上，不会把一次失败钉死。
+        """
         Image = Image or getattr(self, '_Image', None)
         layers = layers if layers is not None else self._layer_specs()
         if Image is None:
             return []
         base_h = self.cfg.get('base_height', 300)
-        out = []
+        cache = getattr(self, '_dims_cache', None)
+        if cache is None:
+            cache = self._dims_cache = {}
+        out, live = [], set()
         for ld in layers:
-            w = h = 0
-            try:
-                with Image.open(ld.get('image')) as _im:
-                    src = _im.convert('RGBA')
-                bh = base_h * float(ld.get('scale', 1.0) or 1.0)
-                if src.height > 0:
-                    ratio = bh / src.height
-                    src = src.resize((max(1, int(src.width * ratio)), max(1, int(bh))),
-                                     Image.LANCZOS)
-                w, h = int(src.size[0]), int(src.size[1])
-            except Exception:
-                w = h = 0
-            out.append((w, h))
+            path = str(ld.get('image') or '')
+            bh = base_h * float(ld.get('scale', 1.0) or 1.0)
+            key = (path, round(bh, 4))
+            wh = cache.get(key)
+            if wh is None:
+                wh = self._layer_display_size(path, bh, Image)
+                if wh[0] > 0 and wh[1] > 0:
+                    cache[key] = wh
+            live.add(key)
+            out.append(wh)
+        if len(cache) != len(live):
+            for k in [k for k in cache if k not in live]:
+                cache.pop(k, None)
         return out
+
+    def _layer_plan(self, rect):
+        """一帧的布局三件套 (layers, dims, plan) —— 同一帧只解析一次，供定位与合成共用。
+
+        R3 关键点：定位（窗口落位）与合成（画布内各层落点）必须用**同一份 rect 快照**。
+        以前合成自己再调 _layout_rect() 重新读一次候选框矩形，而两次读之间隔着 N 次图层
+        解码（实测 15~44ms）—— 打字时候选框在这期间移动/变宽，就会出现「窗口按旧矩形、
+        画面按新矩形」的整层错位（实测差 40px）。
+        """
+        layers = self._layer_specs()
+        if self._layers_active():
+            dims = self._layer_dims(self._Image, layers)
+        else:
+            dims = [(int(getattr(self, 'w', 0) or 0), int(getattr(self, 'h', 0) or 0))]
+        plan = plan_layer_layout(layers, dims, rect,
+                                 main_off=(getattr(self, 'off_x', 0), getattr(self, 'off_y', 0)))
+        return layers, dims, plan
 
     def _calc_layer_targets(self, rect):
         """② 步 3：一次算出全部图层的目标坐标（返回窗口位置/尺寸 + 各层画布内偏移）。
@@ -6864,26 +6921,22 @@ class FollowOverlay:
         单图层时窗口尺寸取 self.w/self.h（与 v1.6 的 PhotoImage 尺寸同源），
         保证 _calc_target 结果与改造前逐位一致 —— 老路径零漂移。
         """
-        layers = self._layer_specs()
-        if self._layers_active():
-            dims = self._layer_dims(self._Image, layers)
-        else:
-            dims = [(int(getattr(self, 'w', 0) or 0), int(getattr(self, 'h', 0) or 0))]
-        return plan_layer_layout(layers, dims, rect,
-                                 main_off=(getattr(self, 'off_x', 0), getattr(self, 'off_y', 0)))
+        return self._layer_plan(rect)[2]
 
     def _plan_targets(self, rect):
         """候选框 rect → 本次要应用的 (x, y, w, h, size_changed)。
 
         单层：w/h 返回 None → _move_to 走 SWP_NOSIZE（与 v1.6 逐位一致），size_changed 恒 False。
-        多层：w/h = 合成画布尺寸；画布尺寸变了就先把位图重新合成（只在候选框宽度
-        变化时发生，属低频），并同步一次 Tk geometry 记账 —— 这就是「两侧图层自动
-        拉开/收拢」的实现点：位置与尺寸在同一次 SetWindowPos 里一起生效，无中间态。
+        多层：w/h = 合成画布尺寸；只有「布局指纹」变了才重合成（尺寸或各层落点变化 ——
+        候选框纯平移不重合成，因为平移不改变画布内相对落点），并同步一次 Tk geometry 记账。
 
+        size_changed 的判据是「窗口当前尺寸 != 目标画布尺寸」，不是「画布重新合成过」——
+        动图节拍会在不移动窗口的情况下换画布，两者混用会让窗口尺寸停摆（R3 修）。
         size_changed 必须回传给调用方：候选框"只变宽不移动"时窗口坐标一模一样，
         只看坐标的死区判断会把整条 resize 路径吞掉（实测窗口会停在旧宽度）。
         """
-        wx, wy, ww, wh, _pl = self._calc_layer_targets(rect)
+        layers, dims, plan = self._layer_plan(rect)
+        wx, wy, ww, wh, pl = plan
         if not self._layers_active():
             return int(wx), int(wy), None, None, False
         ww, wh = int(ww), int(wh)
@@ -6891,10 +6944,10 @@ class FollowOverlay:
             # 布局算不出尺寸（所有图层图都缺失/尺寸为 0）→ 保持窗口现状，
             # 绝不能把 SetWindowPos 的 cx/cy 传 0（那会把窗口缩成一条线）
             return int(wx), int(wy), None, None, False
-        changed = (ww, wh) != tuple(getattr(self, '_canvas_size', None) or (0, 0))
-        if changed:
+        plan_key = (ww, wh, tuple(pl))
+        if plan_key != getattr(self, '_composed_plan', None):
             try:
-                self._compose_into_renderer()
+                self._compose_into_renderer(layers, sizes=dims, rect=rect, plan_key=plan_key)
             except Exception as e:
                 try:
                     _write_log(f'[套层] 候选框变宽后重合成失败: {e}')
@@ -6904,7 +6957,8 @@ class FollowOverlay:
                 self.root.geometry(f'{ww}x{wh}+{int(wx)}+{int(wy)}')
             except Exception:
                 pass
-        return int(wx), int(wy), ww, wh, changed
+        size_changed = (ww, wh) != tuple(getattr(self, '_applied_size', None) or (0, 0))
+        return int(wx), int(wy), ww, wh, size_changed
 
     def _rect_changed(self):
         """候选框矩形（位置或尺寸）与上次已应用的记录不同 → True（O(1) 一次 GetWindowRect）。
@@ -6944,11 +6998,14 @@ class FollowOverlay:
         except Exception:
             return None
 
-    def _compose_frame(self, layers=None, sizes=None, out_frames=None):
+    def _compose_frame(self, layers=None, sizes=None, out_frames=None, rect=None, plan_out=None):
         """② 步 4：把全部图层合成成一张 RGBA 画布（单窗多图，各层自身 alpha 保留）。
 
         返回 canvas（RGBA 图）；无有效图层时返回 None。
         out_frames 非空时回传各层原始帧（抠色键要用），避免重复解码。
+        rect 非空时用调用方给的候选框矩形快照（定位路径必须传：同一帧只能有一个矩形），
+        否则回退到自己读一次缓存句柄矩形（动图节拍/加载路径用）。
+        plan_out 非空时回传本次布局指纹 (ww, wh, placements)，供调用方做「要不要重合成」的判断。
         """
         if not self.PIL:
             return None
@@ -6957,7 +7014,8 @@ class FollowOverlay:
         if not layers:
             return None
         dims = sizes if sizes is not None else self._layer_dims(Image, layers)
-        rect = self._layout_rect()
+        if rect is None:
+            rect = self._layout_rect()
         wx, wy, ww, wh, pl = plan_layer_layout(
             layers, dims, rect,
             main_off=(getattr(self, 'off_x', 0), getattr(self, 'off_y', 0)))
@@ -6966,20 +7024,31 @@ class FollowOverlay:
         frames = [self._layer_raw_frame(i, ld, Image) for i, ld in enumerate(layers)]
         if out_frames is not None:
             out_frames.extend(frames)
+        if plan_out is not None:
+            plan_out.append((int(ww), int(wh), tuple(pl)))
         return compose_layers(frames, (ww, wh), pl, Image)
 
-    def _compose_into_renderer(self, layers=None, key=None, apply=True):
+    def _compose_into_renderer(self, layers=None, key=None, apply=True, sizes=None, rect=None,
+                               plan_key=None):
         """合成 → 交给渲染层出图（compat = 键色抠色 + Label；alpha = 保留 RGBA 推位图）。
 
         这是 ② 与 ① 的接口点：合成只做一次，抠色/贴图/推位图的差别全部留在 Renderer 里。
         key 给定则复用现有抠色键（动图逐帧不重算，避免每帧统计颜色）；
         apply=False 表示窗口级设置不动，只换帧（动图节拍路径）。
+        sizes/rect/plan_key 由定位路径传入：同一帧共用一份布局输入（R3：防「窗口按旧矩形、
+        画面按新矩形」的错位），并让「已合成布局」记账与实际合成保持一致。
         """
         renderer = _renderer_of(self)
         frames = []
-        canvas = self._compose_frame(layers, out_frames=frames)
+        plan_out = []
+        canvas = self._compose_frame(layers, sizes=sizes, out_frames=frames, rect=rect,
+                                     plan_out=plan_out)
         if canvas is None:
             return None
+        if plan_key is not None:
+            self._composed_plan = tuple(plan_key)
+        elif plan_out:
+            self._composed_plan = plan_out[-1]
         if key is not None:
             self.key_rgb = key
         else:
@@ -7027,6 +7096,8 @@ class FollowOverlay:
             return False
         if ok:
             self._x, self._y = int(x), int(y)
+            if w is not None and h is not None:
+                self._applied_size = (int(w), int(h))   # R3：窗口尺寸记账（判 size_changed 用）
         return bool(ok)
 
     def _read_cached_rect(self):
