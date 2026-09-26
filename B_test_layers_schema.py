@@ -1028,9 +1028,9 @@ def test_wizard(tmp, gui_ok):
         check('G06 该层 offset 已并入上方 ⑤⑥ 滑条（图层区不再自带独立控件）',
               (not hasattr(wiz, 'var_lay_offx')) and (not hasattr(wiz, 'var_lay_offy'))
               and hasattr(wiz, 'var_offx') and hasattr(wiz, 'var_offy'))
-        check('G07 缩放/翻转同样复用上方 ④ 与 ③（翻转与图层区共用 var_flip）',
+        check('G07 缩放复用上方 ④；翻转复用通用区 var_flip（R13 起在通用区、统一管所有图层）',
               (not hasattr(wiz, 'var_lay_scale')) and hasattr(wiz, 'var_scale')
-              and hasattr(wiz, 'var_flip'))
+              and hasattr(wiz, 'var_flip') and hasattr(wiz, 'chk_flip'))
         wiz.layer_list.selection_clear(0, 'end')
         wiz.layer_list.selection_set(1)
         wiz._on_layer_select()

@@ -215,8 +215,13 @@ def test_ui_move(tmp, saved):
         h = wiz.root.winfo_reqheight()
         check('A06 窗口需求高度仍远小于 R1 基线（R11 加回 ③ 一行后 ≤1038）', h <= 1038,
               f'reqheight={h}（R1 基线 1038；R4 横排后 867，R11 回退后 ~914）')
-        check('A07 图层区仍有翻转控件（var_flip，作用于当前选中层）',
-              hasattr(wiz, 'var_flip') and hasattr(wiz, 'var_layer_anchor'))
+        # R13 需求回退：水平翻转也已从 ⑫ 图层区搬回通用区（用户「符合，回通用区」），
+        # 且与 ③ 一样统一管所有图层 → 旧文案「图层区仍有翻转控件（作用于当前选中层）」
+        # 已不成立，改为「翻转复用通用区 var_flip（chk_flip）」；var_layer_anchor 仍保留为
+        # 当前层 anchor 的回显镜像（R11 起）。
+        check('A07 翻转复用 var_flip（R13 起在通用区 chk_flip、统一管所有图层）',
+              hasattr(wiz, 'var_flip') and hasattr(wiz, 'chk_flip')
+              and hasattr(wiz, 'var_layer_anchor'))
     finally:
         _kill(wiz)
 

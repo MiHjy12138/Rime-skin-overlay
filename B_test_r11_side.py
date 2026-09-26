@@ -18,6 +18,11 @@
   D 单图层零漂移：仍走 v1.6 单层路径，三态贴边位置 left < center < right
   E 判别力：禁用「统一同步」后 B 段核心断言必须不成立（证明不是恒真断言）
 
+> v2.0-R13 需求回退（2026-09-26 追加）：用户「符合，回通用区」要求水平翻转也从 ⑫ 图层区
+> 搬回通用区、与 ③ 一样统一管所有图层 —— 本脚本 A08 原来写的是「图层区仍可调当前层翻转
+> （写选中层、不写主层）」，该前提被 R13 推翻，已按需求回退改写为「翻转在通用区 + 勾一下
+> 全部层一起翻（含主层）」，理由同 R11：不许静默删整段、也不许改成恒真断言。
+
 红线：只读被测模块；不写真实 config.json / skin.json（save_config 打桩、SKINS_DIR
       指临时目录）；文件对话框与模态框全部打桩。
 
@@ -88,6 +93,19 @@ def _all_widgets(win, out=None):
         out.append(w)
         _all_widgets(w, out)
     return out
+
+
+def _descendant(w, anc):
+    """w 是否在 anc 的子树里（沿 master 链向上找）—— R13 起用来验「翻转控件在通用区」"""
+    cur = w
+    while cur is not None:
+        if cur is anc:
+            return True
+        try:
+            cur = cur.master
+        except Exception:
+            return False
+    return False
 
 
 def _radio_texts(wiz, var):
@@ -220,14 +238,20 @@ def test_structure(tmp, saved):
         check('A07 通用区 ④⑤⑥ 仍在（只搬 ③，不误删）',
               hasattr(wiz, 'var_scale') and hasattr(wiz, 'var_offx')
               and hasattr(wiz, 'var_offy'))
-        # 翻转仍是「当前选中层」参数（与 ④⑤⑥ 同族）——回退贴边时不动它
+        # R13 需求回退：翻转也已从 ⑫ 图层区搬回通用区（用户追加「符合，回通用区」），
+        # 语义与 ③ 一致 = 统一管所有图层 —— 旧断言「图层区仍可调当前层翻转（写选中层、
+        # 不写主层）」的前提被推翻，按需求回退改写为「翻转在通用区 + 勾一下全部层一起翻」。
         _select(wiz, 1)
+        flip_ws = [w for w in _all_widgets(wiz.root)
+                   if w.winfo_class() == 'Checkbutton'
+                   and str(w.cget('variable')) == str(wiz.var_flip)]
+        in_general = bool(flip_ws) and any(_descendant(w, wiz.top_block) for w in flip_ws)
         wiz.var_flip.set(True)
-        wiz._on_layer_flip()
-        check('A08 图层区仍可调「当前层」水平翻转（写选中层，不写主层）',
-              bool(wiz.cfg['layers'][1].get('flip')) is True
-              and bool(wiz.cfg['layers'][0].get('flip')) is False,
-              f"l1.flip={wiz.cfg['layers'][1].get('flip')} "
+        wiz._on_flip_change()
+        check('A08 ★R13：翻转控件在通用区且统一管所有图层（含主层）',
+              in_general and bool(wiz.cfg['layers'][1].get('flip')) is True
+              and bool(wiz.cfg['layers'][0].get('flip')) is True,
+              f"在通用区={in_general} l1.flip={wiz.cfg['layers'][1].get('flip')} "
               f"l0.flip={wiz.cfg['layers'][0].get('flip')}")
         check('A09 图层区保留说明行（讲清贴边统一在通用区改）',
               any(('统一' in t) or ('通用区' in t) for t in _texts_like(wiz, '贴边')),
