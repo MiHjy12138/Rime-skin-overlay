@@ -254,6 +254,35 @@ def inventory(wiz):
     return inter, binds, titles
 
 
+def inventory_by_var(wiz):
+    """按「控件类 + 绑定变量」聚合的交互控件清单（**不看 text 文案**）。
+
+    v2.0-R10/R11/R13：⑪ 渲染模式单选删除、图层区「选中层贴哪儿」单选撤销、翻转勾选框搬家 ——
+    这几轮改的都是**文案或位置**，控件的类与变量绑定没变。E06/E07 的「控件一个不少」对照因此
+    改走这条口径：只比 (类, 变量) 的多重集，文案改写不再误报「丢控件」；而控件真的消失
+    （变量绑定数变少）仍会被抓出来。
+    """
+    vmap = _var_attr_map(wiz)
+    inter, binds = {}, {}
+    for w in _all_widgets(wiz.root):
+        try:
+            cls = w.winfo_class()
+        except Exception:
+            continue
+        if cls not in ('Radiobutton', 'Checkbutton', 'Scale', 'Button', 'Listbox',
+                       'Entry', 'Canvas'):
+            continue
+        try:
+            var = str(w.cget('variable'))
+        except Exception:
+            var = ''
+        key_var = vmap.get(var, var) if var else ''
+        inter[(cls, key_var)] = inter.get((cls, key_var), 0) + 1
+        if key_var:
+            binds[key_var] = binds.get(key_var, 0) + 1
+    return inter, binds
+
+
 def _find_widget(wiz, cls=None, text_contains=None):
     for w in _all_widgets(wiz.root):
         try:
@@ -358,9 +387,30 @@ def section_E(tmp):
                         pass
                 col_child_max.append(cmax)
                 widest = max(widest, cmax)
-            check('E01 ★窗口需求高度确实变小（且 < 基线）',
-                  h < pre_h and h <= 900,
-                  f'R4 前 {pre_h} → HEAD {h}（−{pre_h - h}）；要求 < 基线且 ≤900')
+            # v2.0-R11/R12（写死阈值的前提被推翻）：① 高度 +29px（③ 行 + 图层区说明行）；
+            # ② R12 起 ⚙ 高级设置可折叠。单一的 900 已不成立 → 改为**两态**断言：
+            # 展开态 < R4 前基线且 ≤ 工作区高（按钮行仍在窗内）；折叠态明显更矮、且能回到展开态。
+            workh_e = int(R.screen_work_area_height(w.root) or 0)
+            h_open = h
+            h_closed = h_reopen = -1
+            try:
+                w._toggle_adv_collapse(True)
+                w.root.update_idletasks()
+                h_closed = int(w.root.winfo_reqheight())
+                w._toggle_adv_collapse(False)
+                w.root.update_idletasks()
+                h_reopen = int(w.root.winfo_reqheight())
+            except Exception as _e:
+                note(f'（折叠两态测量失败：{_e!r}）')
+            btm_open = _btn_row_bottom(w)
+            check('E01 ★窗口两态：展开态 < R4 前基线且 ≤ 工作区（按钮行在窗内），'
+                  '折叠态明显更矮且可回展开',
+                  h_open < pre_h and 0 < h_open <= workh_e and h_closed > 0
+                  and h_closed < h_open and abs(h_reopen - h_open) <= 2
+                  and 0 < btm_open <= workh_e,
+                  f'R4 前 {pre_h} → 展开 {h_open}（−{pre_h - h_open}）/ 折叠 {h_closed}'
+                  f'（−{h_open - h_closed}）/ 再展开 {h_reopen}；工作区={workh_e} '
+                  f'按钮行底={btm_open}')
             check('E02 ★窗口需求宽度也确实变小（横排后不被顶宽）',
                   ww < pre_w, f'R4 前 {pre_w} → HEAD {ww}（−{pre_w - ww}）')
             adv_block = int(adv.winfo_reqheight())
@@ -379,23 +429,58 @@ def section_E(tmp):
             try:
                 wp2 = make_wiz(PRE, cfg, s3, skins, tmp)
                 _inter_pre, _binds_pre, _titles_pre = inventory(wp2)
+                _inter_pre_v, _binds_pre_v = inventory_by_var(wp2)
             finally:
                 if wp2 is not None:
                     kill_wiz(wp2)
                 r3()
             inter, binds, titles = inventory(w)
-            lost_inter = {k: v for k, v in _inter_pre.items() if inter.get(k, 0) < v}
-            lost_binds = {k: v for k, v in _binds_pre.items() if binds.get(k, 0) < v}
+            inter_v, binds_v = inventory_by_var(w)
             lost_titles = {k: v for k, v in _titles_pre.items() if titles.get(k, 0) < v}
             note(f'交互控件数：R4 前 {sum(_inter_pre.values())} → HEAD {sum(inter.values())}；'
                  f'变量绑定 {len(_binds_pre)} → {len(binds)}；编号标题 {len(_titles_pre)} → {len(titles)}')
-            check('E06 ★②~⑭ 控件一个不少（交互控件超集对照）',
-                  not lost_inter, f'丢失={lost_inter or "无"}')
-            check('E07 ★所有控件绑定的变量一个不少（无静默丢控件）',
-                  not lost_binds, f'丢失={lost_binds or "无"}')
-            check('E08 编号标题一个不少（②~⑭ 小节都在）',
-                  not lost_titles, f'丢失={lost_titles or "无"}')
-            note(f'新增编号标题（R4 自身引入的说明行，允许）：'
+            # v2.0-R10/R11（前提被需求推翻）：⑪ 渲染模式单选组删除（入口 → ⑩ 旁「增强（真羽化）」开关）、
+            # 图层区「选中层贴哪儿」单选撤销（③ 回通用区统一管所有图层）。这两组控件是**需求主动删的**，
+            # 超集对照里按 (控件类, 变量) 排除（不看文案）；随即用 E06b/E07b 独立核对
+            # 「确实删了 + 功能入口仍在」——谁把它们加回来、或功能入口没了，都会红。
+            REMOVED_BY_R10_R11 = {('Radiobutton', 'var_render'),
+                                  ('Radiobutton', 'var_layer_anchor')}
+            lost_inter_v = {k: v for k, v in _inter_pre_v.items()
+                            if k not in REMOVED_BY_R10_R11 and inter_v.get(k, 0) < v}
+            lost_binds_v = {k: v for k, v in _binds_pre_v.items()
+                            if k not in ('var_render', 'var_layer_anchor')
+                            and binds_v.get(k, 0) < v}
+            check('E06 ★②~⑭ 控件一个不少（按「控件类 + 变量绑定」聚合，不看文案；'
+                  'R10/R11 需求删项除外）',
+                  not lost_inter_v,
+                  f'丢失={lost_inter_v or "无"}（排除={sorted(map(str, REMOVED_BY_R10_R11))}）')
+            check('E07 ★所有控件绑定的变量一份不少（同上，不看文案；无静默丢控件）',
+                  not lost_binds_v, f'丢失={lost_binds_v or "无"}')
+            has_alpha_chk = getattr(w, 'chk_alpha_feather', None) is not None
+            check('E06b ★R10 后 ⑪ 单选确已删除（绑 var_render 的 Radiobutton = 0），'
+                  '且功能入口仍在（⑩ 旁「增强（真羽化）」开关）',
+                  binds_v.get('var_render', 0) == 0
+                  and inter_v.get(('Radiobutton', 'var_render'), 0) == 0
+                  and has_alpha_chk,
+                  f"var_render 绑定={binds_v.get('var_render', 0)} 增强开关={has_alpha_chk}")
+            check('E07b ★R11 后图层区贴边单选确已撤销（绑 var_layer_anchor 的 Radiobutton = 0），'
+                  '③ 回通用区并绑 3 个单选',
+                  inter_v.get(('Radiobutton', 'var_layer_anchor'), 0) == 0
+                  and binds_v.get('var_side', 0) >= 3,
+                  f"var_layer_anchor 单选={inter_v.get(('Radiobutton', 'var_layer_anchor'), 0)} "
+                  f"var_side 绑定={binds_v.get('var_side', 0)}")
+            # 编号标题：⑪ 按需求删除；③ 与图层区说明行的**文案**按 R11 改写（编号仍在）——
+            # 故以「编号 ③ 的新标题仍在 + ⑪ 字样不再出现」守判别力，而不是逐字比对旧文案。
+            LOST_OK = {k for k in _titles_pre
+                       if '⑪' in k or '③ 贴边方向（当前层' in k or '都作用于它' in k}
+            lost_titles_v = {k: v for k, v in _titles_pre.items()
+                             if k not in LOST_OK and titles.get(k, 0) < v}
+            has_11_left = [t for t in titles if '⑪' in t]
+            has_3_new = [t for t in titles if '③' in t and '所有图层' in t]
+            check('E08 编号标题（⑪ 已按 R10 删除；③ 文案按 R11 改写但编号仍在）',
+                  not lost_titles_v and not has_11_left and bool(has_3_new),
+                  f'丢失={lost_titles_v or "无"} ⑪残留={has_11_left or "无"} 新③标题={has_3_new or "无"}')
+            note(f'新增编号标题（R4/R11 引入的说明行，允许）：'
                  f'{ {k: v for k, v in titles.items() if k not in _titles_pre} or "无"}')
             # 列数 vs 工作区宽度（可注入）
             real_saw = R.screen_work_area_width
@@ -478,15 +563,20 @@ def section_E(tmp):
                     h2, w2r = int(w2.root.winfo_reqheight()), int(w2.root.winfo_reqwidth())
                     has_img = bool(getattr(w2, 'tk_img', None)) or bool(w2._preview_specs())
                     inter2, binds2, titles2 = inventory(w2)
-                    miss = {k: v for k, v in _titles_pre.items() if titles2.get(k, 0) < v}
+                    miss = {k: v for k, v in _titles_pre.items()
+                            if k not in LOST_OK and titles2.get(k, 0) < v}
+                    workh2 = int(R.screen_work_area_height(w2.root) or 0)
+                    left_11 = [t for t in titles2 if '⑪' in t]
                     s4.clear()
                     w2._save_and_start()
                     out = dict(s4)
                     drift = {k: (before[k], out.get(k)) for k in before if out.get(k) != before[k]}
-                    check('E12 ★端到端（release/config.json）：重排后预览与 ②~⑭ 齐全、保存零漂移',
-                          has_img and not miss and not drift and h2 <= 900,
+                    check('E12 ★端到端（release/config.json）：重排后预览与 ②~⑭ 齐全'
+                          '（⑪ 已按 R10 删除）、保存零漂移、窗口 ≤ 工作区',
+                          has_img and not miss and not drift and 0 < h2 <= workh2
+                          and not left_11,
                           f'需求={w2r}x{h2} 预览={"有" if has_img else "无"} 缺标题={miss or "无"} '
-                          f'漂移={drift or "无"}')
+                          f'漂移={drift or "无"} 工作区={workh2} ⑪残留={left_11 or "无"}')
                 finally:
                     if w2 is not None:
                         kill_wiz(w2)
@@ -1110,13 +1200,20 @@ def section_H(tmp):
             R.ConfigWizard._adv_column_count = lambda self: 1
             w = make_wiz(R, cfg, saved, skins, tmp)
             inter, binds, titles = inventory(w)
+            # v2.0-R10：⑪ 渲染模式单选组按需求删除 → 编号 ⑪ 不再作为「必须存在的标题」；
+            # 但功能入口（⑩ 旁「增强（真羽化）」开关）必须在，且 ⑪ 字样不许再出现（两条都能抓红）。
             need = set()
-            for c in '②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭':
+            for c in '②③④⑤⑥⑦⑧⑨⑩⑫⑬⑭':
                 need.add(c)
             missing = [c for c in need if not any(c in t for t in titles)]
-            check('H05 ★强制 1 列（最窄屏退路）：②~⑭ 编号标题仍齐全',
-                  not missing and len(list(getattr(w, 'adv_cols', []))) == 1,
-                  f'缺={missing or "无"} 列数={len(list(getattr(w, "adv_cols", [])))}')
+            left_11 = [t for t in titles if '⑪' in t]
+            has_alpha_chk = getattr(w, 'chk_alpha_feather', None) is not None
+            check('H05 ★强制 1 列（最窄屏退路）：②~⑭ 标题齐全（⑪ 已按 R10 删除）'
+                  '，⑩ 旁增强开关仍在',
+                  not missing and len(list(getattr(w, 'adv_cols', []))) == 1
+                  and not left_11 and has_alpha_chk,
+                  f'缺={missing or "无"} 列数={len(list(getattr(w, "adv_cols", [])))} '
+                  f'⑪残留={left_11 or "无"} 增强开关={has_alpha_chk}')
         finally:
             if w is not None:
                 kill_wiz(w)

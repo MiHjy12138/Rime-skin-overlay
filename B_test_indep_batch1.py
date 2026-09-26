@@ -310,10 +310,15 @@ def section_A(tmp):
         # 棋盘格确实垫在底下：图的四角是羽化到透明的 → 应露出棋盘两色
         corners = [photo_px(ph_c, 2, 2), photo_px(ph_c, 18, 2),
                    photo_px(ph_c, 2, 18), photo_px(ph_c, 18, 18)]
-        has_l = any(_near(c, R.CHECKER_LIGHT, 3) for c in corners)
+        # v2.0-R7（前提被需求推翻）：预览底从 R1 的棋盘格改回**画布底色** —— 用户实测把棋盘格
+        # 看成了「不透明」。底色取模块常量（不硬编码白），并断言棋盘格深色**不再出现**；
+        # 两条子条件都能在回退场景下抓红（把预览合成换回棋盘格 → has_bg/has_d 双双反转）。
+        preview_bg = tuple(getattr(R, 'PREVIEW_BG_RGB', (255, 255, 255)))
+        has_bg = all(_near(c, preview_bg, 3) for c in corners)
         has_d = any(_near(c, R.CHECKER_DARK, 3) for c in corners)
-        check('A03 ★预览垫的是棋盘格（角上同时出现浅/深两色，不是白底）',
-              has_l and has_d, f'corners={corners} light={has_l} dark={has_d}')
+        check('A03 ★R7 后预览垫的是画布底色（角上 = PREVIEW_BG_RGB，不再出现棋盘格深色）',
+              has_bg and not has_d,
+              f'corners={corners} 底色={preview_bg} 深色出现={has_d}')
         check('A03b 预览未被 fit 缩小（1:1 → 像素判定才逐位可信）',
               (w0, h0) == (120, 120), f'预览={w0}x{h0}（期望 120x120）')
         check('A04 ★兼容档预览 = 硬边（羽化带无颜色混合，中间色≈0）',
@@ -460,7 +465,8 @@ def section_A(tmp):
             w._on_alpha_feather_toggle()
             pha = w.tk_img
             prof_a = _checker_profile(pha, pha.height() // 2, 60)
-            note(f'（真实出厂图 891x1247，预览缩到 {w0}x{h0}）到棋盘色的距离剖面（中行前 40px）：')
+            note(f'（真实出厂图 891x1247，预览缩到 {w0}x{h0}）到「透明底」的距离剖面（中行前 40px，'
+                 f'R7 后底 = 画布底色）:')
             note(f'   兼容 {prof_c[:40]}')
             note(f'   增强 {prof_a[:40]}')
             run_c, run_a = _max_run(prof_c, 20), _max_run(prof_a, 20)
@@ -469,10 +475,13 @@ def section_A(tmp):
             # grain 34 vs 13，区分度不足）→ 这里只记录剖面作证据，判据压在 A04/A06（1:1）
             # 与 A11/A11b（运行时真羽化）上，不硬造阈值。
             note(f'   兼容最长连续不透明段={run_c}px / 增强={run_a}px（剖面对照见上）')
-            check('A14 真实场景剖面已取证（兼容=0↔高值交替的点阵颗粒；增强=连续上升的斜坡）',
-                  prof_c[17] >= 40 and prof_c[18] < 10 and prof_a[17] >= 30 and prof_a[18] >= 30,
-                  f'兼容 [17..20]={prof_c[17:21]}（17→18 直接掉回 0 = 硬边点阵）；'
-                  f'增强 [17..20]={prof_a[17:21]}（连续高值 = 平滑过渡）')
+            # v2.0-R7：底由棋盘格改为画布底色（白）后，「露出棋盘」变成「露出底色」——
+            # 判据改成与底色无关的形态学判据：兼容 = 边缘 1px 陡降回底色（硬边）；
+            # 增强 = 连续非底色带（斜坡）。增强档若退化成硬边，min(prof_a[17:21]) 会掉到 ~0 → 红。
+            check('A14 真实场景剖面（R7 口径：兼容=高值→底色 1px 陡降；增强=连续非底色带）',
+                  prof_c[17] >= 40 and prof_c[18] < 10 and min(prof_a[17:21]) >= 10,
+                  f'兼容 [17..20]={prof_c[17:21]}（17→18 直接掉回底色 = 硬边）；'
+                  f'增强 [17..20]={prof_a[17:21]}（连续非底色 = 平滑过渡）')
         finally:
             if w is not None:
                 kill_wiz(w)
@@ -604,10 +613,15 @@ def section_B(tmp):
     wiz2 = None
     try:
         wiz2 = make_wiz(R, cfg2, saved, skins)
-        texts = _radio_texts(wiz2, wiz2.var_side)
-        check('B02 ③ 已从通用区移走（var_side 无单选），图层区有 3 个贴边选项',
-              len(texts) == 0 and len(_radio_texts(wiz2, wiz2.var_layer_anchor)) == 3,
-              f'通用区={texts}')
+        # v2.0-R11（前提被需求推翻）：③ 从图层区搬回通用区并**统一管所有图层** ——
+        # 定位只看**变量绑定**（不看文案/位置/容器）：③ = 绑 var_side 的 3 个单选；
+        # 图层区不再有绑 var_layer_anchor 的单选。两条子条件都能在回退场景下抓红
+        # （③ 被搬回图层区 → 第一条红；图层区又加回单选 → 第二条红）。
+        side_radios = _radio_texts(wiz2, wiz2.var_side)
+        lay_radios = _radio_texts(wiz2, wiz2.var_layer_anchor)
+        check('B02 ★R11 后 ③ 在通用区（var_side 绑 3 个单选），图层区不再有贴边单选',
+              len(side_radios) == 3 and len(lay_radios) == 0,
+              f'通用区={side_radios} 图层区={lay_radios}')
         _select(wiz2, 0)
         wiz2.var_side.set('center')
         wiz2._update_preview()
@@ -622,12 +636,15 @@ def section_B(tmp):
         wx, wy, ww, wh, pl = R.plan_layer_layout(rl, dims, (0, 0, 460, 84))
         pos = {p[0]: (p[1], p[2]) for p in pl}
         exp0x = 0 + (460 - dims[0][0]) // 2 + int(wiz2.cfg.get('offset_x', 0))
-        exp1x = 0 - dims[1][0] - 8 + int(rl[1].get('offset_x', 0))
+        exp1x = 0 + (460 - dims[1][0]) // 2 + int(rl[1].get('offset_x', 0))
         check('B04 ★主层贴边真的落到运行时画面落点（居中公式逐位一致）',
               abs((wx + pos[0][0]) - exp0x) <= 1,
               f'层0 屏幕 x={wx + pos[0][0]} 期望={exp0x}（画布 {ww}x{wh}）')
-        check('B05 第 2 层（贴左）不受影响，落点仍是左贴公式',
-              rl[1]['anchor'] == 'left_edge' and abs((wx + pos[1][0]) - exp1x) <= 1,
+        # v2.0-R11：③ 统一管所有图层 —— 改一次 ③，第 2 层 anchor 也同步为 center、落点走同一套
+        # 居中公式（旧前提「第 2 层保持自己的 left_edge」已被需求推翻）；若统一同步失效，
+        # 第 2 层仍是 left_edge → 本条必红。
+        check('B05 ★R11 后 ③ 统一管所有图层：第 2 层 anchor 同步为 center、落点按居中公式',
+              rl[1]['anchor'] == 'center' and abs((wx + pos[1][0]) - exp1x) <= 1,
               f"l1.anchor={rl[1]['anchor']} x={wx + pos[1][0]} 期望={exp1x}")
         # 反向：选中第 2 层改居中 → 只改该层
         _select(wiz2, 1)
@@ -643,8 +660,13 @@ def section_B(tmp):
         wiz2.var_side.set('right')
         wiz2._update_preview()
         _select(wiz2, 1)
-        check('B06b ★切层回显：第 2 层仍是 center，不串层',
-              wiz2.var_layer_anchor.get() == 'center', repr(wiz2.var_layer_anchor.get()))
+        # v2.0-R11：var_layer_anchor 降级为「当前层 anchor 的回显镜像」（不再绑任何单选）；
+        # ③ 统一管所有图层 → 各层 anchor 本应一致。镜像值、被镜像的层值、各层一致性三者对齐
+        # 才算「切层不串层」——镜像脱钩或统一同步失效都会红。
+        anchors_now = [x.get('anchor') for x in (wiz2.cfg.get('layers') or [])]
+        check('B06b ★切层回显：var_layer_anchor = 该层 anchor 的镜像，且各层一致（③ 统一）',
+              wiz2.var_layer_anchor.get() == anchors_now[1] and len(set(anchors_now)) == 1,
+              f'var_layer_anchor={wiz2.var_layer_anchor.get()!r} anchors={anchors_now}')
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -746,20 +768,26 @@ def section_B(tmp):
         try:
             w4 = make_wiz(R, cfg2, saved4, skins)
             w4.root.update_idletasks()
-            adv = _find_widget(w4, text_contains='高级设置')
+            # v2.0-R12（容器类型变更）：高级设置外层由 LabelFrame 换成「Frame + 可点标题按钮 +
+            # 内容区」——靠 text 查找容器会误命中 26px 的标题按钮（实测把 ha 量成 26）。改为
+            # **属性定位**：adv_body = 内容区（展开态高度即「高级设置块」），
+            # adv_area.master = 承载「预览/通用区（左）」与「高级设置（右）」两块的 body。
+            adv_body = getattr(w4, 'adv_body', None)
+            adv_area = getattr(w4, 'adv_area', None)
             left_col = None
-            if adv is not None:
-                try:
-                    sibs = [x for x in adv.master.winfo_children() if x is not adv]
+            try:
+                if adv_area is not None:
+                    sibs = [x for x in adv_area.master.winfo_children() if x is not adv_area]
                     if sibs:
                         left_col = max(sibs, key=lambda x: x.winfo_reqheight())
-                except Exception:
-                    pass
-            ha = int(adv.winfo_reqheight()) if adv is not None else -1
+            except Exception:
+                pass
+            ha = int(adv_body.winfo_reqheight()) if adv_body is not None else -1
             hl = int(left_col.winfo_reqheight()) if left_col is not None else -1
             note(f'两栏各自需求高度：右栏（高级设置）={ha}  左栏={hl}  窗口={hs.get("head")}')
             # R4 后事实：高级设置块被「横排三列」从竖排 901 压到 ~332 → 它**不再是**高度瓶颈
-            # （现在是另一块 390 最高，R4 后那一块就是预览块）。判别力：
+            # （现在是另一块 390 最高，R4 后那一块就是预览块）。R12 起该块还多出可点标题按钮
+            # （26px），这里量的是**内容区 adv_body**（展开态）。判别力：
             #   ① 把横排放回竖排（高级设置块重新变高）→ 第一子条件必红；
             #   ② 窗口装不下任一块 → 第二子条件必红；
             #   ③ 窗口退回 R1 基线（R4 的缩窗被撤销）→ 第三子条件必红。
@@ -1366,8 +1394,12 @@ def section_D(tmp):
                 wiz._apply_skin_to_wizard()
                 a3 = (wiz.var_side.get(), wiz.var_layer_anchor.get(),
                       [x.get('anchor') for x in (wiz.cfg.get('layers') or [])])
-                check('D04 ★皮肤下拉框往返（新档案 2 层 ↔ v1.6 老档案 1 层）不串层',
-                      a1 == ('left', 'left_edge', ['left_edge', 'right_edge'])
+                # v2.0-R11（前提被需求推翻）：③ 统一管所有图层 —— 档案里带顶层 side 时，套用会把
+                # **所有层**的 anchor 统一成 side 的映射（新事实 ['left_edge','left_edge']；旧前提的
+                # 「第 2 层保留档案自己的 right_edge」被 R11 的「③ 统一管所有图层」推翻）。
+                # 往返一致性（a3 == a1）仍是判据：若统一同步失效，第 3 项会退回各层各自的值 → 必红。
+                check('D04 ★皮肤下拉框往返（新档案 2 层 ↔ v1.6 老档案 1 层）：③ 统一同步、往返一致',
+                      a1 == ('left', 'left_edge', ['left_edge', 'left_edge'])
                       and a2[0] == 'right' and a2[2] == 1 and a3 == a1,
                       f'new={a1} old={a2} new2={a3}')
             finally:
