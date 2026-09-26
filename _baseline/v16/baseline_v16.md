@@ -19,6 +19,7 @@
 | 本会话开始 | 172220（CRLF 工作副本） | 2026-09-10 22:36:20 | = HEAD 内容 + 行尾转换 |
 | 采集途中 | 205859 | 2026-09-26 11:06:54 | 队友开发中（`git diff --stat` = +753 行） |
 | 采集途中（再测） | 214709 | 2026-09-26 11:08:22 | 仍在变化 |
+| 基线归档时（交付时刻） | — | 2026-09-26 11:13 | `git diff --stat` 已涨到 **+953 行**，工作树仍非 v1.6（开发在持续推进） |
 
 `git diff --stat`：`rime_char_overlay.py | 753 ++++++++++`，新增顶层符号含 `extract_scheme_theme` / `build_scheme_fields` / `merge_scheme_into_yaml` / `plan_scheme_injection` / `apply_scheme_injection` / `restore_weasel_backup` / `find_weasel_deployer` / `run_weasel_deployer` / `load_scheme_manifest` 等（HEAD 版本里**没有**这些）。
 
