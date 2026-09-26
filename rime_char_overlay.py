@@ -2698,6 +2698,12 @@ ANIM_KEY_SAMPLE = 48        # 统计抠色键色的最大采样帧数（帧多�
 ANIM_PREPROCESS_MAX = 300   # 预处理动图最多处理的帧数（超了均匀采样，防一次处理几千帧卡死）
 ANIM_HIDDEN_POLL_MS = 200   # 窗口隐藏时动画暂停，仅按此间隔探活（最大 CPU 省钱点）
 ANIM_MIN_MS, ANIM_MAX_MS = 20, 1000   # 单帧时长钳位（防异常 duration 把 UI 抳死）
+# R6 图片预处理的动图预览：帧缓存上限（work 尺寸 RGBA，够顺序播放 + 回退几帧）+ 棋盘格同色
+# 注意：棋盘格颜色是「预处理对话框」专属口径（深灰底 #2b2b2b + 亮格 #4a4a4a），与向导预览的
+# CHECKER_LIGHT/CHECKER_DARK（白/浅灰，R1 那套）不是一个东西，故用 PREPROCESS_ 前缀区分。
+ANIM_PREVIEW_CACHE_MAX = 12
+PREPROCESS_CHECKER_LIGHT = '#4a4a4a'
+PREPROCESS_CHECKER_BASE = '#2b2b2b'
 
 
 def _sample_frame_indices(n, limit):
@@ -3552,6 +3558,18 @@ class ImagePreprocessDialog:
         except Exception:
             pass
         self.orig = self._src.convert('RGBA')
+        self._frames_ms = {0: _frame_duration(self._src)}   # 当前帧时长（seek 后读，别处 seek 会变）
+        # ---- R6 动图预览状态：按需解码 + 节流播放（一律主线程内，无跨线程 Tk 调用）----
+        self.preview_idx = 0            # 当前显示帧号（0 = 首帧；静态图恒为 0）
+        self.preview_steps = 0          # 播放推进计数（测试观测用）
+        self._playing = False
+        self._anim_after = None         # 播放节拍 id（销毁前必须 after_cancel）
+        self._alive = True              # 销毁后置 False，迟到的回调靠它安全返回
+        self._frame_cache = collections.OrderedDict()   # 帧号 → work 尺寸 RGBA（LRU）
+        self._checker_cache = {}                        # (w,h) → 棋盘格垫底图
+        self._decode_calls = 0          # 解码次数（校验「按需」而不是一次性全解码）
+        self._last_decode_ms = 0.0      # 最近一次单帧解码耗时（自适应节流用）
+        self._size_fixups = 0           # 帧尺寸与首帧不一致被归一的次数（兜底可观测）
         # 性能优化：交互基于缩略图（最长边 1200px），应用时映射回原图。
         # 大图（如 3MB）不再每次拖拽/调容差时处理全分辨率，顺滑度大幅提升。
         longest = max(self.orig.size)
@@ -3576,6 +3594,7 @@ class ImagePreprocessDialog:
         self.root.resizable(False, False)
         self.root.transient(master)
         self.root.protocol('WM_DELETE_WINDOW', self._cancel)
+        self.root.bind('<Destroy>', self._on_destroy, add='+')
         self._build_ui()
         self._auto_detect_bg()
         self._auto_crop()
@@ -3602,6 +3621,34 @@ class ImagePreprocessDialog:
         anim_txt = f'（动图 {self.n_frames} 帧，处理完仍是动图）' if self.n_frames > 1 else ''
         tk.Label(panel, text=f'原图 {self.orig.width}×{self.orig.height}{anim_txt}',
                  font=('Microsoft YaHei', 9), fg='#888').pack(anchor='w')
+
+        # R6 动图预览：播放 / 逐帧查看（只对动图出现；静态图 UI 一字不变）
+        if self.n_frames > 1:
+            tk.Label(panel, text='▶ 动图预览（裁剪框对每帧都生效）',
+                     font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(8, 2))
+            prow = tk.Frame(panel)
+            prow.pack(anchor='w', fill='x')
+            self.btn_play = tk.Button(prow, text='▶ 播放', width=8, command=self._toggle_preview,
+                                      font=('Microsoft YaHei', 9))
+            self.btn_play.pack(side='left', padx=(0, 2))
+            tk.Button(prow, text='⏮', width=3, command=lambda: self._preview_goto(0),
+                      font=('Microsoft YaHei', 9)).pack(side='left', padx=1)
+            tk.Button(prow, text='◀', width=3, command=lambda: self._preview_step(-1),
+                      font=('Microsoft YaHei', 9)).pack(side='left', padx=1)
+            tk.Button(prow, text='▶', width=3, command=lambda: self._preview_step(1),
+                      font=('Microsoft YaHei', 9)).pack(side='left', padx=1)
+            self.lbl_frame = tk.Label(panel, text='第 1 / %d 帧' % self.n_frames, fg='#888',
+                                      font=('Microsoft YaHei', 9))
+            self.lbl_frame.pack(anchor='w', pady=(2, 0))
+            tk.Label(panel, text='按需解码 + 按帧时长节流：播放只解当前帧，\n大动图不会一次性全解码（不卡界面）',
+                     fg='#999', font=('Microsoft YaHei', 8), justify='left').pack(anchor='w')
+            for seq, fn in (('<Left>', lambda _e: self._preview_step(-1)),
+                            ('<Right>', lambda _e: self._preview_step(1)),
+                            ('<space>', lambda _e: self._toggle_preview())):
+                try:
+                    self.root.bind(seq, fn)
+                except Exception:
+                    pass
 
         # ① 裁剪比例
         tk.Label(panel, text='① 裁剪比例:', font=('Microsoft YaHei', 10)).pack(anchor='w', pady=(8, 2))
@@ -3663,9 +3710,13 @@ class ImagePreprocessDialog:
 
     # ---------- 绘制 ----------
     def _draw_checker(self, cv, ox, oy, w, h):
-        """透明棋盘格背景（画在图下层）"""
+        """透明棋盘格背景（Tk 层画法）。
+
+        R6 起 `_draw` 走「烘进显示图」的快路径（Tk 对混合 alpha 推图极慢，见 _screen_image），
+        本方法只在烘焙失败时兜底补画；颜色口径与烘出来的那层一致（PREPROCESS_CHECKER_*）。
+        """
         cell = 16
-        c = '#4a4a4a'
+        c = PREPROCESS_CHECKER_LIGHT
         for i in range(int(w // cell) + 1):
             for j in range(int(h // cell) + 1):
                 if (i + j) % 2 == 0:
@@ -3674,24 +3725,68 @@ class ImagePreprocessDialog:
                                         oy + min((j + 1) * cell, h),
                                         fill=c, outline='')
 
+    def _checker_bg(self, size, cell=16):
+        """棋盘格垫底图（按尺寸缓存）：亮格 PREPROCESS_CHECKER_LIGHT、暗格 = 画布底色"""
+        key = (int(size[0]), int(size[1]), int(cell))
+        hit = self._checker_cache.get(key)
+        if hit is not None:
+            return hit
+        w, h = key[0], key[1]
+        bg = self._Image.new('RGB', (w, h), PREPROCESS_CHECKER_BASE)
+        light = self._Image.new('RGB', (cell, cell), PREPROCESS_CHECKER_LIGHT)
+        for y0 in range(0, h, cell):
+            for x0 in range(0, w, cell):
+                if (x0 // cell + y0 // cell) % 2 == 0:
+                    bg.paste(light, (x0, y0))
+        if len(self._checker_cache) > 4:      # 尺寸变了才新键，最多留几份
+            self._checker_cache.clear()
+        self._checker_cache[key] = bg
+        return bg
+
+    def _screen_image(self, frame, s):
+        """显示帧 → 推给 Tk 的「成品图」：抠图 → 缩放 → 棋盘格垫底合成 → RGB。
+
+        R6 为什么要烘棋盘格：Tk 的 photo put 对 alpha **不一致**的图走逐像素合成慢路径
+        （实测 640×480 混合 alpha = 81~219 ms，而 alpha 全一致只有 2~6 ms）。动图每帧都要
+        推图，走慢路径就必然卡；烘成不透明 RGB 后单帧 ≈ 4 ms。视觉与老画法一致：老代码在
+        图下垫 Tk 画的同色棋盘格，透明处露出的就是这层。
+        """
+        disp = frame
+        if self.use_key.get() and self.bg_color:
+            disp = self._chroma_key(frame, self.bg_color, self.tol_var.get())
+        dw = max(1, int(disp.width * s))
+        dh = max(1, int(disp.height * s))
+        if (dw, dh) != disp.size:
+            disp = disp.resize((dw, dh), self._Image.LANCZOS)
+        if disp.mode != 'RGBA':
+            disp = disp.convert('RGBA')
+        try:
+            out = self._checker_bg((dw, dh)).copy()
+            out.paste(disp, (0, 0), disp)
+            return out
+        except Exception:
+            # 极端兜底：烘不进去就退回老路径（_draw 会补画 Tk 棋盘格 + 直接推 RGBA）
+            return disp
+
     def _draw(self):
+        if not getattr(self, '_alive', True):
+            return                      # 已销毁：迟到的节拍直接返回，别碰 Tk
         cv = self.cv
         cv.delete('all')
         s, ox, oy = self._fit()
-        disp_w, disp_h = self.work.width * s, self.work.height * s
+        frame = self._frame_work(self.preview_idx)
+        disp_w, disp_h = frame.width * s, frame.height * s
 
-        # 棋盘格 + 图片
-        self._draw_checker(cv, ox, oy, disp_w, disp_h)
-        disp = self.work
-        if self.use_key.get() and self.bg_color:
-            disp = self._chroma_key(self.work, self.bg_color, self.tol_var.get())
-        disp_s = disp.resize((max(1, int(disp.width * s)), max(1, int(disp.height * s))),
-                             self._Image.LANCZOS)
-        self.tk_img = self._ImageTk.PhotoImage(disp_s, master=self.root)
+        # 图片（含棋盘格垫底；R6 起棋盘格烘进图里，Tk 层不再重复画）
+        shot = self._screen_image(frame, s)
+        if shot.mode == 'RGBA':
+            self._draw_checker(cv, ox, oy, disp_w, disp_h)   # 兜底：烘焙失败时回到老画法
+        self.tk_img = self._ImageTk.PhotoImage(shot, master=self.root)
         self._photo_refs.append(self.tk_img)
         if len(self._photo_refs) > 3:
             _release_photo(self._photo_refs.pop(0))
         cv.create_image(ox, oy, anchor='nw', image=self.tk_img)
+        self._update_frame_label()
 
         # 裁剪框
         x0, y0, x1, y1 = self.crop
@@ -3711,6 +3806,164 @@ class ImagePreprocessDialog:
         cw, chh = int(x1 - x0), int(y1 - y0)
         self.lbl_crop.config(text=f'裁剪: {cw}×{chh}')
 
+    # ---------- R6：动图预览（按需解码 + 节流播放） ----------
+    def _canonical_frame(self, img):
+        """帧尺寸归一：**以首帧尺寸为准**（拉伸到首帧画布）。
+
+        为什么定这条策略：
+          · 裁剪框只有一个矩形（在 work 坐标系里），若逐帧换尺寸，框会在播放时来回漂、
+            用户根本没法"照着某一帧裁剪"；
+          · 输出 APNG 也要求所有帧同一画布 —— 尺寸不一的帧会被"顶左贴一块"，等于错位；
+          · 实测 PIL 的 GIF/APNG 读入器本身会把局部帧合成到逻辑画布（同格式文件读回每帧尺寸一致），
+            所以这条分支正常文件走不到，纯属兜底（第三方写入器 / 未来格式）——归一后坐标与首帧一一对应。
+        """
+        if img.size != self.orig.size:
+            self._size_fixups += 1
+            img = img.resize(self.orig.size, self._Image.LANCZOS)
+        return img
+
+    def _decode_frame_rgba(self, idx):
+        """按需解码**这一帧**：seek → RGBA → 尺寸归一。返回 (img, 毫秒, 该帧时长)。"""
+        n = max(1, int(self.n_frames))
+        idx = int(idx) % n
+        t0 = time.perf_counter()
+        try:
+            self._src.seek(idx)
+        except Exception:
+            try:
+                self._src.seek(0)
+            except Exception:
+                pass
+        img = self._src.convert('RGBA')
+        dur = _frame_duration(self._src)
+        img = self._canonical_frame(img)
+        self._last_decode_ms = (time.perf_counter() - t0) * 1000.0
+        self._decode_calls += 1
+        self._frames_ms[idx] = dur
+        return img, self._last_decode_ms, dur
+
+    def _frame_work(self, idx):
+        """第 idx 帧的 work 尺寸缩略图（LRU 缓存）：命中直接返回；未命中才解码这一帧。
+
+        静态图（n_frames<=1）恒返回 self.work —— 老路径逐像素不变。
+        """
+        if self.n_frames <= 1:
+            return self.work
+        idx = int(idx) % self.n_frames
+        if idx == 0:
+            return self.work                   # 首帧就是静态路径的 work，不为它多存一份
+        hit = self._frame_cache.get(idx)
+        if hit is not None:
+            self._frame_cache.move_to_end(idx)
+            return hit
+        img, _ms, _dur = self._decode_frame_rgba(idx)
+        work = img.resize(self.work.size, self._Image.LANCZOS)   # 与首帧同尺寸 → 裁剪框坐标系一致
+        self._frame_cache[idx] = work
+        while len(self._frame_cache) > ANIM_PREVIEW_CACHE_MAX:
+            self._frame_cache.popitem(last=False)
+        return work
+
+    def _frame_delay_ms(self, idx):
+        """下一次节拍间隔：≥该帧时长，且不低于「上次解码耗时 × 2」。
+
+        自适应节流的意义：单帧解码越慢，节拍放得越宽 —— 宁可把播放放慢，也不让主线程
+        被连续解码塞满（实测单帧增量解码 ~2 ms，所以正常动图不受影响）。
+        """
+        try:
+            dur = int(self._frames_ms.get(int(idx) % max(1, self.n_frames)) or 100)
+        except Exception:
+            dur = 100
+        dur = max(ANIM_MIN_MS, min(ANIM_MAX_MS, dur))
+        return int(max(ANIM_MIN_MS, min(ANIM_MAX_MS, max(dur, self._last_decode_ms * 2.0))))
+
+    def _update_frame_label(self):
+        if not hasattr(self, 'lbl_frame'):
+            return
+        try:
+            self.lbl_frame.config(text='第 %d / %d 帧' % (self.preview_idx + 1, self.n_frames))
+        except Exception:
+            pass
+
+    def _schedule_tick(self, ms):
+        if not (self._alive and self._playing):
+            self._anim_after = None
+            return
+        try:
+            self._anim_after = self.root.after(int(ms), self._preview_tick)
+        except Exception:
+            self._anim_after = None
+
+    def _preview_tick(self):
+        """播放节拍：推进一帧 → 重绘 → 按该帧时长（含自适应节流）重排下一次。
+
+        每 tick 只解一帧（缓存命中则不解）；这是「不卡 UI」的关键 —— 大 GIF 不会一次性全解码。
+        """
+        self._anim_after = None
+        if not (self._alive and self._playing and self.n_frames > 1):
+            return
+        self.preview_idx = (self.preview_idx + 1) % self.n_frames
+        self.preview_steps += 1
+        self._draw()
+        self._schedule_tick(self._frame_delay_ms(self.preview_idx))
+
+    def _toggle_preview(self):
+        """▶ 播放 / ⏸ 暂停（暂停保持当前帧，不清进度）"""
+        if self.n_frames <= 1:
+            return
+        if self._playing:
+            self._stop_preview(reset=False)
+            return
+        self._playing = True
+        try:
+            self.btn_play.config(text='⏸ 暂停')
+        except Exception:
+            pass
+        self._draw()
+        self._schedule_tick(self._frame_delay_ms(self.preview_idx))
+
+    def _preview_step(self, delta):
+        """逐帧查看（±1）；手动翻帧时暂停播放，免得跟节拍抢帧"""
+        if self.n_frames <= 1:
+            return
+        self._stop_preview(reset=False)
+        self.preview_idx = (self.preview_idx + int(delta)) % self.n_frames
+        self._draw()
+
+    def _preview_goto(self, idx):
+        """跳到指定帧（0 = 首帧）"""
+        if self.n_frames <= 1:
+            return
+        self._stop_preview(reset=False)
+        self.preview_idx = int(idx) % self.n_frames
+        self._draw()
+
+    def _stop_preview(self, reset=False):
+        """停表：取消 after、复位按钮（销毁/应用/手动翻帧都走这里）"""
+        self._playing = False
+        if self._anim_after is not None:
+            try:
+                self.root.after_cancel(self._anim_after)
+            except Exception:
+                pass
+            self._anim_after = None
+        try:
+            if hasattr(self, 'btn_play'):
+                self.btn_play.config(text='▶ 播放')
+        except Exception:
+            pass
+        if reset:
+            self.preview_idx = 0
+
+    def _on_destroy(self, event=None):
+        """Toplevel 被销毁（含父窗连带销毁）→ 停表 + 标记不再碰 Tk"""
+        try:
+            if event is not None and getattr(event, 'widget', None) is not self.root:
+                return
+        except Exception:
+            pass
+        self._alive = False
+        self._stop_preview(reset=False)
+
     # ---------- 裁剪交互 ----------
     def _on_press(self, e):
         x, y = self._to_img(e.x, e.y)
@@ -3725,11 +3978,12 @@ class ImagePreprocessDialog:
         if x0 <= x <= x1 and y0 <= y <= y1:
             self.drag = ('move', x, y)
             return
-        # 框外点击：若启用抠图 → 手动指定背景色
+        # 框外点击：若启用抠图 → 手动指定背景色（R6：取当前显示帧的像素，与眼睛所见一致）
         if self.use_key.get():
             ix, iy = int(x), int(y)
             if 0 <= ix < self.work.width and 0 <= iy < self.work.height:
-                self.bg_color = self.work.getpixel((ix, iy))[:3]
+                src = self._frame_work(self.preview_idx) if self.n_frames > 1 else self.work
+                self.bg_color = src.getpixel((ix, iy))[:3]
                 self._update_bg_box()
                 self._draw()
 
@@ -3970,6 +4224,7 @@ class ImagePreprocessDialog:
             if (x1 - x0) < 2 or (y1 - y0) < 2:
                 messagebox.showwarning('提示', '裁剪区域太小！', parent=self.root)
                 return
+            self._stop_preview(reset=False)    # R6：应用期间不许节拍来抢 self._src 的 seek
             tf = self._frame_transform()
             out_path = os.path.join(HERE, f'preprocessed_{int(time.time() * 1000)}.png')
             if self.n_frames > 1:
@@ -3981,9 +4236,9 @@ class ImagePreprocessDialog:
                 except Exception:
                     pass
                 for k, i in enumerate(idxs):
-                    self._src.seek(i)
-                    durs.append(_frame_duration(self._src))
-                    outs.append(self._shrink_frame(tf(self._src.convert('RGBA'))))
+                    img, _ms, dur = self._decode_frame_rgba(i)
+                    durs.append(dur)
+                    outs.append(self._shrink_frame(tf(img)))
                     if k % 10 == 0:
                         try:
                             self.lbl_crop.config(text=f'处理中 {k + 1}/{len(idxs)} 帧...')
@@ -3999,15 +4254,18 @@ class ImagePreprocessDialog:
             for p in self._photo_refs:
                 _release_photo(p)
             self._photo_refs.clear()
+            self._alive = False
             self.root.destroy()
         except Exception as e:
             messagebox.showerror('处理失败', str(e), parent=self.root)
 
     def _cancel(self):
         self.result_path = None
+        self._stop_preview(reset=False)
         for p in self._photo_refs:
             _release_photo(p)
         self._photo_refs.clear()
+        self._alive = False
         self.root.destroy()
 
 
