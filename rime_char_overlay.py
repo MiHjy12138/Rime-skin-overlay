@@ -2706,6 +2706,11 @@ ANIM_MIN_MS, ANIM_MAX_MS = 20, 1000   # 单帧时长钳位（防异常 duration 
 ANIM_PREVIEW_CACHE_MAX = 12
 PREPROCESS_CHECKER_LIGHT = '#4a4a4a'
 PREPROCESS_CHECKER_BASE = '#2b2b2b'
+# R8 图片预处理对话框的右栏容器：固定宽 240（与改前观感逐像素一致），内容高于可视区时
+# 让出 17px 给竖直滚动条 → 内容被压窄后折行更高，两者都在 _fit_dialog_size 里算。
+PREPROCESS_PANEL_W = 240
+PREPROCESS_PANEL_SB_W = 17
+PREPROCESS_CHROME_H = 40    # 窗口标题栏 + 边框预留（map 前量不到，保守取值）
 
 
 def _sample_frame_indices(n, limit):
@@ -3573,9 +3578,10 @@ class ImagePreprocessDialog:
         ('9:16', 9.0 / 16),
     ]
 
-    def __init__(self, master, image_path):
+    def __init__(self, master, image_path, layer_hint=None):
         self.master = master
         self.src_path = image_path
+        self.layer_hint = layer_hint     # R9：标题上标明「这一份属于第几层」（None = 不标）
         self.result_path = None
         try:
             from PIL import Image, ImageTk, ImageChops
@@ -3627,12 +3633,13 @@ class ImagePreprocessDialog:
         self._photo_refs = []              # PhotoImage 引用保留，防 GC
 
         self.root = tk.Toplevel(master)
-        self.root.title('图片预处理 - 裁剪 / 抠图')
+        self.root.title('图片预处理 - 裁剪 / 抠图' + (f'（{layer_hint}）' if layer_hint else ''))
         self.root.resizable(False, False)
         self.root.transient(master)
         self.root.protocol('WM_DELETE_WINDOW', self._cancel)
         self.root.bind('<Destroy>', self._on_destroy, add='+')
         self._build_ui()
+        self._fit_dialog_size()          # R8：定窗口尺寸（保证下方功能不被挤出可视区）
         self._auto_detect_bg()
         self._auto_crop()
         self._draw()
@@ -3645,15 +3652,33 @@ class ImagePreprocessDialog:
         # 左：画布
         self.cv = tk.Canvas(main, width=640, height=600, bg='#2b2b2b',
                             highlightthickness=1, highlightbackground='#666')
-        self.cv.pack(side='left')
+        self.cv.pack(side='left', anchor='n')
         self.cv.bind('<ButtonPress-1>', self._on_press)
         self.cv.bind('<B1-Motion>', self._on_drag)
         self.cv.bind('<ButtonRelease-1>', self._on_release)
 
-        # 右：控制面板
-        panel = tk.Frame(main, width=240)
-        panel.pack(side='right', fill='y', padx=(10, 0))
-        panel.pack_propagate(False)
+        # 右：控制面板（v2.0-R8：装进「Canvas + 竖直滚动条」容器）
+        # 改前这里是 `panel = Frame(width=240); pack_propagate(False); pack(fill='y')` —— 一个
+        # 高度被左画布（602px）锁死的固定框。R6 加了「▶ 动图预览」区后右栏内容需求 662px，
+        # pack 就把最后排的「应用 / 重置 / 取消」压成 1px 高且不 map（winfo_ismapped=0），
+        # 用户实测原话：「动图抠图时下方的功能会被挤到无法点击的位置。」
+        # 现在容器高度改为跟窗口走（见 _fit_dialog_size：窗口高度 = max(左画布, 右栏内容)），
+        # 内容仍然装不下时出滚动条 —— 只裁内容不裁控件，任何情况下都能点到底部按钮。
+        # 静态图（内容 534px < 602px）不显示滚动条、宽度仍是 240px → 观感与改前逐像素一致。
+        self.panel_wrap = tk.Frame(main, width=PREPROCESS_PANEL_W)
+        self.panel_wrap.pack(side='right', fill='y', padx=(10, 0))
+        self.panel_wrap.pack_propagate(False)
+        self.panel_canvas = tk.Canvas(self.panel_wrap, width=PREPROCESS_PANEL_W,
+                                      highlightthickness=0, bd=0, bg=self.root.cget('bg'))
+        self.panel_sb = tk.Scrollbar(self.panel_wrap, orient='vertical',
+                                     command=self.panel_canvas.yview)
+        self.panel_canvas.configure(yscrollcommand=self.panel_sb.set)
+        self.panel_canvas.pack(side='left', fill='both', expand=True)
+        panel = tk.Frame(self.panel_canvas)
+        self.panel = panel
+        self._panel_win = self.panel_canvas.create_window((0, 0), window=panel, anchor='nw')
+        panel.bind('<Configure>', self._on_panel_configure)
+        self.panel_canvas.bind('<Configure>', self._on_panel_configure)
 
         anim_txt = f'（动图 {self.n_frames} 帧，处理完仍是动图）' if self.n_frames > 1 else ''
         tk.Label(panel, text=f'原图 {self.orig.width}×{self.orig.height}{anim_txt}',
@@ -3727,6 +3752,120 @@ class ImagePreprocessDialog:
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=2)
         tk.Button(btns, text='取消', command=self._cancel,
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=2)
+
+        # 滚轮：右栏内容超出可视区时能滚（Tk 的滚轮事件只发给指针下的控件，不冒泡，
+        # 所以把右栏子树整体绑一遍；作用域限在本对话框内，不动宿主窗口）
+        self._bind_wheel(panel)
+
+    # ---------- R8：窗口尺寸自适应 + 右栏滚动 ----------
+    def _bind_wheel(self, widget):
+        try:
+            widget.bind('<MouseWheel>', self._on_panel_wheel)
+        except Exception:
+            pass
+        try:
+            for ch in widget.winfo_children():
+                self._bind_wheel(ch)
+        except Exception:
+            pass
+
+    def _on_panel_wheel(self, e):
+        """右栏滚轮滚动（没滚动条时 yview_scroll 是空操作，不会动）。"""
+        try:
+            self.panel_canvas.yview_scroll(-1 if int(getattr(e, 'delta', 0)) > 0 else 1, 'units')
+        except Exception:
+            pass
+
+    def _on_panel_configure(self, _e=None):
+        """右栏内容尺寸变化 → 更新滚动范围；并让内容 frame 宽度 == canvas 宽度。
+
+        宽度口径很关键：静态图（无滚动条）时 canvas 宽 240 → 内容宽 240，折行位置与改前
+        「固定 240px 面板」逐像素一致；出滚动条时 canvas 让出 17px，内容宽 223。
+        canvas 未 map 时 winfo_width() 返回 1，必须回落到 cget('width') —— 否则会把内容
+        挤成 1px 宽、需求高度爆表（测试大量在 withdraw 的宿主里跑，这条踩了就必炸）。
+        """
+        try:
+            self.panel_canvas.configure(scrollregion=self.panel_canvas.bbox('all'))
+        except Exception:
+            pass
+        try:
+            w = int(self.panel_canvas.winfo_width())
+            if w <= 1:
+                w = int(self.panel_canvas.cget('width'))
+            if w > 1 and int(getattr(self, '_panel_w_set', 0)) != w:
+                self._panel_w_set = w
+                self.panel_canvas.itemconfigure(self._panel_win, width=w)
+        except Exception:
+            pass
+
+    def _panel_view_h(self):
+        """右栏可视高度（px）——「内容有没有被挤出可视区」的直接判据。
+
+        map 之后用 canvas 实际高度；未 map（测试宿主 withdraw / 构造瞬间）时回落到
+        _fit_dialog_size 算出的目标值，避免 winfo_height()==1 造成误判。
+        """
+        try:
+            h = int(self.panel_canvas.winfo_height())
+            if h > 1:
+                return h
+        except Exception:
+            pass
+        try:
+            return max(1, int(self._panel_h_target))
+        except Exception:
+            return 0
+
+    def _fit_dialog_size(self):
+        """定窗口尺寸：高 = max(左画布需求, 右栏内容需求)，并对屏幕工作区封顶。
+
+        v2.0-R8 修的是 R6 引入的真 bug（用户第三轮实测第 2 条）：
+          改前右栏是固定高（跟左画布 602px），R6 的「▶ 动图预览」区把内容顶到 662px，
+          pack 把最下面的「应用 / 重置 / 取消」压成 1px 且不 map —— 量出来 y=-31、h=1、
+          ismapped=0，用户根本点不到（静态图 534px 不触发，所以只在动图模式暴露）。
+        两条保证：
+          1) 装得下 → 窗口按内容加高，整屏可见（动图 618 → 678px，远小于 1080p 工作区）；
+          2) 装不下（小屏 / 高 DPI / 以后再加东西）→ 右栏出竖直滚动条 + 窗口不越出工作区，
+             滚到底任何控件都可见可点。两条路径都不裁控件。
+        """
+        try:
+            self.root.update_idletasks()
+            pad_h = 16                                   # main 的上下 pad(8+8)
+            cv_h = int(self.cv.winfo_reqheight())        # 左画布（含 1px 描边）
+            cv_w = int(self.cv.winfo_reqwidth())
+            panel_w = int(self.panel_wrap.winfo_reqwidth())
+            content_h = int(self.panel.winfo_reqheight())  # 右栏内容需求高
+            want_h = max(cv_h, content_h) + pad_h
+            work_h = int(screen_work_area_height(self.root))
+            chrome = int(getattr(self, '_chrome_h', 0) or PREPROCESS_CHROME_H)
+            h = min(want_h, max(300, work_h - chrome - 8))
+            view_h = max(120, h - pad_h)
+            self._panel_h_target = view_h
+            need_sb = content_h > view_h
+            if need_sb:
+                self.panel_sb.pack(side='right', fill='y')
+                self.panel_canvas.configure(width=max(140, PREPROCESS_PANEL_W - PREPROCESS_PANEL_SB_W))
+            else:
+                self.panel_sb.pack_forget()
+                self.panel_canvas.configure(width=PREPROCESS_PANEL_W)
+            self._panel_w_set = 0            # 宽度变了 → 让 _on_panel_configure 重设内容宽
+            self._on_panel_configure()
+            self.root.update_idletasks()
+            # 宽度：左画布 + 10 间距 + 右栏 + 左右 pad(10+10)（1080p 下 = 912px，与改前一致）
+            w = cv_w + 10 + panel_w + 20
+            try:
+                wat, wab = screen_work_area(self.root)
+                scr_w = int(self.root.winfo_screenwidth())
+                x = max(0, (scr_w - w) // 2)
+                y = wat + max(0, ((wab - wat) - (h + chrome)) // 2)
+                self.root.geometry(f'{w}x{h}+{x}+{y}')
+            except Exception:
+                self.root.geometry(f'{w}x{h}')
+            self.root.update_idletasks()
+        except Exception as e:
+            try:
+                _write_log(f'[预处理布局] 尺寸自适应失败: {e}')
+            except Exception:
+                pass
 
     # ---------- 坐标换算 ----------
     def _fit(self):
