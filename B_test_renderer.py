@@ -189,7 +189,39 @@ def main():
         base_missing = [n for n in base_api if not callable(getattr(R.Renderer, n, None))]
         check('B7 Renderer 基类对外接口完整（FollowOverlay 只认这套）',
               not base_missing, f'missing={base_missing}')
-        check('B8 alpha 实装能力齐备（向量化预乘 + 分层窗推送 + 状态复位）',
+        # B8：退化输入的安全网（行为断言，真实执行；t3 曾把这条换成 callable 恒真断言 → 覆盖归零，
+        # 本处按 t6 审查意见恢复：不抛异常 **且** 返回明确的失败值）
+        deg_img = Image.new('RGBA', (2, 2), (10, 20, 30, 128))
+        deg_res, deg_err = {}, {}
+
+        def _probe(tag, fn):
+            try:
+                deg_res[tag] = fn()
+            except Exception as e:
+                deg_res[tag] = None
+                deg_err[tag] = repr(e)
+
+        nowin = R.LayeredRenderer(_StubOverlay(None), 'alpha')   # 无窗口壳（root=None）
+        _probe('ensure_0', lambda: r_alpha.ensure_layered(0))
+        _probe('ensure_none', lambda: r_alpha.ensure_layered(None))
+        _probe('push_hwnd0', lambda: r_alpha.push_bitmap(0, deg_img, 0, 0))
+        _probe('push_frame_nowin', lambda: nowin.push_frame(deg_img))
+        _probe('clear_noframe', lambda: nowin.clear())
+        check('B8a ensure_layered(0/None) 不抛且明确返回 False',
+              'ensure_0' not in deg_err and 'ensure_none' not in deg_err
+              and deg_res.get('ensure_0') is False and deg_res.get('ensure_none') is False,
+              f'res={deg_res!r} err={deg_err!r}')
+        check('B8b push_bitmap(hwnd=0) 真走 GDI 路径：不抛且返回 False（不误报成功）',
+              'push_hwnd0' not in deg_err and deg_res.get('push_hwnd0') is False,
+              f'res={deg_res.get("push_hwnd0")!r} err={deg_err.get("push_hwnd0")!r} '
+              f'last_error={r_alpha.last_error!r}')
+        check('B8c 无窗口 overlay 的 push_frame 不抛且返回 False',
+              'push_frame_nowin' not in deg_err and deg_res.get('push_frame_nowin') is False,
+              f'res={deg_res.get("push_frame_nowin")!r} err={deg_err.get("push_frame_nowin")!r}')
+        check('B8d 无帧无句柄的 clear() 不抛且明确返回 False',
+              'clear_noframe' not in deg_err and deg_res.get('clear_noframe') is False,
+              f'res={deg_res.get("clear_noframe")!r} err={deg_err.get("clear_noframe")!r}')
+        check('B8e alpha 实装能力齐备（向量化预乘 + 分层窗推送 + 状态复位）',
               callable(R.LayeredRenderer.premultiply_bgra)
               and callable(R.LayeredRenderer.push_bitmap)
               and callable(R.LayeredRenderer.ensure_layered)
