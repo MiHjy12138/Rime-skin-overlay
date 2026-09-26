@@ -26,6 +26,13 @@ v0.7 配置向导（所见即所得）：
 
 依赖: 主程序仅 Python 标准库；预览/光环需 Pillow（可选）
 快捷键: Ctrl+Alt+C 隐藏/显示 | Ctrl+Alt+Q 退出 | 拖动微调 | 滚轮缩放 | 右键菜单
+
+v2.0-③ 选图自动生成候选框配色（升级四）：
+  向导「🎨 生成候选框配色…」→ 从当前图片（动图取所有帧的颜色并集）提主色/强调色/背景色
+  → 生成 21 字段配色方案（亮 color_scheme + 暗 color_scheme_dark，自动对比度校正）
+  → 备份 weasel.custom.yaml.bak-<时间戳> 后按 patch 扁平键合并注入 → WeaselDeployer 重部署。
+  皮肤档案记录配色名，切皮肤时图/参数/配色整套恢复（光环经 get_rime_accent 自动联动）。
+  未生成过配色（配置里无 rime_scheme）时全链路静默跳过 —— 老用户零感知。
 """
 import sys, os, json, time, threading, re, queue, collections
 import tkinter as tk
@@ -336,6 +343,9 @@ DEFAULT_CONFIG = {
     'corner_radius': 24,       # 圆角半径（px，按缩放后的显示尺寸）
     'feather_enabled': False,  # 点阵羽化（边缘 alpha 用有序抖动近似成渐变）
     'feather_radius': 24,      # 羽化带宽（px，0~80）
+    # ③ 候选框配色绑定（升级四）：空 = 未生成/未绑定 → 全链路静默跳过（老用户零感知）
+    'rime_scheme': '',         # 亮套 Rime 配色方案名（生成后写入；切皮肤时整套恢复）
+    'rime_scheme_dark': '',    # 暗套 Rime 配色方案名
 }
 
 def load_config():
@@ -439,19 +449,8 @@ def read_rime_layout():
       否则 → 单行
     """
     def parse_file(path):
-        data = {}
-        if not os.path.exists(path):
-            return data
-        try:
-            with open(path, encoding='utf-8') as f:
-                for ln in f:
-                    s = ln.strip()
-                    if s.startswith('"') and ':' in s:
-                        key, _, val = s.partition(':')
-                        data[key.strip().strip('"')] = val.strip()
-        except Exception:
-            pass
-        return data
+        # 统一走模块级解析（口径与 ③ 配色注入一致：只认 "扁平键": 值 行）
+        return parse_flat_yaml(path)
 
     custom = parse_file(WEASEL_CUSTOM)
     base = parse_file(WEASEL_BASE)
@@ -495,6 +494,811 @@ def get_rime_accent():
     except Exception:
         pass
     return default
+
+
+# ============ ③ Rime 候选框配色自动生成与安全注入（升级四）============
+# 管线：选图 → 提主色/强调色/背景色（动图取所有帧的颜色并集）→ 生成 21 字段配色方案
+# （亮 color_scheme + 暗 color_scheme_dark）→ 自动对比度校正 → 备份后按 patch 扁平键
+# 合并进 weasel.custom.yaml → 调 WeaselDeployer 重部署 → 皮肤档案记配色名（切皮肤整套恢复）。
+# 字段名以本机 weasel.custom.yaml 现成先例（furina_aqua / furina_night / yuzu_orange /
+# spring_bloom 等；其中 21 键的 6 套为基准）为准，一字不差：无遗漏、无多余。
+# 默认不动作：皮肤/配置里没有 rime_scheme 键时，全链路静默跳过（老用户零感知）。
+SCHEME_FIELDS = (
+    'name', 'author', 'color_format',
+    'back_color', 'border_color', 'shadow_color',
+    'text_color', 'label_color', 'comment_text_color',
+    'candidate_text_color', 'candidate_back_color',
+    'hilited_text_color', 'hilited_back_color',
+    'hilited_candidate_text_color', 'hilited_candidate_back_color',
+    'hilited_candidate_border_color', 'hilited_label_color',
+    'hilited_comment_text_color', 'hilited_candidate_shadow_color',
+    'nextpage_color', 'prevpage_color',
+)   # 恰好 21 个字段
+SCHEME_AUTHOR = 'RimeSkinOverlay'
+SCHEME_SCAN_EDGE = 256           # 颜色统计前把帧缩到最长边（NEAREST，不引入混合色）
+SCHEME_MAX_SCAN_FRAMES = 240     # 帧数上限（GIF 通常 <100 帧；超过才均匀采样）
+SCHEME_MIN_DELTA_MAIN = 100      # 主文字与所在背景的亮度差下限（0-255 luma，手册口径）
+SCHEME_MIN_DELTA_SUB = 70        # 次级文字（序号/注释/翻页箭头）亮度差下限
+SCHEME_MIN_DELTA_ACCENT_BG = 40  # 强调色与候选栏底色的亮度差下限
+SCHEME_MIN_DELTA_BORDER = 30     # 边框/选中边框与所在底色的亮度差下限
+SCHEME_BG_LIGHT_MIN_LUMA = 215   # 亮套候选栏底色亮度下限（保证浅底深字）
+SCHEME_BG_DARK_MAX_LUMA = 70     # 暗套候选栏底色亮度上限（保证深底浅字）
+SCHEME_TEXT_FLIP_LUMA = 140      # 高亮块亮度 ≥ 此值 → 用深色文字（否则浅色）
+SCHEME_DEPLOY_TIMEOUT = 30.0     # WeaselDeployer 等待上限（秒）；超时明确报错不静默
+SCHEME_DEPLOY_HINT = '可手动部署：右键小狼毫托盘图标 →「重新部署」'
+SCHEME_MANIFEST = os.path.join(HERE, 'rime_schemes.json')  # 本工具生成过的方案记录（清残留用）
+
+# 扁平键行：  "preset_color_schemes/<方案>/<字段>": <值>
+_SCHEME_LINE_RE = re.compile(r'''^(\s*)["']?preset_color_schemes/([^/"']+)/([^"']+?)["']?\s*:\s*(.*?)\s*$''')
+# 当前配色行：  "style/color_scheme" / "style/color_scheme_dark"
+_ACTIVE_LINE_RE = re.compile(r'''^(\s*)["']?(style/color_scheme(?:_dark)?)["']?\s*:\s*(.*?)\s*$''')
+_PATCH_LINE_RE = re.compile(r'^(\s*)patch\s*:\s*$')
+
+
+def _clamp8(v):
+    return 0 if v < 0 else (255 if v > 255 else int(round(v)))
+
+
+def _luma255(rgb):
+    """感知亮度（手册口径 L = 0.299R + 0.587G + 0.114B，0-255 标度）"""
+    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
+
+
+def _contrast_ratio(c1, c2):
+    """WCAG 对比度（1~21，附带参考；主判定用 _luma255 差）"""
+    def _lin(c):
+        c = c / 255.0
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    l1 = 0.2126 * _lin(c1[0]) + 0.7152 * _lin(c1[1]) + 0.0722 * _lin(c1[2])
+    l2 = 0.2126 * _lin(c2[0]) + 0.7152 * _lin(c2[1]) + 0.0722 * _lin(c2[2])
+    hi, lo = (l1, l2) if l1 >= l2 else (l2, l1)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _mix(c1, c2, t):
+    """线性混色（t=0 取 c1，t=1 取 c2）"""
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    return (_clamp8(c1[0] + (c2[0] - c1[0]) * t),
+            _clamp8(c1[1] + (c2[1] - c1[1]) * t),
+            _clamp8(c1[2] + (c2[2] - c1[2]) * t))
+
+
+def _saturation(rgb):
+    """饱和度（max-min，0-255）"""
+    return max(rgb[:3]) - min(rgb[:3])
+
+
+def _color_dist(c1, c2):
+    """RGB 欧氏距离（0-441）"""
+    return ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2 + (c1[2] - c2[2]) ** 2) ** 0.5
+
+
+def _vivid(rgb, amount=1.2):
+    """提饱和：把颜色往远离其灰度等值线的方向拉（保持亮度）"""
+    gray = _luma255(rgb)
+    return tuple(_clamp8(gray + (v - gray) * amount) for v in rgb[:3])
+
+
+def _push_luma(rgb, min_luma=None, max_luma=None):
+    """把颜色亮度推到达标区间（保持色相，往白/黑插值）；已在区间内则原样返回"""
+    l = _luma255(rgb)
+    if min_luma is not None and l < min_luma:
+        target = (255, 255, 255)
+    elif max_luma is not None and l > max_luma:
+        target = (0, 0, 0)
+    else:
+        return tuple(rgb[:3])
+    for i in range(1, 41):
+        c = _mix(rgb, target, i / 40.0)
+        if min_luma is not None and _luma255(c) >= min_luma:
+            return c
+        if max_luma is not None and _luma255(c) <= max_luma:
+            return c
+    return tuple(target)
+
+
+def _ensure_delta(fg, bg, min_delta, prefer=None):
+    """保证 fg 与 bg 的 luma 差 ≥ min_delta（保持色相：往黑/白方向最小步插值）。
+
+    prefer='dark'/'light' 指定优先方向（浅底压深 / 深底提亮）；首选方向到不了上限就换另一方向。
+    返回「最接近原色且达标」的颜色——这就是自动对比度校正的核心。
+    """
+    lb = _luma255(bg)
+    if abs(_luma255(fg) - lb) >= min_delta:
+        return tuple(fg[:3])
+    if prefer not in ('dark', 'light'):
+        prefer = 'dark' if lb >= 128 else 'light'
+    order = [('dark', (0, 0, 0)), ('light', (255, 255, 255))]
+    if prefer == 'light':
+        order.reverse()
+    best = tuple(fg[:3])
+    for _tag, target in order:
+        for i in range(1, 41):
+            c = _mix(fg, target, i / 40.0)
+            if abs(_luma255(c) - lb) >= min_delta:
+                return c
+            best = c
+    return best
+
+
+def _text_on(bg, light_src, dark_src, min_delta):
+    """在底色 bg（通常是高亮块）上选文字色：块亮→深字、块暗→浅字，再保证 luma 差达标"""
+    if _luma255(bg) >= SCHEME_TEXT_FLIP_LUMA:
+        return _ensure_delta(dark_src, bg, min_delta, prefer='dark')
+    return _ensure_delta(light_src, bg, min_delta, prefer='light')
+
+
+def _hex6(rgb):
+    """0xRRGGBB（Rime 配色标准写法，与 weasel.custom.yaml 先例一致）"""
+    return '0x%02X%02X%02X' % (rgb[0], rgb[1], rgb[2])
+
+
+def _hex8(rgb, alpha):
+    """0xAARRGGBB（带透明度：边框/投影用；alpha 为 'AA'/'1A' 之类 2 位十六进制）"""
+    return '0x%s%02X%02X%02X' % (str(alpha).upper().zfill(2), rgb[0], rgb[1], rgb[2])
+
+
+def _parse_hex_color(s):
+    """'0xDCE2F0' / '0x4A6FA599' / '#RRGGBB' → (r,g,b)；失败返回 None"""
+    try:
+        t = str(s).strip().strip('"').strip("'")
+        if t.lower().startswith('0x'):
+            v = int(t[2:], 16)
+        elif t.startswith('#'):
+            v = int(t[1:], 16)
+        else:
+            return None
+        if v > 0xFFFFFF:      # 带 alpha（AARRGGBB）→ 丢弃 alpha，取颜色
+            v &= 0xFFFFFF
+        return ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+    except Exception:
+        return None
+
+
+# ---------- 颜色提取（单图 / 动图多帧并集）----------
+def collect_scheme_frames(path, Image=None, max_frames=SCHEME_MAX_SCAN_FRAMES):
+    """打开图片并返回 (帧列表, meta)。动图默认取**所有帧**的颜色并集（超上限才均匀采样）。"""
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
+    src = Image.open(path)
+    try:
+        n = int(getattr(src, 'n_frames', 1) or 1)
+    except Exception:
+        n = 1
+    idxs = list(range(n))
+    sampled = False
+    if max_frames and n > max_frames:
+        step = n / float(max_frames)
+        idxs = sorted({min(n - 1, int(i * step)) for i in range(max_frames)} | {0, n - 1})
+        sampled = True
+    frames = []
+    for i in idxs:
+        try:
+            src.seek(i)
+            frames.append(src.convert('RGBA'))
+        except Exception:
+            break
+    meta = {'n_frames': n, 'used': len(frames), 'sampled': sampled}
+    try:
+        src.seek(0)
+    except Exception:
+        pass
+    return frames, meta
+
+
+def _frame_color_stats(frames, Image=None, top_n=24):
+    """多帧颜色统计：每帧缩到 ≤SCHEME_SCAN_EDGE → 4bit/通道量化累加（权重=像素数）。
+
+    alpha<128 的像素不计入（透明底角色图的关键：背景不该污染配色）。
+    返回 (色块列表[按权重降序, 每项 {'rgb','w','share'}], 参与统计的像素总数)。
+    """
+    if Image is None:
+        from PIL import Image as _I
+        Image = _I
+    buckets = {}
+    total = 0
+    for img in frames or []:
+        if img is None:
+            continue
+        try:
+            small = img
+            longest = max(img.size)
+            if longest > SCHEME_SCAN_EDGE:
+                s = SCHEME_SCAN_EDGE / float(longest)
+                small = img.resize((max(1, int(img.width * s)),
+                                    max(1, int(img.height * s))), Image.NEAREST)
+            cnt = small.getcolors(max(1, small.width * small.height))
+        except Exception:
+            cnt = None
+        if not cnt:
+            continue
+        for n, c in cnt:
+            if not c:
+                continue
+            a = c[3] if len(c) > 3 else 255
+            if a < 128:
+                continue
+            r, g, b = c[0], c[1], c[2]
+            d = buckets.setdefault((r >> 4, g >> 4, b >> 4), [0, 0, 0, 0])
+            d[0] += n
+            d[1] += r * n
+            d[2] += g * n
+            d[3] += b * n
+            total += n
+    out = []
+    for _k, d in buckets.items():
+        w = d[0]
+        if w <= 0:
+            continue
+        out.append({'rgb': (d[1] // w, d[2] // w, d[3] // w), 'w': w,
+                    'share': (w / float(total)) if total else 0.0})
+    out.sort(key=lambda s: -s['w'])
+    return out[:max(1, top_n)], total
+
+
+def extract_scheme_theme(frames, Image=None):
+    """从（单图或多帧动图的）RGBA 图提取主题色，返回 dict：
+
+      primary   主色（权重最高、且有彩色优先）
+      accent    强调色（与主色距离够远、权重够大的次显著色；没有就由主色派生）
+      bg_light  亮套候选栏底色（图里最亮显著色的浅化版，亮度 ≥ SCHEME_BG_LIGHT_MIN_LUMA）
+      bg_dark   暗套候选栏底色（图里最暗显著色的深化版，亮度 ≤ SCHEME_BG_DARK_MAX_LUMA）
+      is_dark   原图是否整体偏暗（向导提示用）
+      swatches  色块统计明细（调试/测试用）
+    """
+    sw, _total = _frame_color_stats(frames, Image)
+    if not sw:
+        base = (90, 110, 140)
+        return {'primary': base, 'accent': _vivid(base, 1.3),
+                'bg_light': _push_luma(base, min_luma=SCHEME_BG_LIGHT_MIN_LUMA),
+                'bg_dark': _push_luma(base, max_luma=SCHEME_BG_DARK_MAX_LUMA),
+                'is_dark': False, 'swatches': []}
+    sig = [s for s in sw if s['share'] >= 0.06] or sw[:6]
+    colored = [s for s in sig if _saturation(s['rgb']) >= 24 and 18 <= _luma255(s['rgb']) <= 242]
+    primary = (colored or sig)[0]['rgb']
+    cands = [s for s in sw if _color_dist(s['rgb'], primary) >= 70 and s['share'] >= 0.02]
+    if cands:
+        accent = max(cands, key=lambda s: s['share'] *
+                     (1.0 + _saturation(s['rgb']) / 255.0 * 1.6))['rgb']
+    else:
+        away = (255, 255, 255) if _luma255(primary) < 128 else (0, 0, 0)
+        accent = _vivid(_mix(primary, away, 0.30), 1.25)
+    sig2 = [s for s in sw if s['share'] >= 0.02] or sw
+    bright = max(sig2, key=lambda s: _luma255(s['rgb']))['rgb']
+    darkc = min(sig2, key=lambda s: _luma255(s['rgb']))['rgb']
+    return {'primary': primary,
+            'accent': accent,
+            'bg_light': _push_luma(_mix(bright, (255, 255, 255), 0.62),
+                                   min_luma=SCHEME_BG_LIGHT_MIN_LUMA),
+            'bg_dark': _push_luma(_mix(darkc, (0, 0, 0), 0.62),
+                                  max_luma=SCHEME_BG_DARK_MAX_LUMA),
+            'is_dark': (_luma255(bright) < 118 or _luma255(primary) < 90),
+            'swatches': sw[:8]}
+
+
+def make_scheme_names(skin_name):
+    """皮肤名 → (亮配色名, 暗配色名)。Rime 方案名只用 ASCII 安全字符；中文名走稳定哈希。"""
+    s = ''.join(ch for ch in str(skin_name or '').lower() if ch.isascii() and ch.isalnum())[:28]
+    if len(s) < 2:
+        import zlib
+        s = 'skin%08x' % (zlib.crc32(str(skin_name or '').encode('utf-8')) & 0xFFFFFFFF)
+    base = 'rime_' + s
+    return base, base + '_dark'
+
+
+def build_scheme_fields(skin_name, theme, dark=False, scheme=None, author=SCHEME_AUTHOR):
+    """按主题色生成**恰好 21 个字段**的 Rime 配色方案（值全为字符串）。
+
+    dark=False 亮套（浅底深字）/ dark=True 暗套（深底浅字）。
+    所有文字色都过 _ensure_delta 校正：与所在背景的 luma 差 ≥ SCHEME_MIN_DELTA_MAIN(100)，
+    次级文字 ≥ SCHEME_MIN_DELTA_SUB(70)，强调色与候选栏底色差 ≥ SCHEME_MIN_DELTA_ACCENT_BG(40)。
+    """
+    name = scheme or make_scheme_names(skin_name)[1 if dark else 0]
+    prim = theme['primary']
+    bg = theme['bg_dark'] if dark else theme['bg_light']
+    # 强调色：先与候选栏底色拉开亮度差（保证高亮块在候选栏上看得清）
+    acc = _ensure_delta(theme['accent'], bg, SCHEME_MIN_DELTA_ACCENT_BG,
+                        prefer='light' if dark else 'dark')
+    if dark:
+        text_src = _mix(prim, (255, 255, 255), 0.45)
+        strong_src = _mix(prim, (255, 255, 255), 0.82)
+        soft_src = _mix(theme['accent'], (255, 255, 255), 0.22)
+        shadow_rgb, shadow_a, main_pref = (0, 0, 0), '40', 'light'
+    else:
+        text_src = _mix(prim, (0, 0, 0), 0.45)
+        strong_src = _mix(prim, (0, 0, 0), 0.74)
+        soft_src = _mix(theme['accent'], (0, 0, 0), 0.28)
+        shadow_rgb, shadow_a, main_pref = _mix(theme['bg_dark'], (0, 0, 0), 0.40), '1A', 'dark'
+    on_acc_light = _mix(theme['bg_light'], (255, 255, 255), 0.30)
+    on_acc_dark = _mix(theme['bg_dark'], (0, 0, 0), 0.20)
+    text_color = _ensure_delta(text_src, bg, SCHEME_MIN_DELTA_MAIN, main_pref)
+    cand_text = _ensure_delta(strong_src, bg, SCHEME_MIN_DELTA_MAIN, main_pref)
+    label = _ensure_delta(_mix(acc, bg, 0.30), bg, SCHEME_MIN_DELTA_SUB, main_pref)
+    comment = _ensure_delta(_mix(soft_src, bg, 0.45), bg, SCHEME_MIN_DELTA_SUB, main_pref)
+    hilited_text = _text_on(acc, on_acc_light, on_acc_dark, SCHEME_MIN_DELTA_MAIN)
+    hilited_cand_text = _text_on(acc, on_acc_light, on_acc_dark, SCHEME_MIN_DELTA_MAIN)
+    hilited_label = _text_on(acc, on_acc_light, on_acc_dark, SCHEME_MIN_DELTA_SUB)
+    hilited_comment = _text_on(acc, on_acc_light, on_acc_dark, SCHEME_MIN_DELTA_SUB)
+    border = _ensure_delta(_mix(acc, bg, 0.55), bg, SCHEME_MIN_DELTA_BORDER, main_pref)
+    hi_border = _ensure_delta(_mix(acc, (255, 255, 255) if dark else (0, 0, 0), 0.45),
+                              acc, SCHEME_MIN_DELTA_BORDER,
+                              'light' if dark else 'dark')
+    label_hex = _hex6(label)
+    return {
+        'name': '%s %s' % (skin_name or name, name),
+        'author': author,
+        'color_format': 'rgba',
+        'back_color': _hex6(bg),
+        'border_color': _hex8(border, 'AA'),
+        'shadow_color': _hex8(shadow_rgb, shadow_a),
+        'text_color': _hex6(text_color),
+        'label_color': label_hex,
+        'comment_text_color': _hex6(comment),
+        'candidate_text_color': _hex6(cand_text),
+        'candidate_back_color': _hex6(bg),
+        'hilited_text_color': _hex6(hilited_text),
+        'hilited_back_color': _hex6(acc),
+        'hilited_candidate_text_color': _hex6(hilited_cand_text),
+        'hilited_candidate_back_color': _hex6(acc),
+        'hilited_candidate_border_color': _hex6(hi_border),
+        'hilited_label_color': _hex6(hilited_label),
+        'hilited_comment_text_color': _hex6(hilited_comment),
+        'hilited_candidate_shadow_color': _hex8(acc, '30'),
+        'nextpage_color': label_hex,
+        'prevpage_color': label_hex,
+    }
+
+
+# ---------- weasel.custom.yaml 扁平键解析 / 合并（纯函数，dry-run 友好）----------
+def parse_flat_yaml_text(text):
+    """解析扁平键（口径与 read_rime_layout 原有实现一致：只认 "键": 值 行）"""
+    data = {}
+    for ln in (text or '').splitlines():
+        s = ln.strip()
+        if s.startswith('"') and ':' in s:
+            key, _, val = s.partition(':')
+            data[key.strip().strip('"')] = val.strip()
+    return data
+
+
+def parse_flat_yaml(path):
+    """读文件并解析扁平键；文件不存在/读失败返回 {}（不抛异常）"""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            return parse_flat_yaml_text(f.read())
+    except Exception:
+        return {}
+
+
+def _flat_value(flat, key):
+    """取扁平键值并去掉可能的引号/行尾注释（用于比较 style/color_scheme 等）"""
+    v = flat.get(key)
+    if v is None:
+        return None
+    body, _cmt = _split_line_comment(str(v))   # YAML 口径：空白后的 # 起是注释，不算值
+    return body.strip().strip('"').strip("'")
+
+
+def _format_scheme_line(scheme, field, value, indent='  '):
+    """生成一行 patch 扁平键（name 值加双引号，与先例一致）"""
+    val = '"%s"' % str(value) if field == 'name' else str(value)
+    return '%s"preset_color_schemes/%s/%s": %s' % (indent, scheme, field, val)
+
+
+def _split_line_comment(line):
+    """拆出行尾注释（引号外的 # 起）；返回 (主体, 注释串含其前空白)。用于改值时保留注释"""
+    in_q = None
+    for i, ch in enumerate(line):
+        if in_q:
+            if ch == in_q:
+                in_q = None
+        elif ch in '"\'':
+            in_q = ch
+        elif ch == '#':
+            return line[:i].rstrip(), line[i:]
+    return line, ''
+
+
+def _patch_insert_index(lines):
+    """patch 段末尾的插入位置（紧贴块内最后一个非空非注释行之后）"""
+    pi = None
+    for i, ln in enumerate(lines):
+        if _PATCH_LINE_RE.match(ln):
+            pi = i
+            break
+    if pi is None:
+        return len(lines)
+    last = pi
+    for j in range(pi + 1, len(lines)):
+        ln = lines[j]
+        if not ln.strip() or ln.lstrip().startswith('#'):
+            continue
+        if (len(ln) - len(ln.lstrip())) == 0:
+            break                      # 下一个顶级键 → patch 段结束
+        last = j
+    return last + 1
+
+
+def merge_scheme_into_yaml(text, schemes, set_active=False, stale_schemes=(),
+                           active_light=None, active_dark=None):
+    """把配色方案按 patch 扁平键合并进 weasel.custom.yaml 文本（纯函数，不落盘）。
+
+    schemes: [(方案名, {字段: 值}), ...]；字段集合限定在 SCHEME_FIELDS 内（不写野字段）。
+    规则：
+      · 同名方案的同名字段 → 就地替换该行值（保留缩进）；新字段 → 追加到 patch 段末尾
+      · 其它配色方案、注释、style/* 、用户自定义键：默认一字不动（set_active=False）
+      · set_active=True 时只额外改 style/color_scheme(_dark) 两个键（用户确认「一并切换」时）
+      · stale_schemes：本工具上次生成、本次改名后残留的方案 → 整段键行删除（不堆垃圾）
+    返回 (新文本, diff 行列表, 统计 dict)
+    """
+    nl = '\r\n' if '\r\n' in (text or '') else '\n'
+    lines = (text or '').splitlines()
+    want = {}
+    for sname, fields in schemes or []:
+        if not sname or not fields:
+            continue
+        for f in SCHEME_FIELDS:                    # 只认 21 个字段
+            if f in fields:
+                want[(sname, f)] = fields[f]
+    stale = set(stale_schemes or ())
+    out, diff = [], []
+    hit, updated, removed = set(), 0, 0
+    for ln in lines:
+        s = ln.strip()
+        if s and not s.startswith('#'):
+            m = _SCHEME_LINE_RE.match(ln)
+            if m:
+                sname, fname = m.group(2), m.group(3)
+                if sname in stale:
+                    diff.append('- ' + s)
+                    removed += 1
+                    continue
+                key = (sname, fname)
+                if key in want:
+                    newln = _format_scheme_line(sname, fname, want[key], m.group(1))
+                    _body, _cmt = _split_line_comment(ln)
+                    if _cmt:                       # 保留用户写的行尾注释
+                        newln = newln + '  ' + _cmt
+                    hit.add(key)
+                    if newln.strip() != s:
+                        diff.append('- ' + s)
+                        diff.append('+ ' + newln.strip())
+                        updated += 1
+                    out.append(newln)
+                    continue
+            elif set_active:
+                ma = _ACTIVE_LINE_RE.match(ln)
+                if ma:
+                    flat = ma.group(2)
+                    newv = active_light if flat == 'style/color_scheme' else active_dark
+                    if newv:
+                        newln = '%s"%s": %s' % (ma.group(1), flat, newv)
+                        _body, _cmt = _split_line_comment(ln)
+                        if _cmt:
+                            newln = newln + '  ' + _cmt
+                        if newln.strip() != s:
+                            diff.append('- ' + s)
+                            diff.append('+ ' + newln.strip())
+                            updated += 1
+                        out.append(newln)
+                        continue
+        out.append(ln)
+    add = []
+    for sname, fields in schemes or []:
+        for f in SCHEME_FIELDS:
+            if fields and f in fields and (sname, f) not in hit:
+                add.append(_format_scheme_line(sname, f, fields[f]))
+    if set_active:
+        present = set()
+        for ln in out:
+            ma = _ACTIVE_LINE_RE.match(ln)
+            if ma:
+                present.add(ma.group(2))
+        if active_light and 'style/color_scheme' not in present:
+            add.append('  "style/color_scheme": %s' % active_light)
+        if active_dark and 'style/color_scheme_dark' not in present:
+            add.append('  "style/color_scheme_dark": %s' % active_dark)
+    if add:
+        ins = _patch_insert_index(out)
+        for a in add:
+            out.insert(ins, a)
+            ins += 1
+            diff.append('+ ' + a.strip())
+    new_text = nl.join(out)
+    if text.endswith(('\n', '\r')) or not text:
+        new_text += nl
+    return new_text, diff, {'added': len(add), 'updated': updated, 'removed': removed}
+
+
+def plan_scheme_injection(path=None, skin='', light=None, dark=None,
+                          scheme_light=None, scheme_dark=None, set_active=False,
+                          stale_schemes=(), dry_run=False):
+    """规划一次配色注入：只读文件 + 纯计算，返回 plan（不落盘）。
+
+    plan = {ok, msg, target, diff, stats, new_text, old_text, dry_run, created, ...}
+    dry_run=True 的计划带 dry_run 标记，apply_scheme_injection 会拒绝落盘（双保险）。
+    """
+    tgt = path or WEASEL_CUSTOM
+    res = {'ok': False, 'msg': '', 'target': tgt, 'skin': skin, 'dry_run': bool(dry_run),
+           'set_active': bool(set_active), 'created': False, 'diff': [], 'stats': {},
+           'new_text': '', 'old_text': '', 'scheme_light': scheme_light,
+           'scheme_dark': scheme_dark}
+    parent = os.path.dirname(os.path.abspath(tgt))
+    if os.path.exists(tgt):
+        try:
+            # newline='' 保留原始换行（CRLF 文件写回仍是 CRLF，不改用户文件风格）
+            with open(tgt, encoding='utf-8', newline='') as f:
+                text = f.read()
+        except Exception as e:
+            res['msg'] = '读取 %s 失败：%s' % (tgt, e)
+            return res
+    else:
+        if not os.path.isdir(parent):
+            res['msg'] = '未找到 Rime 配置目录：%s（请先安装小狼毫 Weasel）' % parent
+            return res
+        text, res['created'] = '', True
+    base_text = text if text.strip() else 'patch:%s' % ('\n')
+    schemes = [(scheme_light, light or {}), (scheme_dark, dark or {})]
+    new_text, diff, stats = merge_scheme_into_yaml(
+        base_text, schemes, set_active=set_active, stale_schemes=stale_schemes,
+        active_light=scheme_light, active_dark=scheme_dark)
+    res.update(new_text=new_text, old_text=text, diff=diff, stats=stats, ok=True)
+    res['msg'] = '计划：新增 %d 行 / 修改 %d 行 / 删除 %d 行' % (
+        stats['added'], stats['updated'], stats['removed'])
+    return res
+
+
+def apply_scheme_injection(plan, ts=None):
+    """执行注入：先备份 weasel.custom.yaml.bak-<时间戳>，再写合并结果。
+
+    返回 {ok, msg, backup, path, bytes}。dry-run 计划 / 无变化 / 写入失败都不静默：
+    msg 里带明确原因与备份路径。
+    """
+    res = {'ok': False, 'msg': '', 'backup': None, 'path': None, 'bytes': 0}
+    if not plan or not plan.get('ok'):
+        res['msg'] = (plan or {}).get('msg') or '没有可写入的配色计划'
+        return res
+    if plan.get('dry_run'):
+        res['msg'] = 'dry-run 计划不落盘（未写入任何文件）'
+        return res
+    tgt = plan['target']
+    res['path'] = tgt
+    if not plan.get('diff'):
+        res['ok'] = True
+        res['msg'] = '内容与现状一致，无需写入（未落盘）'
+        return res
+    if os.path.exists(tgt):
+        import shutil
+        stamp = ts or time.strftime('%Y%m%d-%H%M%S')
+        bak = '%s.bak-%s' % (tgt, stamp)
+        n = 0
+        while os.path.exists(bak):
+            n += 1
+            bak = '%s.bak-%s-%d' % (tgt, stamp, n)
+        try:
+            shutil.copy2(tgt, bak)
+            res['backup'] = bak
+        except Exception as e:
+            res['msg'] = '备份失败（已中止写入）：%s' % e
+            return res
+    try:
+        # 原子写：先写同目录临时文件再替换，避免写一半崩溃导致 yaml 损坏
+        tmp_path = tgt + '.tmp-scheme-write'
+        with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
+            f.write(plan['new_text'])
+        os.replace(tmp_path, tgt)
+    except Exception as e:
+        try:
+            if os.path.exists(tgt + '.tmp-scheme-write'):
+                os.remove(tgt + '.tmp-scheme-write')
+        except Exception:
+            pass
+        res['msg'] = '写入失败：%s%s' % (e, ('（原文件已备份：%s）' % res['backup']) if res['backup'] else '')
+        return res
+    res['ok'] = True
+    res['bytes'] = len(plan['new_text'].encode('utf-8'))
+    res['msg'] = '已写入 %s（%d 字节）%s' % (os.path.basename(tgt), res['bytes'],
+                                        ('；备份：%s' % os.path.basename(res['backup']))
+                                        if res['backup'] else '；新建文件（无旧文件可备份）')
+    return res
+
+
+def restore_weasel_backup(bak_path, target=None):
+    """从 .bak 还原 weasel.custom.yaml（还原前把当前文件另存 .bak-restore-<时间戳>）"""
+    res = {'ok': False, 'msg': '', 'backup_of_current': None}
+    if not bak_path or not os.path.exists(bak_path):
+        res['msg'] = '备份文件不存在：%s' % bak_path
+        return res
+    tgt = target or WEASEL_CUSTOM
+    try:
+        import shutil
+        if os.path.exists(tgt):
+            keep = '%s.bak-restore-%s' % (tgt, time.strftime('%Y%m%d-%H%M%S'))
+            shutil.copy2(tgt, keep)
+            res['backup_of_current'] = keep
+        shutil.copy2(bak_path, tgt)
+    except Exception as e:
+        res['msg'] = '还原失败：%s' % e
+        return res
+    res['ok'] = True
+    res['msg'] = '已从 %s 还原 %s' % (os.path.basename(bak_path), os.path.basename(tgt))
+    return res
+
+
+def find_latest_weasel_backup(path=None):
+    """找最近的 weasel.custom.yaml.bak-* 备份（按修改时间）；没有返回 None。
+
+    .bak-restore-* 是「还原动作」为保护当前文件生成的副本，不算可选还原源。
+    """
+    tgt = path or WEASEL_CUSTOM
+    d = os.path.dirname(os.path.abspath(tgt))
+    prefix = os.path.basename(tgt) + '.bak-'
+    try:
+        cands = [os.path.join(d, f) for f in os.listdir(d)
+                 if f.startswith(prefix) and '.bak-restore-' not in f]
+    except Exception:
+        return None
+    cands = [c for c in cands if os.path.isfile(c)]
+    if not cands:
+        return None
+    try:
+        return max(cands, key=lambda p: os.path.getmtime(p))
+    except Exception:
+        return cands[0]
+
+
+# ---------- WeaselDeployer 定位与调用（缺失/失败/超时都给明确提示）----------
+def find_weasel_deployer(extra=None):
+    """定位 WeaselDeployer.exe：显式路径 → 环境变量 → PATH → 常见安装目录。找不到返回 None"""
+    import glob as _glob
+    cands = []
+    if extra:
+        cands.append(extra)
+    for env in ('WEASEL_DEPLOYER', 'RIME_WEASEL_DEPLOYER'):
+        if os.environ.get(env):
+            cands.append(os.environ[env])
+    if os.environ.get('WEASEL_DIR'):
+        cands.append(os.path.join(os.environ['WEASEL_DIR'], 'WeaselDeployer.exe'))
+    try:
+        import shutil
+        for name in ('WeaselDeployer.exe', 'WeaselDeployer'):
+            w = shutil.which(name)
+            if w:
+                cands.append(w)
+    except Exception:
+        pass
+    roots = [os.environ.get('ProgramFiles', r'C:\Program Files'),
+             os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+             os.environ.get('LOCALAPPDATA', '')]
+    pats = ('Rime/weasel-*/WeaselDeployer.exe', 'Rime/WeaselDeployer.exe',
+            'Rime/*/WeaselDeployer.exe', 'Rime/weasel/WeaselDeployer.exe')
+    for root in roots:
+        if not root:
+            continue
+        for pat in pats:
+            try:
+                cands.extend(sorted(_glob.glob(os.path.join(root, *pat.split('/'))), reverse=True))
+            except Exception:
+                pass
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def run_weasel_deployer(exe=None, timeout=None, runner=None, extra_dir=None):
+    """调 WeaselDeployer 重部署。返回 {'ok','msg','exe','rc','timed_out'}。
+
+    runner(cmd, timeout) → returncode，可注入（测试用假 runner，不真起进程）。
+    缺失/超时/非 0 返回码/启动异常都返回 ok=False + 明确 msg（绝不静默吞错）。
+    """
+    timeout = SCHEME_DEPLOY_TIMEOUT if timeout is None else timeout
+    res = {'ok': False, 'msg': '', 'exe': None, 'rc': None, 'timed_out': False}
+    path = exe or find_weasel_deployer(extra_dir)
+    res['exe'] = path
+    if not path or not os.path.isfile(path):
+        res['msg'] = ('未找到 WeaselDeployer.exe（小狼毫部署程序）；配色已写入 weasel.custom.yaml，'
+                      '但尚未生效。%s' % SCHEME_DEPLOY_HINT)
+        return res
+    if runner is None:
+        def runner(cmd, _timeout):
+            import subprocess
+            p = subprocess.run([cmd], timeout=_timeout, capture_output=True)
+            return p.returncode
+    try:
+        rc = runner(path, timeout)
+    except Exception as e:
+        if 'Timeout' in type(e).__name__:
+            res['timed_out'] = True
+            res['msg'] = ('WeaselDeployer 超过 %.0f 秒未返回（已放弃等待）。%s'
+                          % (timeout, SCHEME_DEPLOY_HINT))
+        else:
+            res['msg'] = ('调用 WeaselDeployer 失败：%s。%s' % (e, SCHEME_DEPLOY_HINT))
+        return res
+    res['rc'] = rc
+    if rc == 0:
+        res['ok'] = True
+        res['msg'] = '已调用 WeaselDeployer 重新部署（%s）' % os.path.basename(path)
+    else:
+        res['msg'] = ('WeaselDeployer 返回码 %s（部署未成功）。%s' % (rc, SCHEME_DEPLOY_HINT))
+    return res
+
+
+def apply_rime_scheme_binding(cfg, path=None, runner=None, exe=None, timeout=None):
+    """切皮肤时把该皮肤绑定的配色名写回 style/color_scheme(_dark) 并重部署。
+
+    未绑定（cfg 里无 rime_scheme）→ 静默跳过，绝不写文件（新功能默认不动作）。
+    返回 {'ok','msg','skipped','unchanged','backup','deploy'}。
+    """
+    res = {'ok': True, 'msg': '该皮肤未绑定 Rime 配色，跳过', 'skipped': True,
+           'unchanged': False, 'backup': None, 'deploy': None}
+    light = str(cfg.get('rime_scheme') or '').strip()
+    if not light:
+        return res
+    dark = str(cfg.get('rime_scheme_dark') or '').strip()
+    tgt = path or WEASEL_CUSTOM
+    res['skipped'] = False
+    try:
+        if not os.path.exists(tgt):
+            res['ok'] = False
+            res['msg'] = '未找到 %s，无法切换候选框配色' % tgt
+            return res
+        with open(tgt, encoding='utf-8', newline='') as f:
+            cur_text = f.read()
+        flat = parse_flat_yaml_text(cur_text)
+        if _flat_value(flat, 'style/color_scheme') == light and \
+                (not dark or _flat_value(flat, 'style/color_scheme_dark') == dark):
+            res['unchanged'] = True
+            res['msg'] = '候选框配色已是 %s，无需重写' % light
+            return res
+        plan = plan_scheme_injection(tgt, skin=cfg.get('name') or light, light={}, dark={},
+                                     scheme_light=light, scheme_dark=dark, set_active=True)
+        if not plan['ok']:
+            res['ok'] = False
+            res['msg'] = plan['msg']
+            return res
+        wr = apply_scheme_injection(plan)
+        res['backup'] = wr.get('backup')
+        if not wr['ok']:
+            res['ok'] = False
+            res['msg'] = wr['msg']
+            return res
+        dep = run_weasel_deployer(exe=exe, runner=runner, timeout=timeout)
+        res['deploy'] = dep
+        res['msg'] = ('候选框配色已切到 %s%s；%s'
+                      % (light, (' / %s' % dark) if dark else '', dep['msg']))
+        if not dep['ok']:
+            res['ok'] = False          # 文件已写、部署没成 → 明确报「部分完成」
+            res['msg'] = '配色已写入但部署未成功：%s' % dep['msg']
+        return res
+    except Exception as e:
+        res['ok'] = False
+        res['msg'] = '切换候选框配色失败：%s' % e
+        return res
+
+
+# ---------- 生成记录（皮肤改名后清理残留，避免堆垃圾方案）----------
+def load_scheme_manifest():
+    """读本工具生成记录：{皮肤名: [亮方案名, 暗方案名]}；损坏则当空"""
+    try:
+        with open(SCHEME_MANIFEST, encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_scheme_manifest(man):
+    try:
+        with open(SCHEME_MANIFEST, 'w', encoding='utf-8') as f:
+            json.dump(man, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
 
 # 默认抠色键 = 品红（-transparentcolor 最稳的基准色）
 MAGENTA = (255, 0, 255)
@@ -2011,9 +2815,24 @@ class ConfigWizard:
                   font=('Microsoft YaHei', 9)).pack(side='left', padx=(0, 2))
         tk.Button(skin_btns, text='🗑 删除', command=self._delete_skin,
                   font=('Microsoft YaHei', 9)).pack(side='left')
+        # ③ 候选框配色：从当前图片（含动图所有帧）提色 → 生成 21 字段配色 → 注入 + 重部署
+        scheme_row = tk.Frame(skin_box)
+        scheme_row.pack(anchor='w', pady=(3, 0))
+        self.btn_scheme = tk.Button(scheme_row, text='🎨 生成候选框配色…',
+                                    command=self._generate_scheme,
+                                    font=('Microsoft YaHei', 9))
+        self.btn_scheme.pack(side='left')
+        self.btn_scheme_restore = tk.Button(scheme_row, text='↩ 还原配色备份',
+                                            command=self._restore_scheme_backup,
+                                            font=('Microsoft YaHei', 9))
+        self.btn_scheme_restore.pack(side='left', padx=(6, 0))
         self.lbl_skin_hint = tk.Label(skin_box, text='选中即应用，可整套切换',
                                       fg='#999', font=('Microsoft YaHei', 8))
         self.lbl_skin_hint.pack(anchor='w', pady=(2, 0))
+        self.lbl_scheme_hint = tk.Label(skin_box, text='配色：未生成（选图后一键生成）',
+                                        fg='#999', font=('Microsoft YaHei', 8),
+                                        justify='left', wraplength=300)
+        self.lbl_scheme_hint.pack(anchor='w', pady=(2, 0))
         self._refresh_skin_list()
 
         # ⑫ 开机自启（真相 = 启动文件夹快捷方式，勾选态直接读实际状态）
@@ -2261,6 +3080,14 @@ class ConfigWizard:
         self.btn_prep.config(state='normal' if img else 'disabled')
         self._update_preview()
         self._update_key_hint()
+        # ③ 配色绑定回显：皮肤档案存了配色名 → 提示行回显（切皮肤时由外挂整套恢复）
+        try:
+            sn = str(cfg.get('rime_scheme') or '')
+            self._set_scheme_hint(('配色：%s（切皮肤时自动恢复）' % sn) if sn
+                                  else '配色：该皮肤未绑定（可一键生成）',
+                                  True if sn else None)
+        except Exception:
+            pass
         # 选中即应用：若外挂正在运行，立即切换皮肤（托盘菜单选中态同步）
         if self.overlay is not None:
             try:
@@ -2322,6 +3149,205 @@ class ConfigWizard:
         delete_skin(name)
         self._refresh_skin_list()
         messagebox.showinfo('已删除', f'皮肤「{name}」已删除。', parent=self.root)
+
+    # ---------- ③ 选图自动生成候选框配色（升级四）----------
+    def _scheme_skin_name(self):
+        """配色归属名：皮肤下拉选中名 > 图片文件名（去扩展名）"""
+        n = (self.skin_var.get() or '').strip()
+        if n:
+            return n
+        return os.path.splitext(os.path.basename(self.cfg.get('image') or ''))[0] or 'skin'
+
+    def _set_scheme_hint(self, text, ok=None):
+        """向导内配色结果提示（成功绿 / 警告橙 / 普通灰）"""
+        if not hasattr(self, 'lbl_scheme_hint'):
+            return
+        color = '#2e7d32' if ok else ('#e67e22' if ok is False else '#999')
+        try:
+            self.lbl_scheme_hint.config(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _generate_scheme(self, auto=False, dry_run=False):
+        """③ 一键生成候选框配色：提色 → 21 字段亮/暗两套 → 确认 → 备份注入 → 重部署。
+
+        auto=True 跳过所有弹窗（自动化/测试用）；dry_run=True 只算 diff 不落盘。
+        返回 {'ok','msg','plan','apply','deploy','theme',...}，向导与测试共用同一份结果。
+        """
+        res = {'ok': False, 'msg': '', 'plan': None, 'apply': None, 'deploy': None,
+               'theme': None, 'theme_info': {}, 'skin': '', 'scheme_light': '',
+               'scheme_dark': '', 'backup': None}
+        img = self.cfg.get('image')
+        if not img or not os.path.exists(img):
+            res['msg'] = '请先选择图片，再生成候选框配色'
+            self._set_scheme_hint(res['msg'], ok=False)
+            if not auto:
+                messagebox.showwarning('生成候选框配色', res['msg'], parent=self.root)
+            return res
+        if not self.PIL:
+            res['msg'] = '需要 Pillow(PIL) 才能提取图片颜色（当前环境不可用）'
+            self._set_scheme_hint(res['msg'], ok=False)
+            if not auto:
+                messagebox.showwarning('生成候选框配色', res['msg'], parent=self.root)
+            return res
+        try:
+            skin = self._scheme_skin_name()
+            res['skin'] = skin
+            frames, meta = collect_scheme_frames(img, self._Image)
+            theme = extract_scheme_theme(frames, self._Image)
+            res['theme'] = theme
+            res['theme_info'] = {'n_frames': meta['n_frames'], 'used': meta['used'],
+                                 'sampled': meta['sampled'],
+                                 'note': '图片整体偏暗（亮套会偏亮）' if theme.get('is_dark')
+                                         else '图片偏亮/中等'}
+            names = make_scheme_names(skin)
+            res['scheme_light'], res['scheme_dark'] = names
+            light = build_scheme_fields(skin, theme, dark=False, scheme=names[0])
+            dark = build_scheme_fields(skin, theme, dark=True, scheme=names[1])
+            man = load_scheme_manifest()
+            old = [x for x in (man.get(skin) or []) if x not in names]
+            plan = plan_scheme_injection(WEASEL_CUSTOM, skin=skin, light=light, dark=dark,
+                                         scheme_light=names[0], scheme_dark=names[1],
+                                         set_active=False, stale_schemes=old, dry_run=dry_run)
+            res['plan'] = plan
+            if not plan['ok']:
+                res['msg'] = plan['msg']
+                self._set_scheme_hint('配色未生成：%s' % res['msg'], ok=False)
+                if not auto:
+                    messagebox.showwarning('生成候选框配色', res['msg'], parent=self.root)
+                return res
+            if auto:
+                set_active = True
+            else:
+                preview = '\n'.join(plan['diff'][:10])
+                if len(plan['diff']) > 10:
+                    preview += '\n…（共 %d 行改动）' % len(plan['diff'])
+                summary = ('目标文件：%s\n\n配色方案：%s（亮） / %s（暗）\n'
+                           '图片帧数 %d（参与统计 %d 帧）%s\n'
+                           '改动预览：\n%s' % (WEASEL_CUSTOM, names[0], names[1],
+                                            meta['n_frames'], meta['used'],
+                                            '（帧数过多已均匀采样）' if meta['sampled'] else '',
+                                            preview))
+                if not messagebox.askyesno('生成候选框配色（%s）' % skin, summary,
+                                           parent=self.root):
+                    res['msg'] = '已取消（未写入任何文件）'
+                    self._set_scheme_hint('配色：已取消（未写入）', ok=False)
+                    return res
+                set_active = messagebox.askyesno(
+                    '一并切换候选框配色？',
+                    '是否同时把当前候选框切到这套配色（style/color_scheme）？\n'
+                    '选「否」= 只写入配色方案，不动你现在的候选框', parent=self.root)
+            if set_active:
+                plan = plan_scheme_injection(WEASEL_CUSTOM, skin=skin, light=light, dark=dark,
+                                             scheme_light=names[0], scheme_dark=names[1],
+                                             set_active=True, stale_schemes=old, dry_run=dry_run)
+                res['plan'] = plan
+            if dry_run:
+                res['ok'] = True
+                res['msg'] = 'dry-run：%d 行改动（未写入任何文件）' % len(plan['diff'])
+                self._set_scheme_hint('配色：dry-run 完成（%d 行改动，未落盘）'
+                                      % len(plan['diff']), True)
+                return res
+            if plan['diff']:
+                wr = apply_scheme_injection(plan)
+                res['apply'] = wr
+                res['backup'] = wr.get('backup')
+                if not wr['ok']:
+                    res['msg'] = wr['msg']
+                    self._set_scheme_hint('配色写入失败：%s' % wr['msg'], ok=False)
+                    if not auto:
+                        messagebox.showwarning('配色写入失败', wr['msg'], parent=self.root)
+                    return res
+                dep = run_weasel_deployer()
+            else:
+                dep = {'ok': True, 'rc': None, 'exe': None, 'timed_out': False,
+                       'msg': '配色与现状一致，跳过重复部署'}
+            res['deploy'] = dep
+            # 记录到 cfg：随 config.json / 皮肤档案保存 → 切皮肤时整套恢复（含光环联动）
+            self.cfg['rime_scheme'] = names[0]
+            self.cfg['rime_scheme_dark'] = names[1]
+            man[skin] = list(names)
+            save_scheme_manifest(man)
+            res['ok'] = True
+            res['msg'] = '配色已生成：%s（亮）/ %s（暗）；%s' % (names[0], names[1], dep['msg'])
+            self._set_scheme_hint('配色：%s / %s%s' % (
+                names[0], names[1],
+                '（已写入并部署）' if dep['ok'] else '（已写入，部署未成功：详见弹窗/日志）'), dep['ok'])
+            _write_log('[配色] 生成 %s → %s / %s；%s' % (skin, names[0], names[1], dep['msg']))
+            if not auto:
+                if dep['ok']:
+                    messagebox.showinfo('配色已生成', res['msg'], parent=self.root)
+                else:
+                    messagebox.showwarning('配色已写入，但部署未成功', res['msg'], parent=self.root)
+            return res
+        except Exception as e:
+            res['msg'] = '生成配色失败：%s' % e
+            self._set_scheme_hint(res['msg'], ok=False)
+            _write_log('[配色] 生成失败：%s' % e)
+            if not auto:
+                messagebox.showerror('生成候选框配色', res['msg'], parent=self.root)
+            return res
+
+    def _restore_scheme_backup(self, auto=False):
+        """↩ 一键还原：用最近的 weasel.custom.yaml.bak-* 覆盖回去 + 重部署 + 解绑配色名。
+
+        还原前会把当前文件另存 .bak-restore-<时间戳>（可再次撤回）；找不到备份时明确提示。
+        """
+        res = {'ok': False, 'msg': '', 'backup': None, 'deploy': None}
+        bak = find_latest_weasel_backup(WEASEL_CUSTOM)
+        if not bak:
+            res['msg'] = '没有找到配色备份（%s.bak-*）' % os.path.basename(WEASEL_CUSTOM)
+            self._set_scheme_hint(res['msg'], ok=False)
+            if not auto:
+                messagebox.showwarning('还原配色备份', res['msg'], parent=self.root)
+            return res
+        res['backup'] = bak
+        if not auto and not messagebox.askyesno(
+                '还原配色备份',
+                '用备份覆盖当前候选框配色？\n\n备份：%s\n目标：%s\n\n'
+                '（当前文件会另存 .bak-restore-<时间戳>，可再次撤回）'
+                % (os.path.basename(bak), WEASEL_CUSTOM), parent=self.root):
+            res['msg'] = '已取消（未还原）'
+            return res
+        try:
+            rb = restore_weasel_backup(bak, WEASEL_CUSTOM)
+            if not rb['ok']:
+                res['msg'] = rb['msg']
+                self._set_scheme_hint('配色还原失败：%s' % res['msg'], ok=False)
+                if not auto:
+                    messagebox.showwarning('还原配色备份', res['msg'], parent=self.root)
+                return res
+            dep = run_weasel_deployer()
+            res['deploy'] = dep
+            # 解绑：向导配置与生成记录同步清掉（避免下一步又把它切回去）
+            self.cfg['rime_scheme'] = ''
+            self.cfg['rime_scheme_dark'] = ''
+            try:
+                skin = self._scheme_skin_name()
+                man = load_scheme_manifest()
+                if skin in man:
+                    man.pop(skin, None)
+                    save_scheme_manifest(man)
+            except Exception:
+                pass
+            res['ok'] = True
+            res['msg'] = '已从 %s 还原；%s' % (os.path.basename(bak), dep['msg'])
+            self._set_scheme_hint('配色：已还原到备份（%s）%s'
+                                  % (os.path.basename(bak),
+                                     '' if dep['ok'] else '，但部署未成功'), dep['ok'])
+            _write_log('[配色] 还原 %s：%s' % (bak, dep['msg']))
+            if not auto:
+                if dep['ok']:
+                    messagebox.showinfo('已还原配色备份', res['msg'], parent=self.root)
+                else:
+                    messagebox.showwarning('已还原，但部署未成功', res['msg'], parent=self.root)
+            return res
+        except Exception as e:
+            res['msg'] = '还原配色备份失败：%s' % e
+            self._set_scheme_hint(res['msg'], ok=False)
+            if not auto:
+                messagebox.showerror('还原配色备份', res['msg'], parent=self.root)
+            return res
 
     def _read_rime(self):
         """读取当前 Rime 候选框配置并应用到向导"""
@@ -3096,6 +4122,11 @@ class FollowOverlay:
             save_config(self.cfg)
         except Exception:
             pass
+        # ③ 配色联动：该皮肤绑定了 Rime 配色名 → 切候选框配色 + 重部署（未绑定则静默跳过）
+        try:
+            self._bind_rime_scheme(cfg)
+        except Exception as _e:
+            _write_log(f'[配色] 皮肤 {name} 绑定异常: {_e}')
         # S3 修复：同步托盘菜单选中态缓存（pystray 线程读，不直接碰主线程 cfg）
         try:
             if self.tray:
@@ -3103,6 +4134,20 @@ class FollowOverlay:
         except Exception:
             pass
         return True
+
+    def _bind_rime_scheme(self, cfg):
+        """③ 切皮肤时把该皮肤绑定的 Rime 配色名写回 weasel.custom.yaml 并重部署。
+
+        未绑定（cfg 无 rime_scheme）→ 静默跳过、不碰任何文件（老用户零感知）。
+        返回 (ok, msg)；失败只记日志，不让切皮肤崩掉。
+        """
+        try:
+            r = apply_rime_scheme_binding(cfg)
+            _write_log(f'[配色] 皮肤 {cfg.get("name", "")}: {r["msg"]}')
+            return bool(r.get('ok')), r.get('msg', '')
+        except Exception as e:
+            _write_log(f'[配色] 皮肤绑定失败: {e}')
+            return False, str(e)
 
     def save_current_skin(self):
         """把当前配置保存为皮肤档案（托盘菜单用，走 Tk 主线程）"""
