@@ -31,6 +31,14 @@ import ctypes.wintypes as wintypes
 import tkinter as tk
 from PIL import Image, ImageGrab, ImageTk
 
+try:
+    # 控制台编码保护：GBK 控制台下打印「⑪」等非 GBK 字符会 UnicodeEncodeError（曾导致 exit=2），
+    # 放在一切输出之前；与 B_test_scheme_inject.py / B_test_layer_sim.py 同写法（stderr 一并保护）
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import rime_char_overlay as R          # noqa: E402
