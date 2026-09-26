@@ -37,9 +37,15 @@ v2.0-③ 选图自动生成候选框配色（升级四）：
 v2.0-①a 渲染层收口（升级一，第二步）：
   config.json 增 render_mode：compat（默认，v1.6 键色抠色路径）/ alpha（真 alpha 分层窗）。
   FollowOverlay.load_char 里「RGBA → 抠色 → PhotoImage → Label + 窗口透明色」整段收口成
-  Renderer 接口，两个实现：CompatRenderer（老逻辑原样承载）/ LayeredRenderer（①b 实装骨架）。
-  缺键与非法值一律按 compat（resolve_render_mode）；alpha 骨架期对外行为与 compat 逐像素一致。
-  回滚：render_mode 改回 compat 即恢复，无需回退代码。
+  Renderer 接口，两个实现：CompatRenderer（老逻辑原样承载）/ LayeredRenderer（真 alpha）。
+  缺键与非法值一律按 compat（resolve_render_mode）；回滚：改回 compat 即恢复。
+
+v2.0-①b 真 alpha 分层窗实装（升级一，第三步）：
+  LayeredRenderer = Tk 窗 + WS_EX_LAYERED + UpdateLayeredWindow 推 32bpp 预乘 BGRA 位图
+  （PIL 向量化预乘，无逐像素 Python 循环；biHeight 取负=自上而下）。效果：逐像素 alpha
+  真渐变（圆角/羽化边缘不再硬边）、含品红的图不再被抠穿、透明区点击穿透。
+  推送时机：动图跟 _anim_tick 每帧推；静态图只在首次显示/移动/缩放/换图/特效变化推一次。
+  向导 ⑪ 渲染模式可一键切换（兼容/增强）；alpha 下不放 Label 贴图，交互事件照旧挂 Tk 窗。
 """
 import sys, os, json, time, threading, re, queue, collections
 import tkinter as tk
@@ -1420,6 +1426,97 @@ def _flatten_alpha_for_tk(img_rgba, Image=None, key=MAGENTA):
 # 缺键与非法值一律按 compat 处理：老用户升级后零感知（渲染层纯收口，不改行为）。
 RENDER_MODES = ('compat', 'alpha')
 DEFAULT_RENDER_MODE = 'compat'
+# 向导里的中文标签（不把 compat/alpha 术语摆给用户看）：(模式值, 显示文案)
+RENDER_MODE_CHOICES = (('compat', '兼容（默认）'), ('alpha', '增强（真·半透明）'))
+
+# ---- 分层窗（真 alpha）所需的 GDI/USER32 常量与结构（v2.0-①b，对齐 spike_layered_alpha.py）----
+gdi32 = ctypes.windll.gdi32      # user32/kernel32 在下方统一声明；gdi32 只有分层窗路径用得到
+WS_EX_LAYERED = 0x00080000       # 分层窗口扩展样式
+ULW_ALPHA = 0x00000002           # UpdateLayeredWindow：使用逐像素 alpha
+AC_SRC_OVER, AC_SRC_ALPHA = 0x00, 0x01
+DIB_RGB_COLORS = 0
+LAYERED_BI_RGB = 0               # biCompression：32bpp 无压缩（ULW 只吃 BI_RGB）
+
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    """CreateDIBSection 位图描述头（biHeight 取负数 = 自上而下，手册 ① 步 3）"""
+    _fields_ = [('biSize', wintypes.DWORD), ('biWidth', wintypes.LONG),
+                ('biHeight', wintypes.LONG), ('biPlanes', wintypes.WORD),
+                ('biBitCount', wintypes.WORD), ('biCompression', wintypes.DWORD),
+                ('biSizeImage', wintypes.DWORD), ('biXPelsPerMeter', wintypes.LONG),
+                ('biYPelsPerMeter', wintypes.LONG), ('biClrUsed', wintypes.DWORD),
+                ('biClrImportant', wintypes.DWORD)]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [('bmiHeader', BITMAPINFOHEADER), ('bmiColors', wintypes.DWORD * 3)]
+
+
+class BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [('BlendOp', ctypes.c_byte), ('BlendFlags', ctypes.c_byte),
+                ('SourceConstantAlpha', ctypes.c_byte), ('AlphaFormat', ctypes.c_byte)]
+
+
+class LAYER_POINT(ctypes.Structure):
+    _fields_ = [('x', wintypes.LONG), ('y', wintypes.LONG)]
+
+
+class LAYER_SIZE(ctypes.Structure):
+    _fields_ = [('cx', wintypes.LONG), ('cy', wintypes.LONG)]
+
+
+_win32_ready = False
+
+
+def _prepare_win32():
+    """一次性声明分层窗用到的 GDI/USER32 签名（首次推图时生效，之后只过一次布尔判断）。
+
+    64 位下返回 HDC/HBITMAP 的调用若吃默认 c_int 会被截断（spike 靠句柄值小侥幸没炸），
+    这里显式声明 restype，避免"有时成功有时黑屏"的偶发故障。
+    """
+    global _win32_ready
+    if _win32_ready:
+        return
+    u32, g32 = user32, gdi32
+    u32.GetDC.argtypes = [wintypes.HWND]
+    u32.GetDC.restype = ctypes.c_void_p
+    u32.ReleaseDC.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    u32.ReleaseDC.restype = ctypes.c_int
+    u32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+    u32.SetWindowLongW.restype = ctypes.c_long
+    u32.UpdateLayeredWindow.argtypes = [
+        wintypes.HWND, ctypes.c_void_p, ctypes.POINTER(LAYER_POINT), ctypes.POINTER(LAYER_SIZE),
+        ctypes.c_void_p, ctypes.POINTER(LAYER_POINT), wintypes.DWORD,
+        ctypes.POINTER(BLENDFUNCTION), wintypes.DWORD]
+    u32.UpdateLayeredWindow.restype = wintypes.BOOL
+    u32.WindowFromPoint.argtypes = [LAYER_POINT]
+    u32.WindowFromPoint.restype = wintypes.HWND
+    g32.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    g32.CreateCompatibleDC.restype = ctypes.c_void_p
+    g32.CreateDIBSection.argtypes = [ctypes.c_void_p, ctypes.POINTER(BITMAPINFO), wintypes.UINT,
+                                     ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                     wintypes.DWORD]
+    g32.CreateDIBSection.restype = ctypes.c_void_p
+    g32.SelectObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    g32.SelectObject.restype = ctypes.c_void_p
+    g32.DeleteObject.argtypes = [ctypes.c_void_p]
+    g32.DeleteObject.restype = wintypes.BOOL
+    g32.DeleteDC.argtypes = [ctypes.c_void_p]
+    g32.DeleteDC.restype = wintypes.BOOL
+    _win32_ready = True
+
+
+_PIL_MOD = None
+_PIL_CHOPS = None
+
+
+def _pil():
+    """(PIL.Image, PIL.ImageChops)：延迟取一次后复用 —— 预乘是逐帧热路径，别每帧 import"""
+    global _PIL_MOD, _PIL_CHOPS
+    if _PIL_MOD is None:
+        from PIL import Image as _I, ImageChops as _C
+        _PIL_MOD, _PIL_CHOPS = _I, _C
+    return _PIL_MOD, _PIL_CHOPS
 
 
 def resolve_render_mode(cfg):
@@ -1499,6 +1596,15 @@ class Renderer:
         alpha：UpdateLayeredWindow 推预乘位图（①b/t3 实装）。"""
         return None
 
+    def on_moved(self, x=None, y=None):
+        """窗口移动/缩放/图层同步后（compat：无操作，Label 由系统带走；
+        alpha：位图必须重推一次，手册 ① 步 6）。x/y 仅作诊断，实现在推图时自取窗口坐标。"""
+        return None
+
+    def on_shown(self):
+        """窗口从隐藏恢复显示后（compat：无操作；alpha：重推，隐藏期间位图可能失效）。"""
+        return None
+
     def release(self, photo):
         """释放 tcl image（同步，不等 GC 的 __del__）"""
         _release_photo(photo)
@@ -1560,56 +1666,357 @@ class CompatRenderer(Renderer):
             pass
 
 
+class LayerFrame:
+    """alpha 模式的「帧对象」：包住 PIL 图，向调用方提供与 PhotoImage 相同的取尺寸语义。
+
+    load_char 里用 `self.img.width()/height()`（PhotoImage 是方法），而 PIL.Image 的
+    width/height 是**属性** —— 直接返回 PIL 图会在 load_char 里炸 'int' object is not
+    callable。所以统一包一层：对外 width()/height()，对内 .image 是真正的 RGBA 帧。
+    """
+
+    __slots__ = ('image',)
+
+    def __init__(self, image):
+        self.image = image
+
+    def width(self):
+        return int(self.image.size[0])
+
+    def height(self):
+        return int(self.image.size[1])
+
+    def __repr__(self):
+        return f'LayerFrame{tuple(self.image.size)}'
+
+
 class LayeredRenderer(CompatRenderer):
-    """真 alpha 分层窗渲染（手册 ① 步 2-5）—— 本阶段（①a）只落骨架。
+    """真 alpha 分层窗渲染（手册 ① 步 2-6）：Tk 窗 + WS_EX_LAYERED + UpdateLayeredWindow。
 
-    ①b/t3 实装清单（接口按 spike_layered_alpha.py 的六步留好位置）：
-      1. ensure_layered(hwnd)：GetWindowLongW/GWL_EXSTYLE 或上 WS_EX_LAYERED；
-         每次推图前重设（Tk 重设窗口属性会冲掉，手册 ① 步 4）
-      2. premultiply_bgra(img)：PIL 向量化预乘 —— split → ImageChops.multiply(ch, a)
-         → merge('RGBA', (b, g, r, a)) → tobytes()；
-         **勿照抄 spike 的逐像素循环**（46ms/帧 → 向量化 2.07ms/帧，手册 ① 步 3）
-      3. push_bitmap(hwnd, img, x, y)：GetDC → CreateCompatibleDC → CreateDIBSection
-         （biHeight 取负数 = 自上而下）→ memmove 预乘 BGRA → UpdateLayeredWindow(ULW_ALPHA)
-         → 释放 GDI 对象
-      4. make_label/apply_window/apply_label 改为「不放贴图、不设 -transparentcolor」：
-         该模式下窗口内容完全由位图决定（手册 ① 步 5）；Label 仍保留以接收鼠标事件
-      5. 推送时机：静态图只在「首次显示 / 移动 / 缩放 / 换图 / 特效参数变」推一次，
-         动图跟 _anim_tick 每帧推（手册 ① 步 6，勿按 50ms 轮询硬推）
+    与 CompatRenderer 的差别（只影响 render_mode=alpha；compat 分支一行都不受影响）：
+      · flatten 原样保留 RGBA：不抠键色、不做 alpha 二值化 → 逐像素 alpha 真渐变
+      · 不经 Tk PhotoImage：帧本身就是显示数据源，UpdateLayeredWindow 推预乘 BGRA 位图
+      · 不复用 -transparentcolor（窗口内容完全由位图决定），Label 只用来接鼠标事件
+        （手册 ① 步 5；透明区天然点击穿透，见 Windows 对 ULW 窗口的 alpha 命中测试）
+      · 推送时机（手册 ① 步 6）：动图跟 _anim_tick 每帧推；静态图只在「首次显示 / 移动 /
+        缩放 / 换图 / 特效参数变」推一次 —— 由 FollowOverlay 在定位、拖动、尺寸校正、
+        手动显示四处调 on_moved()/on_shown() 触发，不做 50ms 轮询硬推
+      · 每次推图前重设 WS_EX_LAYERED（Tk 重设窗口属性会冲掉，手册 ① 步 4）
 
-    骨架期约定：alpha_ready=False → 上面 5 条一律不启用，所有渲染调用继续走
-    CompatRenderer 的实现，保证 render_mode=alpha 时对外行为与 compat 逐像素一致
-    （t2 验收要求）；t3 置 alpha_ready=True 后这套骨架才开始接管显示。
+    性能（本机实测，手册基线）：PIL 向量化预乘 300x420 ≈2.8ms/帧、450x675 ≈6.3ms/帧；
+    对照 spike 的逐像素 Python 循环 46ms/帧 —— 所以预乘只准用向量化实现。
     """
 
     mode = 'alpha'
-    uses_tk_label = True    # t3 实装后置 False（骨架期仍用 Label，行为才能与 compat 等价）
-    alpha_ready = False     # t3 实装完成置 True；在此之前全部走 compat 兼容实现
+    uses_tk_label = False      # 手册 ① 步 5：该模式不放贴图，内容完全由位图决定
+    alpha_ready = True
 
-    # ---- ①b/t3 实装用的骨架 API（骨架期安全空转，绝不改变显示行为）----
-    def ensure_layered(self, hwnd):
-        """[t3] 给顶层句柄补 WS_EX_LAYERED（Tk 改属性会冲掉，每次推图前重设）"""
-        if not self.alpha_ready:
+    def __init__(self, overlay, mode=None):
+        super().__init__(overlay, mode)
+        self._frame = None             # 当前帧（PIL RGBA）——推图数据源
+        self._frame_pushed = False     # 当前帧是否已推给当前窗口
+        self._hwnd = 0                 # 最近一次推图使用的顶层句柄
+        self._pushed_size = (0, 0)
+        self._pushed_pos = (0, 0)
+        self._n_push = 0               # 推送次数（B_test 验「静态只推一次 / 动图每帧推」）
+        self._n_fail = 0
+        self._reset_done = set()       # 已做过 layered 状态复位的窗口句柄（每个窗口一次）
+        self.last_error = ''
+
+    # ---------- 帧链路：保留 RGBA（真 alpha）----------
+    def flatten(self, img_rgba, key=MAGENTA, Image=None):
+        """不抠色：原样保留 RGBA（键色是 compat 硬抠色的产物，对逐像素 alpha 无意义）"""
+        try:
+            return img_rgba.copy()
+        except Exception:
+            return img_rgba
+
+    def to_photo(self, img):
+        """不经 Tk PhotoImage：把 RGBA 帧记为本渲染器的当前帧，返回 LayerFrame 交给 load_char。
+
+        LayerFrame 提供 width()/height()（与 PhotoImage 同语义），.image 才是 PIL 帧。
+        """
+        self._frame = img
+        self._frame_pushed = False
+        return LayerFrame(img)
+
+    def _as_image(self, obj):
+        """帧对象 → PIL Image（LayerFrame 解包；不是图像则返回 None）"""
+        if obj is None:
             return None
-        raise NotImplementedError('①b/t3 实装：SetWindowLongW(GWL_EXSTYLE, ex | WS_EX_LAYERED)')
+        inner = getattr(obj, 'image', None)
+        if inner is not None and hasattr(inner, 'tobytes'):
+            return inner
+        if hasattr(obj, 'tobytes') and hasattr(obj, 'size'):
+            return obj
+        return None
+
+    def make_label(self, parent, photo, key_rgb, cursor='fleur'):
+        """不放贴图，仍造 Label 承载拖动/滚轮/右键事件（交互链路照旧）"""
+        return tk.Label(parent, bg='#000000', cursor=cursor)
+
+    def apply_window(self, key_rgb):
+        """窗口准备 + 首推位图。
+
+        先摘掉 Tk 的 -transparentcolor：它在 Windows 上走 SetLayeredWindowAttributes
+        （LWA_COLORKEY），与 UpdateLayeredWindow 对同一个 WS_EX_LAYERED 窗口互斥 ——
+        不清掉会把位图内容整片抠掉（手册 ① 步 5「内容完全由位图决定」）。
+        """
+        self.drop_tk_transparency()
+        return self.push_static()
+
+    def drop_tk_transparency(self):
+        """清掉 Tk 键色透明度与底色（alpha 模式不再需要，且会与 ULW 打架）"""
+        root = self.root
+        if root is None:
+            return
+        try:
+            root.attributes('-transparentcolor', '')
+        except Exception:
+            pass
+        try:
+            root.configure(bg='#000000')
+        except Exception:
+            pass
+
+    def apply_label(self, label, photo, key_rgb):
+        return None       # 位图模式：Label 不贴图、也不设 -transparentcolor
+
+    def apply_photo_only(self, label, photo):
+        """换帧（动图节拍 / 热重载 / 滚轮缩放）：同一帧已推过就跳过，绝不轮询硬推"""
+        img = self._as_image(photo)
+        if img is None:
+            return None
+        if img is not self._frame:
+            self._frame = img
+            self._frame_pushed = False
+        if self._frame_pushed:
+            return True
+        return self.push_static()
+
+    def on_moved(self, x=None, y=None):
+        """移动/缩放/图层同步后重推（手册 ① 步 6 的「移动」时机）"""
+        self._frame_pushed = False
+        return self.push_static()
+
+    def on_shown(self):
+        """从隐藏恢复显示后重推（隐藏期间位图内容可能未生效）"""
+        self._frame_pushed = False
+        return self.push_static()
+
+    # ---------- 窗口准备 ----------
+    def ensure_layered(self, hwnd):
+        """确保顶层句柄带 WS_EX_LAYERED（Tk 每次 attributes()/geometry 都可能冲掉 → 推图前重设）。
+
+        首次拿到的窗口还要做一次「摘掉再戴上」复位：Tk 的 -transparentcolor 会用
+        SetLayeredWindowAttributes 把窗口锁进另一种分层模式，此时 UpdateLayeredWindow
+        永远返回 0（实测）。复位后 ULW 立刻可用 —— 也让「compat 皮肤切到 alpha 皮肤」
+        这种运行时切换不会变成黑窗。
+        """
+        if not hwnd:
+            return False
+        try:
+            _prepare_win32()
+            ex = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if hwnd not in self._reset_done:
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+                user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+                self._reset_done.add(hwnd)
+                return bool(user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)
+            if ex & WS_EX_LAYERED:
+                return True
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+            return bool(user32.GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED)
+        except Exception as e:
+            self.last_error = f'ensure_layered: {e!r}'
+            return False
+
+    def _ensure_window(self):
+        """手册 ① 步 4：窗口准备放在"拿到顶层句柄"之后。
+
+        用 update_idletasks 让 Tk 把窗口真正建出来（不用 update()：推图可能在
+        Tk 回调里发生，update() 会重入处理事件队列）。
+        """
+        ov, root = self.overlay, self.root
+        if root is not None:
+            try:
+                root.update_idletasks()
+            except Exception:
+                pass
+        hwnd = 0
+        try:
+            hwnd = int(getattr(ov, '_top_hwnd', lambda: 0)() or 0)
+        except Exception:
+            hwnd = 0
+        if not hwnd and root is not None:
+            # 兜底：窗口还没 map 时 GetParent 链可能拿不到，用 GetAncestor(GA_ROOT) 直接取顶层
+            try:
+                hwnd = int(user32.GetAncestor(root.winfo_id(), 2) or 0)
+            except Exception:
+                hwnd = 0
+        if not hwnd:
+            hwnd = self._hwnd
+        if not hwnd:
+            self.last_error = '顶层句柄不可用（窗口未建立）'
+            return 0
+        try:
+            if not user32.IsWindow(hwnd):
+                self.last_error = f'句柄已失效 0x{hwnd:X}'
+                return 0
+        except Exception:
+            pass
+        self._hwnd = hwnd
+        self.ensure_layered(hwnd)
+        return hwnd
+
+    def _window_pos(self, hwnd):
+        """窗口当前屏幕坐标（GetWindowRect 为权威，退回镜像坐标 _x/_y）"""
+        try:
+            r = wintypes.RECT()
+            user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            user32.GetWindowRect.restype = wintypes.BOOL
+            if user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                return int(r.left), int(r.top)
+        except Exception:
+            pass
+        return int(getattr(self.overlay, '_x', 0) or 0), int(getattr(self.overlay, '_y', 0) or 0)
+
+    # ---------- 位图推送 ----------
+    def make_bmi(self, w, h):
+        """BITMAPINFO：32bpp / BI_RGB / biHeight 取负（自上而下，手册 ① 步 3）"""
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = int(w)
+        bmi.bmiHeader.biHeight = -int(h)
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = LAYERED_BI_RGB
+        return bmi
 
     def premultiply_bgra(self, img_rgba):
-        """[t3] PIL 向量化预乘 → BGRA bytes（手册 ① 步 3）"""
-        if not self.alpha_ready:
-            return None
-        raise NotImplementedError('①b/t3 实装：split/multiply/merge(B,G,R,A)/tobytes')
+        """PIL 向量化预乘 → BGRA bytes（手册 ① 步 3）。
+
+        split 出 a 后逐通道 ImageChops.multiply(ch, a)（= c*a/255 整数口径，与 spike 的
+        (c*a)//255 逐像素参考实现一致），再按 B,G,R,A 合并 —— 全程 C 实现，无 Python 逐像素循环。
+        """
+        img = img_rgba
+        Image, chops = _pil()
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+        r, g, b, a = img.split()
+        out = Image.merge('RGBA', (chops.multiply(b, a), chops.multiply(g, a),
+                                   chops.multiply(r, a), a))
+        return out.tobytes()
 
     def push_bitmap(self, hwnd, img_rgba, x, y):
-        """[t3] UpdateLayeredWindow 六步推送（spike push_bitmap 的向量化版）"""
-        if not self.alpha_ready:
-            return None
-        raise NotImplementedError('①b/t3 实装：spike_layered_alpha.push_bitmap 六步')
+        """spike 六步：GetDC → CreateCompatibleDC → CreateDIBSection → memmove 预乘 BGRA
+        → UpdateLayeredWindow → 释放 GDI 句柄（手册 ① 步 2）。失败返回 False 并记 last_error。"""
+        _prepare_win32()
+        w, h = img_rgba.size
+        data = self.premultiply_bgra(img_rgba)
+        screen_dc = mem_dc = hbmp = None
+        ok = False
+        try:
+            screen_dc = user32.GetDC(0)
+            if not screen_dc:
+                self.last_error = 'GetDC 失败'
+                return False
+            mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+            if not mem_dc:
+                self.last_error = 'CreateCompatibleDC 失败'
+                return False
+            bmi = self.make_bmi(w, h)
+            bits = ctypes.c_void_p()
+            hbmp = gdi32.CreateDIBSection(mem_dc, ctypes.byref(bmi), DIB_RGB_COLORS,
+                                          ctypes.byref(bits), None, 0)
+            if not hbmp or not bits:
+                self.last_error = 'CreateDIBSection 失败'
+                return False
+            ctypes.memmove(bits, data, len(data))
+            gdi32.SelectObject(mem_dc, hbmp)
+            blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+            pt_dst = LAYER_POINT(int(x), int(y))
+            sz = LAYER_SIZE(int(w), int(h))
+            pt_src = LAYER_POINT(0, 0)
+            ok = bool(user32.UpdateLayeredWindow(
+                hwnd, screen_dc, ctypes.byref(pt_dst), ctypes.byref(sz),
+                mem_dc, ctypes.byref(pt_src), 0, ctypes.byref(blend), ULW_ALPHA))
+            if not ok:
+                self.last_error = 'UpdateLayeredWindow 返回 0'
+        except Exception as e:
+            self.last_error = f'push_bitmap: {e!r}'
+            ok = False
+        finally:
+            try:
+                if hbmp:
+                    gdi32.DeleteObject(hbmp)
+            except Exception:
+                pass
+            try:
+                if mem_dc:
+                    gdi32.DeleteDC(mem_dc)
+            except Exception:
+                pass
+            try:
+                if screen_dc:
+                    user32.ReleaseDC(0, screen_dc)
+            except Exception:
+                pass
+        return ok
+
+    def clear(self):
+        """把分层窗内容清成全透明（切回 compat / 让出显示权时调用）。
+
+        分层窗的内容一旦推上去就一直挂在窗口 surface 上：切回 compat 后由 Tk 常规绘制
+        接管，先推一张全透明图可以避免旧位图残留在画面上。
+        """
+        img = self._frame
+        hwnd = self._hwnd
+        if img is None or not hwnd:
+            return False
+        try:
+            Image, _chops = _pil()
+            blank = Image.new('RGBA', img.size, (0, 0, 0, 0))
+            x, y = self._window_pos(hwnd)
+            ok = self.push_bitmap(hwnd, blank, x, y)
+            self._frame_pushed = False
+            return ok
+        except Exception as e:
+            self.last_error = f'clear: {e!r}'
+            return False
+
+    def push_static(self, force=False):
+        """把当前帧推给分层窗（帧未变且已推过则跳过）。返回是否成功。"""
+        img = self._frame
+        if img is None:
+            return False
+        if self._frame_pushed and not force:
+            return True
+        hwnd = self._ensure_window()
+        if not hwnd:
+            self._n_fail += 1
+            return False
+        x, y = self._window_pos(hwnd)
+        if self.push_bitmap(hwnd, img, x, y):
+            self._frame_pushed = True
+            self._pushed_size = tuple(img.size)
+            self._pushed_pos = (x, y)
+            self._n_push += 1
+            return True
+        self._n_fail += 1
+        return False
 
     def push_frame(self, img_rgba, key_rgb=None, x=None, y=None):
-        """[t3] 逐帧推送入口。骨架期显示仍由 Tk Label 承担，这里安全空转。"""
-        if not self.alpha_ready:
-            return None
-        raise NotImplementedError('①b/t3 实装：ensure_layered + premultiply_bgra + UpdateLayeredWindow')
+        """逐帧推送入口（动图节拍用：帧已由 to_photo 记好，这里只负责推）"""
+        img = self._as_image(img_rgba)
+        if img is not None and img is not self._frame:
+            self._frame = img
+            self._frame_pushed = False
+        return self.push_static(force=True)
+
+    def describe(self):
+        return (f'{type(self).__name__}(mode={self.mode} ready={self.alpha_ready} '
+                f'push={self._n_push} fail={self._n_fail}'
+                + (f' err={self.last_error}' if self.last_error else '') + ')')
 
 
 RENDERER_CLASSES = {'compat': CompatRenderer, 'alpha': LayeredRenderer}
@@ -1620,6 +2027,13 @@ def create_renderer(overlay, cfg=None, mode=None):
     if cfg is None:
         cfg = getattr(overlay, 'cfg', None)
     m = mode or resolve_render_mode(cfg)
+    if m == 'alpha' and getattr(overlay, '_ImageTk', None) is None:
+        # alpha 依赖 PIL（向量化预乘 + RGBA 帧）；PIL 缺失时回落 compat，画面照旧能显示
+        try:
+            _write_log('[渲染] alpha 需要 Pillow，未安装 → 回落 compat')
+        except Exception:
+            pass
+        m = 'compat'
     cls = RENDERER_CLASSES.get(m, CompatRenderer)
     try:
         r = cls(overlay, m)
@@ -3048,8 +3462,26 @@ class ConfigWizard:
         tk.Label(adv, text='带宽 px；远看像半透明，近看是点阵', fg='#888',
                  font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(0, 4))
 
-        # ⑪ 皮肤管理（图片 + 全套参数整套切换）
-        skin_box = tk.LabelFrame(adv, text='💾 ⑪ 皮肤管理',
+        # ⑪ 渲染模式（v2.0-①）：兼容 = v1.6 老路径；增强 = 真 alpha 分层窗（真·半透明）
+        tk.Label(adv, text='⑪ 渲染模式:', font=('Microsoft YaHei', 10)).pack(anchor='w')
+        row_rm = tk.Frame(adv)
+        row_rm.pack(anchor='w', pady=(0, 2))
+        _cur_render = resolve_render_mode(self.cfg)
+        if self.overlay is not None:      # 打开向导时回显当前模式，避免一保存就被打回兼容
+            _cur_render = resolve_render_mode({'render_mode':
+                                               getattr(self.overlay, 'render_mode', _cur_render)})
+        self.var_render = tk.StringVar(master=self.root, value=_cur_render)
+        for _val, _text in RENDER_MODE_CHOICES:
+            tk.Radiobutton(row_rm, text=_text, variable=self.var_render, value=_val,
+                           font=('Microsoft YaHei', 9),
+                           command=self._update_render_hint).pack(side='left', padx=2)
+        self.lbl_render_hint = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8),
+                                        justify='left', wraplength=320)
+        self.lbl_render_hint.pack(anchor='w', pady=(0, 4))
+        self._update_render_hint()
+
+        # ⑫ 皮肤管理（图片 + 全套参数整套切换）
+        skin_box = tk.LabelFrame(adv, text='💾 ⑫ 皮肤管理',
                                  font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=4)
         skin_box.pack(fill='x', pady=(2, 0))
         self.skin_var = tk.StringVar(master=self.root)
@@ -3084,11 +3516,11 @@ class ConfigWizard:
         self.lbl_scheme_hint.pack(anchor='w', pady=(2, 0))
         self._refresh_skin_list()
 
-        # ⑫ 开机自启（真相 = 启动文件夹快捷方式，勾选态直接读实际状态）
+        # ⑬ 开机自启（真相 = 启动文件夹快捷方式，勾选态直接读实际状态）
         row_start = tk.Frame(adv)
         row_start.pack(anchor='w', pady=(6, 0))
         self.var_autostart = tk.BooleanVar(master=self.root, value=autostart_installed())
-        tk.Checkbutton(row_start, text='⑫ 开机自启（静默到托盘）',
+        tk.Checkbutton(row_start, text='⑬ 开机自启（静默到托盘）',
                        variable=self.var_autostart,
                        font=('Microsoft YaHei', 10)).pack(side='left')
         self.lbl_autostart = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8))
@@ -3105,6 +3537,19 @@ class ConfigWizard:
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
         tk.Label(row8, text='💡 保存后启动；下次双击可重新配置',
                  fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
+
+    def _update_render_hint(self):
+        """渲染模式提示（大白话，不摆 compat/alpha 术语）"""
+        try:
+            if resolve_render_mode({'render_mode': self.var_render.get()}) == 'alpha':
+                txt = ('💡 增强：支持真·半透明（羽化/圆角边缘更柔和、图里含品红也不再被抠穿）。\n'
+                       '透明区域会点击穿透（不挡鼠标，点击落到下面的窗口）；拖动请抓图片不透明部分。')
+            else:
+                txt = ('💡 兼容（默认）：与旧版显示方式完全一致，最稳；\n'
+                       '圆角/羽化的边缘是硬边（近看会有点阵/毛边）。')
+            self.lbl_render_hint.configure(text=txt)
+        except Exception:
+            pass
 
     def _effects_cfg(self):
         """向导里的特效参数（与 config 同名字段，可直接喂给 apply_display_effects）"""
@@ -3324,6 +3769,13 @@ class ConfigWizard:
         self.var_feather.set(bool(cfg.get('feather_enabled', False)))
         self.var_feather_r.set(int(cfg.get('feather_radius', 24) or 0))
         self.var_flip.set(bool(cfg.get('flip_h', False)))
+        # 渲染模式：皮肤档案显式声明才改（缺键保持全局开关，与 _sync_render_mode 同语义）
+        if 'render_mode' in cfg:
+            try:
+                self.var_render.set(resolve_render_mode(cfg))
+                self._update_render_hint()
+            except Exception:
+                pass
         img = cfg.get('image', '')
         self.lbl_img.config(text=os.path.basename(img) + f'（皮肤: {name}）', fg='#2e7d32')
         self.btn_prep.config(state='normal' if img else 'disabled')
@@ -3846,6 +4298,8 @@ class ConfigWizard:
         self.cfg['feather_radius'] = int(self.var_feather_r.get())
         self.cfg['flip_h'] = bool(self.var_flip.get())
         self.cfg.pop('feather_dither', None)   # 旧字段清理（点阵羽化已成为唯一实现）
+        # 渲染模式（v2.0-①）：UI 只有中文选项，写回时归一成 compat/alpha（非法值回落 compat）
+        self.cfg['render_mode'] = resolve_render_mode({'render_mode': self.var_render.get()})
         # 开机自启（真相 = 启动文件夹快捷方式；勾选态与实际同步后才算完成）
         want_start = bool(self.var_autostart.get())
         ok, msg = set_autostart(want_start, force=want_start)
@@ -4057,8 +4511,16 @@ class FollowOverlay:
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
-        self.root.attributes('-transparentcolor', '#FF00FF')  # 默认品红，load_char 后按实际键色覆盖
-        self.root.configure(bg='#FF00FF')
+        # 渲染模式先定：窗口初始化就要按它选路 —— alpha 绝不能用 -transparentcolor。
+        # Tk 的透明色在 Windows 上走 SetLayeredWindowAttributes，一旦对某窗口调用过，
+        # 同一窗口的 UpdateLayeredWindow 会永久返回 0（2026-09-26 实测：先设再清也没救，
+        # 必须「摘掉再戴上 WS_EX_LAYERED」才复位；见 LayeredRenderer.ensure_layered）。
+        self.render_mode = resolve_render_mode(self.cfg)
+        if self.render_mode == 'compat':
+            self.root.attributes('-transparentcolor', '#FF00FF')  # 默认品红，load_char 后按实际键色覆盖
+            self.root.configure(bg='#FF00FF')
+        else:
+            self.root.configure(bg='#000000')   # 内容全由位图决定，底色只是兜底
         if self.PIL:
             set_window_icon(self.root, (self._Image, self._ImageTk))
 
@@ -4068,8 +4530,7 @@ class FollowOverlay:
         self.key_rgb = MAGENTA          # 当前抠色键（动态，随图片变化）
         self.layer = self.cfg.get('layer', 'above')  # 图层：above=图片置顶 / below=候选框压图（v1.5）
         # ===== 渲染层（v2.0-①a）：render_mode=compat(默认)/alpha → Renderer 实现 =====
-        # 缺键/非法值一律 compat（老用户零感知）；alpha 当前只有骨架，对外行为与 compat 逐像素一致
-        self.render_mode = resolve_render_mode(self.cfg)
+        # 缺键/非法值一律 compat（老用户零感知）；alpha 走真分层窗（①b 已实装）
         self.renderer = create_renderer(self, self.cfg, self.render_mode)
         try:
             _write_log(f'[渲染] render_mode={self.render_mode} '
@@ -4235,6 +4696,9 @@ class FollowOverlay:
         cfg = self.cfg if isinstance(self.cfg, dict) else {}
         mode = resolve_render_mode(cfg) if 'render_mode' in cfg else self.render_mode
         if mode != self.render_mode:
+            old = _renderer_of(self)
+            if mode == 'compat' and hasattr(old, 'clear'):
+                old.clear()      # 让出显示权前清空分层窗内容，避免旧位图残留
             self.render_mode = mode
             self.renderer = create_renderer(self, cfg, mode)
             try:
@@ -4471,6 +4935,8 @@ class FollowOverlay:
         nx, ny = e.x_root - self._dx, e.y_root - self._dy
         self.root.geometry(f'+{nx}+{ny}')
         self._x, self._y = nx, ny
+        # 拖动中位图要跟着走（alpha）；compat 下无操作
+        self._push_render_frame()
         # 手动拖拽后候选框在场 → 同步图层（below 时保持候选框压图，避免拖完层级漂移）
         self._sync_layer_with_candidate()
 
@@ -4511,6 +4977,8 @@ class FollowOverlay:
                 self._position_once(allow_scan=True)
             except Exception:
                 pass
+            # 手动显示（可能无候选框、_position_once 没推）→ 补推一次位图（compat 无操作）
+            self._push_render_frame()
         else:
             self.root.withdraw()
             self.visible = False
@@ -4583,6 +5051,20 @@ class FollowOverlay:
         except Exception:
             return self._top_hwnd_cache or None
 
+    def _push_render_frame(self):
+        """渲染层重推（v2.0-①b）：移动/缩放/显隐之后让分层窗位图跟上。
+
+        compat 模式下 on_moved 是空操作（显示由 Tk Label 承担），所以这里无条件调用，
+        不需要在调用点再判断 render_mode —— 老路径行为零变化。
+        """
+        try:
+            _renderer_of(self).on_moved()
+        except Exception as e:
+            try:
+                _write_log(f'[渲染] 重推位图失败: {e}')
+            except Exception:
+                pass
+
     def _sync_tk_geometry(self):
         """低频（尺寸变化/手动交互后）把镜像坐标同步回 Tk：
         SetWindowPos 直移后 Tk 内部 winfo_x/y 可能过时，凡 w/h 变化
@@ -4593,6 +5075,8 @@ class FollowOverlay:
             self.root.geometry(f'{self.w}x{self.h}+{int(self._x)}+{int(self._y)}')
         except Exception:
             pass
+        # 尺寸/位置变了 → alpha 下位图要重推一次（compat 无操作）
+        self._push_render_frame()
 
     def _cached_hwnd_ok(self):
         """缓存句柄仍有效：窗口存在且可见（O(1)，无枚举）。"""
@@ -4669,6 +5153,7 @@ class FollowOverlay:
                             self.visible = True
                         if PERF_LOG_ENABLED and moved:
                             _perf_log(f'  ├ SetWindowPos -> ({x},{y})')
+                        self._push_render_frame()  # 移动/首显后重推位图（compat 无操作）
                         self._apply_layer(self._cached_hwnd)  # 移动/首显后同步图层（above=无操作）
                         return True
                     # 矩形异常（非候选框尺寸）→ 缓存失效

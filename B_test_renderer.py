@@ -173,8 +173,9 @@ def main():
               issubclass(R.LayeredRenderer, R.CompatRenderer)
               and issubclass(R.CompatRenderer, R.Renderer)
               and issubclass(R.LayeredRenderer, R.Renderer))
-        check('B5 LayeredRenderer 骨架期 alpha_ready=False',
-              R.LayeredRenderer.alpha_ready is False)
+        check('B5 LayeredRenderer 已完成实装（①b：alpha_ready=True，不再骨架期空转）',
+              R.LayeredRenderer.alpha_ready is True
+              and R.LayeredRenderer.uses_tk_label is False)
         skeleton = ('ensure_layered', 'premultiply_bgra', 'push_bitmap', 'push_frame',
                     'make_label', 'apply_window', 'apply_label', 'apply_photo_only',
                     'flatten', 'to_photo', 'prepare', 'release')
@@ -184,21 +185,16 @@ def main():
         # push_bitmap 是 LayeredRenderer 的内部实现细节，不属于对外契约）
         base_api = ('pick_key', 'flatten', 'to_photo', 'prepare', 'make_label',
                     'apply_window', 'apply_label', 'apply_photo_only', 'push_frame',
-                    'release', 'describe')
+                    'on_moved', 'on_shown', 'release', 'describe')
         base_missing = [n for n in base_api if not callable(getattr(R.Renderer, n, None))]
         check('B7 Renderer 基类对外接口完整（FollowOverlay 只认这套）',
               not base_missing, f'missing={base_missing}')
-        safe = True
-        for call in (lambda: r_alpha.ensure_layered(0),
-                     lambda: r_alpha.premultiply_bgra(Image.new('RGBA', (2, 2))),
-                     lambda: r_alpha.push_bitmap(0, Image.new('RGBA', (2, 2)), 0, 0),
-                     lambda: r_alpha.push_frame(Image.new('RGBA', (2, 2)))):
-            try:
-                call()
-            except Exception as e:
-                safe = False
-                print('      骨架方法骨架期抛异常:', repr(e))
-        check('B8 骨架期 alpha 方法安全空转（不抛、不动显示）', safe)
+        check('B8 alpha 实装能力齐备（向量化预乘 + 分层窗推送 + 状态复位）',
+              callable(R.LayeredRenderer.premultiply_bgra)
+              and callable(R.LayeredRenderer.push_bitmap)
+              and callable(R.LayeredRenderer.ensure_layered)
+              and callable(R.LayeredRenderer.make_bmi)
+              and R.LayeredRenderer.alpha_ready is True)
         check('B9 Renderer 接口默认 mode / uses_tk_label 自洽',
               R.Renderer.mode == 'compat' and R.CompatRenderer.uses_tk_label is True)
 
@@ -383,14 +379,20 @@ def main():
                   ok2 and ov.render_mode == 'alpha'
                   and type(ov.renderer) is R.LayeredRenderer,
                   f'{ov.render_mode}/{type(ov.renderer).__name__}')
-            check('D14 alpha 骨架期切皮肤后产物与 compat 逐像素一致（40x60 全量）',
-                  _photo_pixels(ov.img, 40, 60) == compat_px)
+            check('D14 alpha 皮肤下帧保留 RGBA（①b 真 alpha 不再抠色）',
+                  ov.renderer._frame is not None
+                  and ov.renderer._frame.mode == 'RGBA'
+                  and ov.renderer._frame.size == (40, 60)
+                  and hasattr(ov.img, 'image'),      # LayerFrame：width()/height() 语义
+                  ov.renderer.describe())
             scfg['render_mode'] = 'compat'
             with open(skin_json, 'w', encoding='utf-8') as f:
                 _json.dump(scfg, f, ensure_ascii=False, indent=2)
             ov.apply_skin('渲染测试皮')
             check('D15 切回 compat 完全恢复老行为',
-                  ov.render_mode == 'compat' and type(ov.renderer) is R.CompatRenderer)
+                  ov.render_mode == 'compat' and type(ov.renderer) is R.CompatRenderer
+                  and str(ov.root.attributes('-transparentcolor')).lower()
+                  == R._key_hex(ov.key_rgb).lower())
         finally:
             R.SKINS_DIR = old_skins
 
@@ -429,18 +431,23 @@ def main():
             ov_a.tray.stop()
         except Exception:
             pass
-        check('D19 alpha 配置 → LayeredRenderer 被选中',
-              type(ov_a.renderer) is R.LayeredRenderer and ov_a.render_mode == 'alpha',
+        check('D19 alpha 配置 → LayeredRenderer 被选中（①b 实装完成）',
+              type(ov_a.renderer) is R.LayeredRenderer and ov_a.render_mode == 'alpha'
+              and R.LayeredRenderer.alpha_ready is True,
               ov_a.renderer.describe())
-        check('D20 alpha 配置下 Label 仍在（交互不受影响）',
-              ov_a.label is not None and ov_a.label.bind('<B1-Motion>'))
-        tc_a = str(ov_a.root.attributes('-transparentcolor')).lower().lstrip('#')
-        check('D21 alpha 骨架期窗口属性与 compat 一致',
-              tc_a == tc.lower(), f'{tc_a} vs {tc}')
-        check('D22 alpha 骨架期产物与 compat 逐像素一致（40x60 全量）',
-              (ov_a.img.width(), ov_a.img.height()) == (40, 60)
-              and _photo_pixels(ov_a.img, 40, 60) == compat_px,
-              f'{ov_a.img.width()}x{ov_a.img.height()}')
+        check('D20 alpha 配置下 Label 仍在（交互不受影响）且不贴图',
+              ov_a.label is not None and ov_a.label.bind('<B1-Motion>')
+              and not ov_a.label.cget('image'))
+        check('D21 alpha 模式已摘掉 -transparentcolor（键色抠色不再参与显示）',
+              str(ov_a.root.attributes('-transparentcolor')) in ('', '0'),
+              repr(str(ov_a.root.attributes('-transparentcolor'))))
+        semi = Image.new('RGBA', (6, 6), (200, 60, 40, 60))
+        k_semi = R.pick_key_color([semi], Image)
+        compat_semi = R._flatten_alpha_for_tk(semi, Image, k_semi).getpixel((2, 2))
+        alpha_semi = ov_a.renderer.flatten(semi, k_semi, Image).getpixel((2, 2))
+        check('D22 alpha 保留逐像素 alpha，compat 把它抠成键色（升级一的实质差别）',
+              alpha_semi == (200, 60, 40, 60) and compat_semi[:3] == tuple(k_semi),
+              f'alpha={alpha_semi} compat={compat_semi[:3]} key={k_semi}')
 
         # alpha 实例切「无 render_mode 键」的老皮肤 → 全局开关保持 alpha（不被老档案打回）
         old_skins = R.SKINS_DIR
