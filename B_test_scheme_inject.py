@@ -5,11 +5,13 @@
   [1] 颜色提取（单图 / 动图多帧颜色并集 / 透明像素不参与 / 空输入兜底）
   [2] 21 字段生成（字段名与 weasel.custom.yaml 现成先例逐一对应、无遗漏无多余；亮暗两套）
   [3] 对比度下限（每套 9 组「文字 vs 所在背景」+ 强调色 vs 候选栏底色）
-  [4] 临时目录内的注入 / 合并（保留同名方案其它字段、不动 style/* 与其它方案）/ 备份 / 回滚
-  [5] dry-run 只返回 diff 不落盘
-  [6] WeaselDeployer 缺失 / 失败 / 超时都给明确提示，不静默吞错
-  [7] 向导入口与结果提示；皮肤档案保存配色名；切皮肤整套恢复（含光环联动 get_rime_accent）
-  [8] 全程不触碰真实 %APPDATA%\\Rime（结束时断言真实文件哈希与目录清单一字未变）
+  [4] 临时目录内的注入 / 合并 / 备份 / 回滚 / dry-run 不落盘 / 原子写无残留
+  [5] WeaselDeployer 缺失 / 失败 / 超时都给明确提示，不静默吞错
+  [6] 向导入口与结果提示；皮肤档案保存配色名；切皮肤整套恢复（含光环联动 get_rime_accent）
+  [7] 全程不触碰真实 %APPDATA%\\Rime（结束时断言真实文件哈希与目录清单一字未变）
+  [8] WeaselDeployer 定位：注册表卸载项解析（伪造数据单测，不依赖真机）+ 真机定位结果
+      （环境无小狼毫时 SKIP 而非 FAIL）；全程不真起 WeaselDeployer 进程
+  [9] 测试临时目录治理：回收历史 %TEMP%/scheme_* 残留，本次运行目录 try/finally 必删
 
 运行: python B_test_scheme_inject.py   （退出码 0 = 全过）
 """
@@ -18,6 +20,7 @@ import sys
 import json
 import shutil
 import tempfile
+import time
 
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -30,12 +33,51 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import rime_char_overlay as R
 
-PASS, FAIL = [], []
+PASS, FAIL, SKIP = [], [], []
 
 
 def check(name, cond, detail=''):
     (PASS if cond else FAIL).append(name)
     print(f'{"PASS" if cond else "FAIL"}  {name}{(" | " + detail) if detail else ""}')
+
+
+def skip(name, detail=''):
+    """环境不合适（如本机没装小狼毫）→ 计 SKIP，不计失败"""
+    SKIP.append(name)
+    print(f'SKIP  {name}{(" | " + detail) if detail else ""}')
+
+
+def _sweep_stale_tmp_dirs(current=None, protect_recent=600, only_prefix='scheme_'):
+    """回收本测试历史遗留的 %TEMP%/scheme_* 目录（可靠清理，不误删别的东西）。
+
+    只认 only_prefix 前缀、只删目录、跳过正在运行的那一个（current）与最近被修改过的
+    （protect_recent 秒内 → 防并发运行的另一个实例被互删）。返回被回收目录清单。
+    """
+    base = tempfile.gettempdir()
+    cur = os.path.abspath(current) if current else None
+    removed = []
+    try:
+        names = os.listdir(base)
+    except Exception:
+        return removed
+    now = time.time()
+    for n in names:
+        if not n.startswith(only_prefix):
+            continue
+        p = os.path.join(base, n)
+        if cur and os.path.abspath(p) == cur:
+            continue
+        try:
+            if os.path.islink(p) or not os.path.isdir(p):
+                continue
+            if protect_recent and (now - os.path.getmtime(p)) < protect_recent:
+                continue
+            shutil.rmtree(p, ignore_errors=True)
+            if not os.path.exists(p):
+                removed.append(p)
+        except Exception:
+            continue
+    return removed
 
 
 def _md5(p):
@@ -681,6 +723,207 @@ def test_real_untouched(real_custom, snap_before):
     check('7b 真实 Rime 目录没有新增文件（无新 .bak）', not added, str(added))
 
 
+# ---------------- [8] WeaselDeployer 注册表定位 ----------------
+FAKE_ENTRIES = [
+    {'_key': 'Weasel', 'DisplayName': '小狼毫输入法',
+     'UninstallString': '"D:\\Rime\\weasel-0.17.4\\uninstall.exe"',
+     'DisplayIcon': '"D:\\Rime\\weasel-0.17.4\\WeaselServer.exe"', 'InstallLocation': ''},
+    {'_key': 'RimeOld', 'DisplayName': 'Rime 输入法 (旧)',
+     'UninstallString': 'D:\\Tools\\rime\\uninstall.exe /S',
+     'DisplayIcon': 'D:\\Tools\\rime\\weasel.ico,0', 'InstallLocation': ''},
+    {'_key': 'WeChat', 'DisplayName': '微信',
+     'UninstallString': '"C:\\Program Files\\Tencent\\WeChat\\uninstall.exe"',
+     'DisplayIcon': '', 'InstallLocation': 'C:\\Program Files\\Tencent\\WeChat'},
+    {'_key': 'Primer', 'DisplayName': 'Primer Suite',
+     'UninstallString': 'C:\\Tools\\Primer\\uninstall.exe', 'DisplayIcon': '', 'InstallLocation': ''},
+]
+
+
+def test_registry_lookup(tmp):
+    print('--- [8] WeaselDeployer 定位：注册表来源（伪造数据单测 + 真机结果）---')
+    _path = getattr(R, '_path_from_reg_value', None)
+    _dir = getattr(R, '_dir_from_reg_path_value', None)
+    _look = getattr(R, '_looks_like_weasel_entry', None)
+    _dirs = getattr(R, 'weasel_dirs_from_entries', None)
+    _iter = getattr(R, 'iter_uninstall_entries', None)
+    _reg = getattr(R, 'registry_weasel_dirs', None)
+
+    check('8a 可执行路径提取：去引号 / 带参数 / 带图标索引',
+          bool(_path)
+          and _path('"D:\\Rime\\weasel-0.17.4\\uninstall.exe"')
+          == 'D:\\Rime\\weasel-0.17.4\\uninstall.exe'
+          and _path('D:\\Rime\\weasel-0.17.4\\uninstall.exe /S')
+          == 'D:\\Rime\\weasel-0.17.4\\uninstall.exe'
+          and _path('D:\\Rime\\weasel-0.17.4\\weasel.ico,0')
+          == 'D:\\Rime\\weasel-0.17.4\\weasel.ico',
+          str(_path('"D:\\Rime\\weasel-0.17.4\\uninstall.exe"') if _path else None))
+    check('8b 从 UninstallString 提目录（带引号）',
+          bool(_dir) and _dir('"D:\\Rime\\weasel-0.17.4\\uninstall.exe"') == 'D:\\Rime\\weasel-0.17.4',
+          str(_dir('"D:\\Rime\\weasel-0.17.4\\uninstall.exe"') if _dir else None))
+    check('8c 从 DisplayIcon 提目录（带 ,0 图标索引）',
+          bool(_dir) and _dir('D:\\Rime\\weasel-0.17.4\\weasel.ico,0') == 'D:\\Rime\\weasel-0.17.4',
+          str(_dir('D:\\Rime\\weasel-0.17.4\\weasel.ico,0') if _dir else None))
+    check('8d 带启动参数（ /S）仍能提目录',
+          bool(_dir) and _dir('"C:\\Rime\\weasel\\uninstall.exe" /S') == 'C:\\Rime\\weasel')
+    check('8e InstallLocation 形态（纯目录）原样返回',
+          bool(_dir) and _dir('D:\\Rime\\weasel-0.17.4') == 'D:\\Rime\\weasel-0.17.4')
+    check('8f 空值/None → None 且不抛异常',
+          bool(_path) and _path('') is None and _path(None) is None
+          and _dir('') is None and _dir(None) is None)
+    check('8g DisplayName 匹配 小狼毫/Rime/weasel，不误伤 Primer/微信',
+          bool(_look) and _look('小狼毫输入法') and _look('Rime 输入法')
+          and _look('weasel-0.17.4') and not _look('Primer Suite') and not _look('微信'))
+
+    got = _dirs(FAKE_ENTRIES) if _dirs else []
+    check('8h 只挑小狼毫/Rime/weasel 的安装目录（去重保序）',
+          got == ['D:\\Rime\\weasel-0.17.4', 'D:\\Tools\\rime'], str(got))
+
+    calls = []
+    fake_tree = {
+        ('HKLM', r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'): ['Weasel', 'OtherApp'],
+        ('HKLM', r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'): ['Weasel32'],
+        ('HKCU', r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'): [],
+    }
+    fake_vals = {
+        r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Weasel': FAKE_ENTRIES[0],
+        r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OtherApp': FAKE_ENTRIES[2],
+        r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Weasel32': FAKE_ENTRIES[1],
+    }
+
+    def _lister(hive, subkey):
+        calls.append((hive, subkey))
+        return list(fake_tree.get((hive, subkey), []))
+
+    def _reader(hive, subkey):
+        return fake_vals.get(subkey)
+
+    ents = _iter(lister=_lister, reader=_reader) if _iter else None
+    check('8i 遍历三个卸载项根（HKLM 64 位 / WOW6432Node / HKCU）',
+          bool(_iter) and len(calls) == 3 and isinstance(ents, list) and len(ents) == 3,
+          f'calls={len(calls)} entries={len(ents) if isinstance(ents, list) else None}')
+    got2 = _dirs(ents) if (_dirs and isinstance(ents, list)) else []
+    check('8j 注入伪造注册表数据 → 得到预期安装目录（不依赖真机）',
+          got2 == ['D:\\Rime\\weasel-0.17.4', 'D:\\Tools\\rime'], str(got2))
+
+    def _boom(*a, **k):
+        raise OSError('模拟注册表不可读')
+
+    ok_no_raise = False
+    try:
+        ents2 = _iter(lister=_boom, reader=_boom) if _iter else None
+        ok_no_raise = isinstance(ents2, list)
+    except Exception as e:
+        print('    注册表异常穿透：', e)
+    check('8k 注册表读取异常不抛（返回列表，继续走后续候选）', ok_no_raise)
+
+    ok_reg, reg_dirs = False, []
+    try:
+        reg_dirs = _reg() if _reg else []
+        ok_reg = isinstance(reg_dirs, list)
+    except Exception as e:
+        print('    registry_weasel_dirs 抛异常：', e)
+    check('8l 真机 registry_weasel_dirs() 调用不抛异常', bool(_reg) and ok_reg)
+
+    real = R.find_weasel_deployer()
+    if real:
+        size = os.path.getsize(real) if os.path.isfile(real) else -1
+        check('8m 真机定位结果可用（文件存在且名称为 WeaselDeployer.exe）',
+              os.path.isfile(real) and os.path.basename(real).lower() == 'weaseldeployer.exe',
+              f'{real} ({size} B)')
+    else:
+        skip('8m 真机未找到 WeaselDeployer（本环境无小狼毫）')
+    if reg_dirs:
+        check('8n 真机注册表能提出安装目录且目录存在',
+              all(os.path.isdir(d) for d in reg_dirs), str(reg_dirs))
+    else:
+        skip('8n 真机注册表无小狼毫/Rime 卸载项')
+
+    fake_exe = os.path.join(tmp, 'prio_explicit.exe')
+    _write(fake_exe, 'MZ')
+    check('8o 显式 extra 优先于注册表与常见目录',
+          R.find_weasel_deployer(extra=fake_exe) == fake_exe,
+          str(R.find_weasel_deployer(extra=fake_exe)))
+    fake_env = os.path.join(tmp, 'prio_env.exe')
+    _write(fake_env, 'MZ')
+    old_env = os.environ.get('WEASEL_DEPLOYER')
+    os.environ['WEASEL_DEPLOYER'] = fake_env
+    try:
+        r2 = R.find_weasel_deployer()
+    finally:
+        if old_env is None:
+            os.environ.pop('WEASEL_DEPLOYER', None)
+        else:
+            os.environ['WEASEL_DEPLOYER'] = old_env
+    check('8p 环境变量优先于注册表', r2 == fake_env, str(r2))
+    if real:
+        r3 = R.run_weasel_deployer(runner=lambda c, t: 0)   # 注入 runner → 不真起部署进程
+        check('8q 定位到真 exe 时可用注入 runner 静默验证（不真起进程）',
+              r3['ok'] and r3['exe'] == real, f"{r3['exe']} rc={r3['rc']}")
+    else:
+        skip('8q 无真 exe（本环境无小狼毫）')
+
+
+def _mk_tmp_dir(name):
+    p = os.path.join(tempfile.gettempdir(), name)
+    os.makedirs(p, exist_ok=True)
+    with open(os.path.join(p, 'WeaselDeployer.exe'), 'wb') as f:
+        f.write(b'MZ fake')
+    return p
+
+
+def _count_scheme_dirs(exclude=None):
+    base = tempfile.gettempdir()
+    out = []
+    try:
+        for n in os.listdir(base):
+            if not n.startswith('scheme_'):
+                continue
+            p = os.path.join(base, n)
+            if exclude and os.path.abspath(p) == os.path.abspath(exclude):
+                continue
+            if os.path.isdir(p):
+                out.append(p)
+    except Exception:
+        pass
+    return out
+
+
+# ---------------- [9] 测试临时目录治理 ----------------
+def test_tmp_hygiene(tmp):
+    print('--- [9] 测试临时目录治理（不残留 scheme_*）---')
+    sweep = globals().get('_sweep_stale_tmp_dirs')
+    fake = _mk_tmp_dir('scheme_selftest_%d' % os.getpid())
+    keep = _mk_tmp_dir('notscheme_selftest_%d' % os.getpid())
+    removed = []
+    try:
+        # 只针对自建的 scheme_selftest_* 前缀回收（不碰其它实例正在用的目录）
+        removed = sweep(protect_recent=0, current=None,
+                        only_prefix='scheme_selftest_') if sweep else []
+        check('9a sweep 回收 TEMP 下的 scheme_* 目录',
+              bool(sweep) and not os.path.exists(fake)
+              and any(os.path.abspath(p) == os.path.abspath(fake) for p in removed),
+              f'removed={len(removed)}')
+        check('9b 不碰非 scheme_ 前缀的目录（只认自己的前缀）', os.path.isdir(keep), keep)
+        check('9c 返回被回收目录清单（便于日志留痕）',
+              isinstance(removed, list) and all(isinstance(x, str) for x in removed),
+              str([os.path.basename(x) for x in removed][:3]))
+        protected = _mk_tmp_dir('scheme_selftest_protected_%d' % os.getpid())
+        try:
+            removed2 = sweep(protect_recent=0, current=protected,
+                             only_prefix='scheme_selftest_') if sweep else []
+            check('9e sweep 保护正在运行的那一个（current 不被删）',
+                  bool(sweep) and os.path.isdir(protected)
+                  and not any(os.path.abspath(p) == os.path.abspath(protected) for p in removed2))
+        finally:
+            shutil.rmtree(protected, ignore_errors=True)
+    finally:
+        shutil.rmtree(keep, ignore_errors=True)
+    left = _count_scheme_dirs(exclude=tmp)
+    stale = [p for p in left if (time.time() - os.path.getmtime(p)) >= 600]
+    check('9d 历史残留已回收（除本次运行目录外无 10 分钟以上的 scheme_* 目录）',
+          not stale, f'仍剩={[os.path.basename(x) for x in stale]}')
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix='scheme_')
     real_custom = R.WEASEL_CUSTOM          # 真实路径（只读）
@@ -692,19 +935,31 @@ def main():
     R.HERE = tmp                            # 日志写临时目录，别污染项目
     print('=' * 64)
     print(f'真实 Rime 目录（只读、不写）：{os.path.dirname(real_custom)}')
+    print(f'本次临时目录：{tmp}')
     print('=' * 64)
     try:
+        recycled = _sweep_stale_tmp_dirs(current=tmp)
+        if recycled:
+            print('已回收历史临时目录 %d 个：%s'
+                  % (len(recycled), ', '.join(os.path.basename(p) for p in recycled)))
         test_extract(tmp)
         test_fields(tmp, real_custom)
         test_contrast(tmp)
         test_inject(tmp, real_custom)
         test_deployer(tmp)
         test_wizard_binding(tmp, real_custom)
+        test_registry_lookup(tmp)
+        test_tmp_hygiene(tmp)
         test_real_untouched(real_custom, snap)
     finally:
         R.HERE = real_here
+        # 本次运行目录必删（try/finally 兜底，异常/提前退出也不残留）
+        shutil.rmtree(tmp, ignore_errors=True)
+        if os.path.isdir(tmp):
+            print(f'警告：本次临时目录未能删除：{tmp}')
     print('=' * 64)
-    print(f'通过 {len(PASS)} 项 / 失败 {len(FAIL)} 项')
+    print(f'通过 {len(PASS)} 项 / 失败 {len(FAIL)} 项'
+          + (f' / 跳过 {len(SKIP)} 项' if SKIP else ''))
     if FAIL:
         print('失败项: ' + ', '.join(FAIL))
         return 1

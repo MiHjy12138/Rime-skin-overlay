@@ -1519,9 +1519,174 @@ def find_latest_weasel_backup(path=None):
         return cands[0]
 
 
+# ---------- 小狼毫安装位置探测：注册表卸载项（任意盘符的自定义安装都能定位）----------
+# 三个根：HKLM 64 位 / HKLM 32 位（WOW6432Node）/ HKCU —— 小狼毫常见写在 WOW6432Node 下
+_WEASEL_UNINSTALL_ROOTS = (
+    ('HKLM', r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+    ('HKLM', r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'),
+    ('HKCU', r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+)
+# DisplayName/路径匹配：小狼毫 / weasel / 独立单词 rime（不误伤 Primer 之类含 rime 的词）
+_WEASEL_NAME_RE = re.compile(r'小狼毫|weasel|(^|[^a-z])rime([^a-z]|$)', re.IGNORECASE)
+# 这些扩展名的注册表值视为「可执行文件/图标路径」→ 取所在目录；否则视为目录本身
+_EXE_LIKE_EXT = ('.exe', '.ico', '.dll', '.bat', '.cmd', '.msi', '.lnk')
+
+
+def _reg_hive(name):
+    """hive 名 → HKEY 常量；winreg 不可用（非 Windows/受限环境）返回 None"""
+    try:
+        import winreg
+    except Exception:
+        return None
+    return {'HKLM': winreg.HKEY_LOCAL_MACHINE,
+            'HKCU': winreg.HKEY_CURRENT_USER}.get(name)
+
+
+def _path_from_reg_value(value):
+    """注册表里的路径值 → 纯路径：去引号、去启动参数、去图标索引（...,0）。
+
+    例：'"D:\\Rime\\weasel-0.17.4\\uninstall.exe"' → 'D:\\Rime\\weasel-0.17.4\\uninstall.exe'
+        'D:\\Rime\\weasel\\weasel.ico,0'          → 'D:\\Rime\\weasel\\weasel.ico'
+        '"C:\\Rime\\uninstall.exe" /S'            → 'C:\\Rime\\uninstall.exe'
+    解析失败/空值返回 None（绝不抛异常）。
+    """
+    if not value:
+        return None
+    s = str(value).split('\x00')[0].strip()      # 个别安装器的 REG_SZ 带尾随 NUL
+    if not s:
+        return None
+    if ',' in s:                                  # DisplayIcon 常见形式 "...\weasel.ico,0"
+        head, _, tail = s.rpartition(',')
+        if head.strip() and tail.strip().isdigit():
+            s = head.strip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        s = s[1:end] if end > 0 else s[1:]
+    else:
+        m = re.match(r'^(.*?\.(?:exe|ico|dll|bat|cmd|msi|lnk))(\s|$)', s, re.IGNORECASE)
+        s = m.group(1) if m else s.split(' ')[0]
+    s = s.strip().strip('"').strip()
+    return s or None
+
+
+def _dir_from_reg_path_value(value):
+    """注册表值 → 安装目录：可执行/图标路径取所在目录，纯目录（InstallLocation）原样返回"""
+    p = _path_from_reg_value(value)
+    if not p:
+        return None
+    if p.lower().endswith(_EXE_LIKE_EXT):
+        d = os.path.dirname(p)
+        return os.path.normpath(d) if d else None
+    return os.path.normpath(p)
+
+
+def _looks_like_weasel_entry(name, uninstall_string='', display_icon='', install_location=''):
+    """卸载项是否属于小狼毫/Rime/weasel（名称或任一路径字段命中即可）"""
+    blob = ' '.join(str(x or '') for x in (name, uninstall_string, display_icon, install_location))
+    return bool(_WEASEL_NAME_RE.search(blob))
+
+
+def iter_uninstall_entries(lister=None, reader=None):
+    """遍历三个卸载项根，返回各卸载项的值字典列表。
+
+    lister(hive, subkey) → 子键名列表；reader(hive, full_subkey) → 值字典（两者可注入，便于单测）。
+    默认用 winreg 实读；任何异常（权限/缺失/非 Windows）都被吞掉并继续，绝不抛异常。
+    """
+    if lister is None:
+        def lister(hive_name, subkey):
+            try:
+                import winreg
+            except Exception:
+                return []
+            hive = _reg_hive(hive_name)
+            if hive is None:
+                return []
+            try:
+                with winreg.OpenKey(hive, subkey) as k:
+                    out, i = [], 0
+                    while True:
+                        try:
+                            out.append(winreg.EnumKey(k, i))
+                        except OSError:
+                            break
+                        i += 1
+                    return out
+            except Exception:
+                return []
+    if reader is None:
+        def reader(hive_name, full_subkey):
+            try:
+                import winreg
+            except Exception:
+                return None
+            hive = _reg_hive(hive_name)
+            if hive is None:
+                return None
+            try:
+                with winreg.OpenKey(hive, full_subkey) as k:
+                    d, i = {}, 0
+                    while True:
+                        try:
+                            n, v, _t = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        d[n] = v
+                        i += 1
+                    return d
+            except Exception:
+                return None
+    entries = []
+    for hive_name, subkey in _WEASEL_UNINSTALL_ROOTS:
+        try:
+            children = lister(hive_name, subkey)
+        except Exception:
+            children = []
+        for child in children or []:
+            try:
+                vals = reader(hive_name, subkey + '\\' + str(child))
+            except Exception:
+                vals = None
+            if isinstance(vals, dict) and vals:
+                entries.append(vals)
+    return entries
+
+
+def weasel_dirs_from_entries(entries):
+    """从卸载项列表筛出小狼毫/Rime/weasel 的安装目录（去重保序）。
+
+    目录来源：UninstallString → DisplayIcon → InstallLocation（任一能解析即可）。
+    """
+    out = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        un = e.get('UninstallString') or ''
+        icon = e.get('DisplayIcon') or ''
+        loc = e.get('InstallLocation') or ''
+        if not _looks_like_weasel_entry(e.get('DisplayName') or e.get('name') or '', un, icon, loc):
+            continue
+        for v in (un, icon, loc):
+            d = _dir_from_reg_path_value(v)
+            if d and d not in out:
+                out.append(d)
+    return out
+
+
+def registry_weasel_dirs():
+    """真机：从注册表卸载项得到小狼毫安装目录列表（读失败返回 []，绝不抛异常）"""
+    try:
+        return weasel_dirs_from_entries(iter_uninstall_entries())
+    except Exception:
+        return []
+
+
 # ---------- WeaselDeployer 定位与调用（缺失/失败/超时都给明确提示）----------
 def find_weasel_deployer(extra=None):
-    """定位 WeaselDeployer.exe：显式路径 → 环境变量 → PATH → 常见安装目录。找不到返回 None"""
+    """定位 WeaselDeployer.exe。
+
+    优先级：显式 extra > 环境变量 > PATH > 注册表卸载项（任意盘符自定义安装）> 常见安装目录。
+    找不到返回 None —— 调用方会给「已写入但需手动重新部署」的明确提示，不静默。
+    """
     import glob as _glob
     cands = []
     if extra:
@@ -1539,6 +1704,9 @@ def find_weasel_deployer(extra=None):
                 cands.append(w)
     except Exception:
         pass
+    # 注册表卸载项：小狼毫装在 D:\Rime\weasel-0.17.4 这类非标准路径时靠它定位
+    for d in registry_weasel_dirs():
+        cands.append(os.path.join(d, 'WeaselDeployer.exe'))
     roots = [os.environ.get('ProgramFiles', r'C:\Program Files'),
              os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
              os.environ.get('LOCALAPPDATA', '')]
@@ -1552,8 +1720,15 @@ def find_weasel_deployer(extra=None):
                 cands.extend(sorted(_glob.glob(os.path.join(root, *pat.split('/'))), reverse=True))
             except Exception:
                 pass
+    seen = set()
     for c in cands:
-        if c and os.path.isfile(c):
+        if not c:
+            continue
+        key = os.path.normcase(os.path.abspath(c))
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(c):
             return c
     return None
 
