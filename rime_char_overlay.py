@@ -5770,20 +5770,65 @@ class ConfigWizard:
             pass
         self._update_preview()
         self._update_key_hint()
+        try:
+            self._refresh_layer_row(0)   # R9：主图换了名字 → 图层列表第 1 行文案跟着变
+        except Exception:
+            pass
 
     def _preprocess_image(self):
-        """打开图片预处理窗口：裁剪 / 镜像反转 / 纯色抠图"""
-        if not self.cfg.get('image'):
-            messagebox.showwarning('提示', '请先选择图片！')
-            return
-        if not self.PIL:
-            messagebox.showerror('缺少依赖', '图片预处理需要 Pillow 库，当前环境未安装。')
-            return
+        """打开图片预处理窗口：裁剪 / 纯色背景抠图，作用于**当前选中的那一层**。
+
+        v2.0-R9（用户第三轮实测第 3 条「多图层时新加的图无法预处理」）：
+        改前写死 `self.cfg['image']`（顶层主图），处理完一律 `_set_main_image` —— 选中的图层
+        根本没参与：多图层下新加的层没有裁剪/抠图入口，真做下去还会把结果盖到**主图**上，
+        等于把用户的套层图改坏。
+        现在：
+          · 第 0 层（主图）→ 仍走 `_set_main_image`（顶层 image 与 layers[0]、① 文案、动图
+            按钮、key 提示照旧刷新）—— 原行为一字未改；
+          · 其它层 → 只改该层 image；顶层 image 与其它层一律不动；列表文案 / 预览 / key 提示
+            照常刷新（不出现「列表还写旧文件名」）；
+          · 该层还没选图 / 文件已不在 → 明确弹提示（带上层号与路径），绝不拿别的图顶上。
+        """
         try:
-            dlg = ImagePreprocessDialog(self.root, self.cfg['image'])
+            layers = self._layers()
+            i = self._cur_layer_index()
+            ld = layers[i] if 0 <= i < len(layers) else None
+            path = str((ld or {}).get('image') or '')
+            if not path and i == 0:
+                path = str(self.cfg.get('image') or '')   # 主层兼容老口径
+            if not path:
+                messagebox.showwarning(
+                    '这一层还没有图',
+                    f'第 {i + 1} 层还没有选图片。\n'
+                    + ('先用「① 选择图片」给主图选一张，再回来预处理。' if i == 0 else
+                       '先在 ⑫ 图层里给这一层选一张图，再回来预处理。'),
+                    parent=self.root)
+                return
+            if not os.path.isfile(path):
+                messagebox.showwarning(
+                    '图片文件找不到',
+                    f'第 {i + 1} 层的图片不在原来的位置了：\n{path}\n'
+                    '（可能被移走、删除或换了盘符）请重新为该层选图再预处理。',
+                    parent=self.root)
+                return
+            if not self.PIL:
+                messagebox.showerror('缺少依赖', '图片预处理需要 Pillow 库，当前环境未安装。')
+                return
+            hint = f'第 {i + 1} 层' + ('（主图）' if i == 0 else '')
+            dlg = ImagePreprocessDialog(self.root, path, layer_hint=hint)
             self.root.wait_window(dlg.root)
-            if dlg.result_path:
+            if not dlg.result_path:
+                return                      # 用户取消：一个路径都不许动
+            if i == 0:
                 self._set_main_image(dlg.result_path, '（已预处理）')
+                return
+            if ld is not None:
+                ld['image'] = dlg.result_path
+            self.cfg['layers'] = layers
+            self._layer_sel = i
+            self._refresh_layer_row(i)      # 列表文案：文件名变了
+            self._update_preview()          # 预览按新图重绘
+            self._update_key_hint()
         except Exception as e:
             messagebox.showerror('预处理失败', str(e))
 
