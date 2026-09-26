@@ -21,6 +21,14 @@ import json
 import shutil
 import tempfile
 
+# 控制台编码保护（与 B_test_layered_alpha.py 同写法）：
+# GBK 控制台下打印 🧹 / ⑪ 等非 GBK 字符会 UnicodeEncodeError 并让脚本 exit≠0
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 import rime_char_overlay as R          # noqa: E402
