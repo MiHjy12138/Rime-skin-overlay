@@ -287,6 +287,27 @@ def test_schema_compat():
     check('A25 无图老档案不崩（layers 仍可构造）', isinstance(c.get('layers'), list)
           and len(c['layers']) == 1, repr(c.get('layers')))
 
+    # ---- F-V1 / F-V3：主层 offset 的单一权威（纯函数面，比端到端更快定位）----
+    c = R.resolve_layers({'image': 'a.png', 'offset_x': -132, 'offset_y': -132})
+    check('A26 F-V1（纯函数面）老配置无 layers 键：顶层 offset 必须传进主层',
+          int(c[0]['offset_x']) == -132 and int(c[0]['offset_y']) == -132,
+          f'{c[0]["offset_x"]},{c[0]["offset_y"]}')
+    c = R.resolve_layers({'image': 'a.png', 'offset_x': 10, 'offset_y': 20,
+                          'layers': [{'image': 'a.png', 'anchor': 'left_edge',
+                                      'offset_x': 50, 'offset_y': 60}]})
+    check('A27 F-V3：主层 offset 只认顶层，层内值不叠加（无双计）',
+          int(c[0]['offset_x']) == 10 and int(c[0]['offset_y']) == 20,
+          f'{c[0]["offset_x"]},{c[0]["offset_y"]}')
+    check('A27b 主层 anchor 也以顶层 side 为权威（层内的 left_edge 被忽略）',
+          c[0]['anchor'] == 'right_edge' and abs(float(c[0]['scale']) - 1.0) < 1e-9,
+          f'{c[0]["anchor"]}/{c[0]["scale"]}')
+    c = R.resolve_layers({'image': 'a.png', 'offset_x': 7,
+                          'layers': [{'image': 'a.png', 'anchor': 'left_edge'},
+                                     {'image': 'b.png', 'anchor': 'right_edge',
+                                      'offset_x': 30, 'z': 1}]})
+    check('A28 F-V3：非主层（i>0）的层内 offset 不受影响（仍是自己的值）',
+          int(c[1]['offset_x']) == 30, repr(c[1]['offset_x']))
+
     c = R.migrate_skin_cfg({'schema': 2, 'image': 'a.png', 'layers': [
         {'image': 'sub/b.png', 'anchor': 'left_edge'}]}, skin_dir='D:/skins/测试')
     p = str(c['layers'][0]['image']).replace('\\', '/')
@@ -721,15 +742,16 @@ def test_runtime(tmp, gui_ok):
         check('F05 placements 覆盖 3 层且不越出窗口',
               len(pl) == 3 and all(0 <= dx and 0 <= dy for _i, dx, dy in pl), str(pl))
 
-        # 只开一个窗口：定位前后本进程 Tk 顶层窗口数不增加（每层一窗会成倍增长）
+        # ---- 单窗纪律（F-V2：纯 Tk 记账断言，不依赖「Tk 窗首次 update 才进 EnumWindows」的时序）----
         ov2._cached_hwnd = fake.hwnd
         R.set_candidate_hwnd(fake.hwnd)
-        n_before = len(_own_tk_windows())
+        kids_before = str(ov2.root.tk.eval('winfo children .')).split()
         ov2._position_once()
-        ov2.root.update_idletasks()
-        n_after = len(_own_tk_windows())
-        check('F06 多图层不新增窗口（定位后 Tk 顶层窗数量不变；每层一窗会 >1）',
-              n_after == n_before and n_after >= 1, f'before={n_before} after={n_after}')
+        kids_after = str(ov2.root.tk.eval('winfo children .')).split()
+        check('F06 多图层不为每层开窗：root 下没有额外 Toplevel',
+              not [k for k in kids_after if 'toplevel' in k], f'children={kids_after}')
+        check('F06b 定位前后 Tk 子窗口集合不变（定位不创建窗口/控件；.!label + .!menu 是既有控件）',
+              kids_after == kids_before, f'before={kids_before} after={kids_after}')
         n_lbl = len([x for x in ov2.root.winfo_children() if isinstance(x, tkinter.Label)])
         check('F07 多图层仍只有 1 个承载控件（不是每层一个控件/窗口）', n_lbl <= 1,
               f'labels={n_lbl}')
@@ -1139,6 +1161,163 @@ def _layer_delete_main_guard(wiz):
 
 
 # ==========================================================================
+# H. 端到端向后兼容（F-V1 回归）：release/ 老配置与老皮肤的落点必须与 v1.6 逐位相同
+# ==========================================================================
+def _v16_xy(w, h, rect, side, off_x=0, off_y=0, cfg_off_x=0, cfg_off_y=0):
+    """v1.6 `_calc_target` 的手写复刻（**独立于产品代码**，防"拿被测实现证明自己"）。
+
+    口径与 v1.6 源码一致：gap=8；right→rect.right+gap；left→rect.left-w-gap；
+    center→rect.left+(cw-w)//2；y 一律垂直居中；末尾再叠加用户微调偏移。
+    """
+    cw, ch = rect.right - rect.left, rect.bottom - rect.top
+    gap = 8
+    if side == 'left':
+        x = rect.left - w - gap + off_x + cfg_off_x
+    elif side == 'center':
+        x = rect.left + (cw - w) // 2 + off_x + cfg_off_x
+    else:
+        x = rect.right + gap + off_x + cfg_off_x
+    y = rect.top + (ch - h) // 2 + off_y + cfg_off_y
+    return int(x), int(y)
+
+
+def _probe_overlay(cfg, fake):
+    """建真 overlay → 贴到假候选框 → 返回 (落点, 显示尺寸)；用完立刻销毁。
+
+    进程内只允许一个外挂实例（_close_active_overlay 会销毁前一个），所以必须串行。
+    """
+    ov = None
+    try:
+        ov = R.FollowOverlay(dict(cfg))
+        try:
+            ov.tray.stop()
+        except Exception:
+            pass
+        try:
+            ov._anim_stop()          # 动图皮肤（心灵信标 24 帧）不参与本段
+        except Exception:
+            pass
+        ov._cached_hwnd = fake.hwnd
+        R.set_candidate_hwnd(fake.hwnd)
+        ov._position_once()
+        return (int(ov._x), int(ov._y)), (int(ov.w), int(ov.h))
+    finally:
+        try:
+            if ov is not None:
+                ov.root.destroy()
+        except Exception:
+            pass
+        R._ACTIVE_OVERLAY = None
+
+
+def test_release_compat(gui_ok):
+    section('H. 端到端向后兼容：release 老配置 / 老皮肤落点 == v1.6（F-V1 回归）')
+    rel = os.path.join(BASE, 'release')
+    cfg_path = os.path.join(rel, 'config.json')
+    if not gui_ok:
+        for i in range(1, 16):
+            skip(f'H{i:02d}', '无桌面环境（GUI 不可用）')
+        return
+    if not os.path.exists(cfg_path):
+        for i in range(1, 16):
+            skip(f'H{i:02d}', 'release/config.json 不存在')
+        return
+
+    real_skins = R.SKINS_DIR
+    real_save = R.save_config
+    real_mb = (R.messagebox.showinfo, R.messagebox.showwarning,
+               R.messagebox.showerror, R.messagebox.askyesno)
+    fake = None
+    try:
+        R.save_config = lambda cfg: None
+        R.messagebox.showinfo = lambda *a, **k: None
+        R.messagebox.showwarning = lambda *a, **k: None
+        R.messagebox.showerror = lambda *a, **k: None
+        R.messagebox.askyesno = lambda *a, **k: True
+
+        with open(cfg_path, encoding='utf-8') as f:
+            raw = json.load(f)
+        check('H01 release/config.json 是"老配置"形态（无 layers 键）', 'layers' not in raw,
+              str(sorted(raw.keys())))
+        check('H02 release/config.json 微调偏移 == -132 / -132',
+              int(raw.get('offset_x', 0)) == -132 and int(raw.get('offset_y', 0)) == -132,
+              f'{raw.get("offset_x")},{raw.get("offset_y")}')
+
+        # verifier 实测基线用的假候选框：420x72 @ (266,205)
+        fake = FakeCandidate(x=266, y=205, w=420, h=72)
+        rect = fake.rect()
+
+        # ---- 启动路径：load_config 的语义 = 直接把 config.json 喂给 FollowOverlay ----
+        pos, size = _probe_overlay(raw, fake)
+        exp = _v16_xy(size[0], size[1], rect, raw.get('side', 'right'),
+                      cfg_off_x=int(raw.get('offset_x', 0)),
+                      cfg_off_y=int(raw.get('offset_y', 0)))
+        check('H03 启动路径：落点 == v1.6 手写公式（逐位）', pos == exp,
+              f'got={pos} exp={exp} size={size}')
+        check('H04 启动路径：落点 == verifier 实测 v1.6 基线 (562,19)', pos == (562, 19),
+              f'got={pos}')
+        check('H05 芙芙图显示尺寸 == 128x180（scale 0.6）', size == (128, 180), str(size))
+        lost = _v16_xy(size[0], size[1], rect, raw.get('side', 'right'))
+        check('H06 若丢掉 offset 会偏成 (694,151) —— 与 verifier 的错落点一致',
+              lost == (694, 151), f'got={lost}')
+
+        # ---- 皮肤路径：find_skin → list_skins（会 migrate）----
+        R.SKINS_DIR = os.path.join(rel, 'skins')
+        sk_fu = R.find_skin('芙芙')
+        check('H07 皮肤路径能读到 芙芙 档案', bool(sk_fu))
+        if sk_fu:
+            pos_skin, size_skin = _probe_overlay(sk_fu, fake)
+            exp_skin = _v16_xy(size_skin[0], size_skin[1], rect, sk_fu.get('side', 'right'),
+                               cfg_off_x=int(sk_fu.get('offset_x', 0)),
+                               cfg_off_y=int(sk_fu.get('offset_y', 0)))
+            check('H08 皮肤路径（芙芙）：落点 == v1.6 手写公式', pos_skin == exp_skin,
+                  f'got={pos_skin} exp={exp_skin}')
+            check('H09 ★两条通路一致：启动路径 == 皮肤路径（同一份数据同一落点）',
+                  pos_skin == pos, f'startup={pos} skin={pos_skin}')
+
+        sk_xl = R.find_skin('心灵信标')
+        check('H10 皮肤路径能读到 心灵信标 档案（center/below/scale0.9/-162,-42）', bool(sk_xl))
+        if sk_xl:
+            pos_xl, size_xl = _probe_overlay(sk_xl, fake)
+            exp_xl = _v16_xy(size_xl[0], size_xl[1], rect, sk_xl.get('side', 'center'),
+                             cfg_off_x=int(sk_xl.get('offset_x', 0)),
+                             cfg_off_y=int(sk_xl.get('offset_y', 0)))
+            check('H11 皮肤路径（心灵信标）：落点 == v1.6 手写公式',
+                  pos_xl == exp_xl, f'got={pos_xl} exp={exp_xl}')
+            check('H12 心灵信标 落点 == (136,64)（尺寸 356x270 手算基线）',
+                  pos_xl == (136, 64), f'got={pos_xl} size={size_xl}')
+            check('H13 心灵信标 x 偏移没丢：与"丢 offset"版本的差值 == 162',
+                  (_v16_xy(size_xl[0], size_xl[1], rect, sk_xl.get('side', 'center'))[0]
+                   - pos_xl[0]) == 162,
+                  f'delta={_v16_xy(size_xl[0], size_xl[1], rect, sk_xl.get("side", "center"))[0] - pos_xl[0]}')
+            # 真正的"启动路径"：直接把 skin.json 原文喂给 FollowOverlay（不经 list_skins 的 migrate）
+            # —— 模拟老版本程序把档案当配置用 / 用户手工把 skin.json 拷成 config.json 的场景
+            xl_json = os.path.join(rel, 'skins', '心灵信标', 'skin.json')
+            with open(xl_json, encoding='utf-8') as f:
+                raw_xl = json.load(f)
+            check('H14 心灵信标 skin.json 原文是"老档案"形态（无 layers 键）',
+                  'layers' not in raw_xl, str(sorted(raw_xl.keys())))
+            pos_xl2, _sz2 = _probe_overlay(raw_xl, fake)
+            check('H15 ★心灵信标：原始档案启动路径 == 皮肤路径（两条通路逐位一致）',
+                  pos_xl2 == pos_xl, f'startup={pos_xl2} skin={pos_xl}')
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        check('H00 端到端段未抛异常', False, repr(e))
+    finally:
+        R.SKINS_DIR = real_skins
+        R.save_config = real_save
+        (R.messagebox.showinfo, R.messagebox.showwarning,
+         R.messagebox.showerror, R.messagebox.askyesno) = real_mb
+        try:
+            if fake is not None:
+                fake.destroy()
+        except Exception:
+            pass
+        R._ACTIVE_OVERLAY = None
+
+
+# ==========================================================================
 def main():
     print('=== B_test_layers_schema：v2.0-② 套层皮肤（多图层 + 锚点布局 + 单窗多图合成）===')
     print('Python', sys.version.split()[0])
@@ -1153,6 +1332,7 @@ def main():
         test_compose()
         test_runtime(tmp, gui_ok)
         test_wizard(tmp, gui_ok)
+        test_release_compat(gui_ok)
     finally:
         try:
             shutil.rmtree(tmp, ignore_errors=True)

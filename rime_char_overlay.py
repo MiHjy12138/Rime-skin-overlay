@@ -515,9 +515,14 @@ def make_layer_from_cfg(cfg, skin_dir=None):
 def resolve_layers(cfg, skin_dir=None):
     """cfg → 运行时图层列表（每个元素键齐全）。
 
-    · 老档案（无 layers）→ 单元素列表，参数全部来自顶层字段（单层退化等价的关键）
-    · 第 0 层：anchor/scale/flip/effects 与 offset 以顶层字段为准（顶层 offset 并入层内）
-    · 其它层：完全用自己的字段
+    · 老配置/老档案（无 layers 键）→ 单元素列表，**且必须继续走下面的主层合并分支**
+      —— 顶层 offset_x/offset_y 是用户微调偏移的唯一权威（出厂 config.json 就是
+      offset -132/-132），提前 return 会让老配置的微调偏移在启动路径上整体丢掉
+      （F-V1：图片窗位移 132~162 px；皮肤路径因 list_skins 会 migrate 才侥幸正常）
+    · 第 0 层（主层）：anchor/scale/flip/effects/offset 一律以顶层兼容字段为权威，
+      layers[0] 里的同名字段**不参与计算**（F-V3：避免"顶层 offset + 层内 offset"双计；
+      存盘时该字段本就归零，只有手改档案才可能非零，语义上以顶层为准）
+    · 其它层（i>0）：完全用自己的字段
     · 按 z 稳定升序（画布从下往上叠）
     """
     cfg = cfg if isinstance(cfg, dict) else {}
@@ -529,7 +534,8 @@ def resolve_layers(cfg, skin_dir=None):
             if l.get('image'):
                 layers.append(l)
     if not layers:
-        return [make_layer_from_cfg(cfg, skin_dir=skin_dir)]
+        # 老配置：补出主层，然后与有 layers 的情况走**同一条**合并分支（勿提前 return）
+        layers = [make_layer_from_cfg(cfg, skin_dir=skin_dir)]
     layers = layers[:MAX_LAYERS]
     layers.sort(key=lambda l: l.get('z', 0))
     main = make_layer_from_cfg(cfg, skin_dir=skin_dir)
@@ -542,11 +548,9 @@ def resolve_layers(cfg, skin_dir=None):
     l0['effects'] = main['effects']
     if not l0.get('image'):
         l0['image'] = main['image']
-    # 顶层 offset 并入第 0 层（顶层是权威；层内 offset 是额外微调）
-    l0['offset_x'] = _as_int(l0.get('offset_x'), 0, -1000, 1000) \
-        + _as_int(cfg.get('offset_x'), 0, -1000, 1000)
-    l0['offset_y'] = _as_int(l0.get('offset_y'), 0, -1000, 1000) \
-        + _as_int(cfg.get('offset_y'), 0, -1000, 1000)
+    # 顶层 offset 就是第 0 层的 offset（单一权威，F-V3：不再叠加层内值 → 绝无双计）
+    l0['offset_x'] = _as_int(cfg.get('offset_x'), 0, -1000, 1000)
+    l0['offset_y'] = _as_int(cfg.get('offset_y'), 0, -1000, 1000)
     layers[0] = l0
     return layers
 
