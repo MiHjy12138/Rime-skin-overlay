@@ -6,6 +6,8 @@
   [2] 21 字段生成（字段名与 weasel.custom.yaml 现成先例逐一对应、无遗漏无多余；亮暗两套）
   [3] 对比度下限（每套 9 组「文字 vs 所在背景」+ 强调色 vs 候选栏底色）
   [4] 临时目录内的注入 / 合并 / 备份 / 回滚 / dry-run 不落盘 / 原子写无残留
+      （R5 起：新配色块的 `# ===== <皮肤名> =====` 分节标题与前后空行也在此核对；
+        注释断言由「注释行数量未变」收紧为「原有注释一条不丢 + 新增只允许本工具的分节标题」）
   [5] WeaselDeployer 缺失 / 失败 / 超时都给明确提示，不静默吞错
   [6] 向导入口与结果提示；皮肤档案保存配色名；切皮肤整套恢复（含光环联动 get_rime_accent）
   [7] 全程不触碰真实 %APPDATA%\\Rime（结束时断言真实文件哈希与目录清单一字未变）
@@ -89,6 +91,13 @@ def _md5(p):
         return h.hexdigest()
     except Exception:
         return None
+
+
+def _cmt_counter(txt):
+    """注释行多重集（R5：用于断言「原有注释一条不丢 + 新增的只能是分节标题」）"""
+    import collections
+    return collections.Counter(l.strip() for l in (txt or '').splitlines()
+                               if l.strip().startswith('#'))
 
 
 # ---------------- 夹具 ----------------
@@ -396,9 +405,20 @@ def test_inject(tmp, real_custom):
           sum(1 for k in flat if k.startswith('preset_color_schemes/furina_aqua/')) ==
           sum(1 for k in R.parse_flat_yaml_text(orig)
               if k.startswith('preset_color_schemes/furina_aqua/')))
-    check('4l 注释行数量未变',
-          len([l for l in orig.splitlines() if l.strip().startswith('#')]) ==
-          len([l for l in text.splitlines() if l.strip().startswith('#')]))
+    check('4l 原文件注释一条不丢（R5 后收紧：不再只看数量）',
+          not (_cmt_counter(orig) - _cmt_counter(text)),
+          f'丢掉={list((_cmt_counter(orig) - _cmt_counter(text)).elements())}')
+    _extra_cmt = _cmt_counter(text) - _cmt_counter(orig)
+    check('4l2 新增注释只有 R5 的分节标题（每套方案 1 个，共 2 个）',
+          set(_extra_cmt) == {'# ===== demo =====', '# ===== demo · 深色 ====='}
+          and sum(_extra_cmt.values()) == 2,
+          f'新增={dict(_extra_cmt)}')
+    _lines_after = text.splitlines()
+    _hi = _lines_after.index('  # ===== demo =====') if '  # ===== demo =====' in _lines_after else -1
+    check('4l3 ★新块前有空行、标题紧贴自己的第一行键（不再与上一个皮肤并在一起）',
+          _hi > 0 and _lines_after[_hi - 1].strip() == ''
+          and f'preset_color_schemes/{names[0]}/name' in _lines_after[_hi + 1],
+          f'idx={_hi} prev={_lines_after[_hi - 1]!r}' if _hi > 0 else '未找到标题')
 
     # --- 幂等：再注入一次应无变化、不再备份 ---
     plan3 = R.plan_scheme_injection(tgt, skin='demo', light=light, dark=dark,

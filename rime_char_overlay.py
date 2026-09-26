@@ -929,6 +929,8 @@ _SCHEME_LINE_RE = re.compile(r'''^(\s*)["']?preset_color_schemes/([^/"']+)/([^"'
 # 当前配色行：  "style/color_scheme" / "style/color_scheme_dark"
 _ACTIVE_LINE_RE = re.compile(r'''^(\s*)["']?(style/color_scheme(?:_dark)?)["']?\s*:\s*(.*?)\s*$''')
 _PATCH_LINE_RE = re.compile(r'^(\s*)patch\s*:\s*$')
+# R5：本工具写的分节标题注释行（`# ===== 某皮肤 =====`，与用户文件里现成写法同形）
+_SCHEME_HEADER_RE = re.compile(r'^\s*#\s*={3,}\s*.+?\s*={3,}\s*$')
 
 
 def _clamp8(v):
@@ -1284,6 +1286,23 @@ def _format_scheme_line(scheme, field, value, indent='  '):
     return '%s"preset_color_schemes/%s/%s": %s' % (indent, scheme, field, val)
 
 
+def _scheme_section_title(skin, sname):
+    """R5：新配色块的分节标题文本 —— 亮套 = 皮肤名，暗套 = 皮肤名 · 深色。
+
+    皮肤名（写入方给的归属名）优先；为空时退化成方案名，保证标题里永远有可读文字
+    （用户要在 weasel.custom.yaml 里靠这行认块）。
+    """
+    base = str(skin or '').strip() or str(sname or '').strip()
+    if str(sname or '').endswith('_dark'):
+        return '%s · 深色' % base
+    return base
+
+
+def _scheme_section_header(title, indent='  '):
+    """R5：`# ===== <标题> =====` 分节标题注释行（对齐用户文件现成写法）"""
+    return '%s# ===== %s =====' % (indent, title)
+
+
 def _split_line_comment(line):
     """拆出行尾注释（引号外的 # 起）；返回 (主体, 注释串含其前空白)。用于改值时保留注释"""
     in_q = None
@@ -1319,19 +1338,24 @@ def _patch_insert_index(lines):
 
 
 def merge_scheme_into_yaml(text, schemes, set_active=False, stale_schemes=(),
-                           active_light=None, active_dark=None):
+                           active_light=None, active_dark=None, skin=''):
     """把配色方案按 patch 扁平键合并进 weasel.custom.yaml 文本（纯函数，不落盘）。
 
     schemes: [(方案名, {字段: 值}), ...]；字段集合限定在 SCHEME_FIELDS 内（不写野字段）。
+    skin   : 归属皮肤名（R5）—— 新块写前加 `# ===== <皮肤名> =====` 分节标题注释，
+             并与上一块之间留 ≥1 个空行（用户反馈：新配色跟最后一个皮肤「并在一起」看不清）。
     规则：
       · 同名方案的同名字段 → 就地替换该行值（保留缩进）；新字段 → 追加到 patch 段末尾
       · 其它配色方案、注释、style/* 、用户自定义键：默认一字不动（set_active=False）
       · set_active=True 时只额外改 style/color_scheme(_dark) 两个键（用户确认「一并切换」时）
-      · stale_schemes：本工具上次生成、本次改名后残留的方案 → 整段键行删除（不堆垃圾）
+      · stale_schemes：本工具上次生成、本次改名后残留的方案 → 整段键行删除（不堆垃圾），
+        连带删掉它头上本工具写的分节标题（不留孤儿注释）
+      · 幂等：只有「该方案真有新增键」才写标题，且同一标题已存在就不重复写
     返回 (新文本, diff 行列表, 统计 dict)
     """
     nl = '\r\n' if '\r\n' in (text or '') else '\n'
     lines = (text or '').splitlines()
+    existing_cmts = {ln.strip() for ln in lines if ln.strip().startswith('#')}
     want = {}
     for sname, fields in schemes or []:
         if not sname or not fields:
@@ -1349,6 +1373,10 @@ def merge_scheme_into_yaml(text, schemes, set_active=False, stale_schemes=(),
             if m:
                 sname, fname = m.group(2), m.group(3)
                 if sname in stale:
+                    # R5：连同本工具写的分节标题一起清掉（改名重注入不留孤儿标题）
+                    if out and _SCHEME_HEADER_RE.match(out[-1]):
+                        diff.append('- ' + out[-1].strip())
+                        out.pop()
                     diff.append('- ' + s)
                     removed += 1
                     continue
@@ -1382,11 +1410,19 @@ def merge_scheme_into_yaml(text, schemes, set_active=False, stale_schemes=(),
                         out.append(newln)
                         continue
         out.append(ln)
-    add = []
+    add, has_header = [], False
     for sname, fields in schemes or []:
-        for f in SCHEME_FIELDS:
-            if fields and f in fields and (sname, f) not in hit:
-                add.append(_format_scheme_line(sname, f, fields[f]))
+        if not sname or not fields:
+            continue
+        miss = [f for f in SCHEME_FIELDS if f in fields and (sname, f) not in hit]
+        if not miss:
+            continue                           # 没有新增键 → 不写标题（幂等的前提）
+        hdr = _scheme_section_header(_scheme_section_title(skin, sname))
+        if hdr.strip() not in existing_cmts:   # 标题已存在就不重复写
+            add.append(hdr)
+            has_header = True
+        for f in miss:
+            add.append(_format_scheme_line(sname, f, fields[f]))
     if set_active:
         present = set()
         for ln in out:
@@ -1399,10 +1435,19 @@ def merge_scheme_into_yaml(text, schemes, set_active=False, stale_schemes=(),
             add.append('  "style/color_scheme_dark": %s' % active_dark)
     if add:
         ins = _patch_insert_index(out)
+        # R5：新块前留 1 个空行（否则会紧贴上一个皮肤的最后一行键）
+        if has_header and ins > 0 and out[ins - 1].strip() != '':
+            out.insert(ins, '')
+            ins += 1
+            diff.append('+ (空行)')
         for a in add:
             out.insert(ins, a)
             ins += 1
             diff.append('+ ' + a.strip())
+        # R5：新块后也留 1 个空行（后面还有别的内容时，别和它贴在一起）
+        if has_header and ins < len(out) and out[ins].strip() != '':
+            out.insert(ins, '')
+            diff.append('+ (空行)')
     new_text = nl.join(out)
     if text.endswith(('\n', '\r')) or not text:
         new_text += nl
@@ -1440,7 +1485,7 @@ def plan_scheme_injection(path=None, skin='', light=None, dark=None,
     schemes = [(scheme_light, light or {}), (scheme_dark, dark or {})]
     new_text, diff, stats = merge_scheme_into_yaml(
         base_text, schemes, set_active=set_active, stale_schemes=stale_schemes,
-        active_light=scheme_light, active_dark=scheme_dark)
+        active_light=scheme_light, active_dark=scheme_dark, skin=skin)
     res.update(new_text=new_text, old_text=text, diff=diff, stats=stats, ok=True)
     res['msg'] = '计划：新增 %d 行 / 修改 %d 行 / 删除 %d 行' % (
         stats['added'], stats['updated'], stats['removed'])
@@ -1866,6 +1911,30 @@ def save_scheme_manifest(man):
     try:
         with open(SCHEME_MANIFEST, 'w', encoding='utf-8') as f:
             json.dump(man, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def bind_scheme_to_skin(name, light, dark=''):
+    """R5：把配色名写进皮肤档案（只改这两个键，其它字段一字不动）。
+
+    返回是否写入成功。切皮肤时 apply_rime_scheme_binding 读它们整套恢复（含光环联动）；
+    皮肤档案不存在（未保存皮肤）→ 返回 False，调用方据此提示「先保存皮肤」。
+    """
+    n = str(name or '').strip()
+    if not n:
+        return False
+    j = os.path.join(SKINS_DIR, n, 'skin.json')
+    if not os.path.exists(j):
+        return False
+    try:
+        with open(j, encoding='utf-8') as f:
+            cfg = json.load(f)
+        cfg['rime_scheme'] = str(light or '')
+        cfg['rime_scheme_dark'] = str(dark or '')
+        with open(j, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
         return True
     except Exception:
         return False
@@ -4361,7 +4430,7 @@ class ConfigWizard:
         self.lbl_skin_hint = tk.Label(skin_box, text='选中即应用，可整套切换',
                                       fg='#999', font=('Microsoft YaHei', 8))
         self.lbl_skin_hint.pack(anchor='w', pady=(2, 0))
-        self.lbl_scheme_hint = tk.Label(skin_box, text='配色：未生成（选图后一键生成）',
+        self.lbl_scheme_hint = tk.Label(skin_box, text='配色：未生成（生成时先存皮肤名）',
                                         fg='#999', font=('Microsoft YaHei', 8),
                                         justify='left', wraplength=300)
         self.lbl_scheme_hint.pack(anchor='w', pady=(2, 0))
@@ -5439,26 +5508,24 @@ class ConfigWizard:
             except Exception:
                 pass
 
-    def _save_as_skin(self):
-        """把当前向导参数保存为皮肤档案"""
+    def _save_skin_named(self, name, ask_overwrite=True):
+        """按指定名字把当前向导状态存成皮肤档案；返回 (ok, 实际名字, 提示语)。
+
+        R5 抽出：按钮「💾 存为皮肤」（先问名字）与「🎨 生成候选框配色」（配色要先绑皮肤名）
+        共用同一段落盘逻辑，避免两处口径漂移。
+        """
+        name = str(name or '').strip()
         if not self.cfg.get('image'):
-            messagebox.showwarning('提示', '请先选择图片！')
-            return
-        name = simpledialog.askstring('保存皮肤',
-                                      '皮肤名称（保存图片 + 全套参数，\n保存后可在托盘「皮肤选择」随时切换）：',
-                                      parent=self.root)
-        if not name:
-            return
-        name = name.strip()
-        if not name:
-            return
+            return False, '', '请先选择图片！'
+        if not _valid_skin_name(name):
+            return False, '', '皮肤名称限 1-40 字符（中文/字母/数字/空格/横线）'
         # 同名覆盖确认
         existing = [n for n, _ in list_skins() if n.lower() == name.lower()]
         if existing:
-            if not messagebox.askyesno('覆盖确认',
-                                       f'皮肤「{existing[0]}」已存在，覆盖？',
-                                       parent=self.root):
-                return
+            if ask_overwrite and not messagebox.askyesno('覆盖确认',
+                                                         f'皮肤「{existing[0]}」已存在，覆盖？',
+                                                         parent=self.root):
+                return False, '', '已取消（未保存皮肤）'
             name = existing[0]
         tcfg = dict(self.cfg)
         tcfg['layout'] = self.var_layout.get()
@@ -5486,15 +5553,32 @@ class ConfigWizard:
         try:
             save_skin(name, tcfg)
         except ValueError as e:
-            messagebox.showwarning('无法保存', str(e), parent=self.root)
-            return
+            return False, '', str(e)
         except Exception as e:
-            messagebox.showerror('保存失败', str(e), parent=self.root)
-            return
+            return False, '', str(e)
+        self.cfg['name'] = name        # R5：记住归属（配色/档案恢复都认它）
         self._refresh_skin_list()
         self.skin_var.set(name)
-        messagebox.showinfo('已保存', f'皮肤「{name}」已保存。\n托盘「皮肤选择」可随时切换。',
-                            parent=self.root)
+        return True, name, f'皮肤「{name}」已保存。'
+
+    def _save_as_skin(self):
+        """把当前向导参数保存为皮肤档案"""
+        if not self.cfg.get('image'):
+            messagebox.showwarning('提示', '请先选择图片！')
+            return
+        default = (str(self.cfg.get('name') or '').strip()
+                   or os.path.splitext(os.path.basename(self.cfg.get('image') or ''))[0])
+        name = simpledialog.askstring('保存皮肤',
+                                      '皮肤名称（保存图片 + 全套参数，\n保存后可在托盘「皮肤选择」随时切换）：',
+                                      initialvalue=default, parent=self.root)
+        if not name or not name.strip():
+            return
+        ok, _nm, msg = self._save_skin_named(name.strip())
+        if not ok:
+            if msg and '已取消' not in msg:
+                messagebox.showwarning('无法保存', msg, parent=self.root)
+            return
+        messagebox.showinfo('已保存', f'{msg}\n托盘「皮肤选择」可随时切换。', parent=self.root)
 
     def _delete_skin(self):
         """删除选中皮肤（仅删档案，不影响当前运行中的外挂）"""
@@ -5512,11 +5596,77 @@ class ConfigWizard:
 
     # ---------- ③ 选图自动生成候选框配色（升级四）----------
     def _scheme_skin_name(self):
-        """配色归属名：皮肤下拉选中名 > 图片文件名（去扩展名）"""
-        n = (self.skin_var.get() or '').strip()
+        """配色归属名（尽力而为）：已保存皮肤名 > cfg['name'] > 图片文件名（去扩展名）"""
+        n = self._saved_skin_name()
+        if n:
+            return n
+        n = str(self.cfg.get('name') or '').strip()
         if n:
             return n
         return os.path.splitext(os.path.basename(self.cfg.get('image') or ''))[0] or 'skin'
+
+    def _saved_skin_name(self):
+        """当前向导对应的「已保存皮肤名」：下拉选中名 / cfg['name']，且档案真的存在；否则 ''"""
+        for cand in ((self.skin_var.get() or '').strip(),
+                     str(self.cfg.get('name') or '').strip()):
+            if cand and find_skin(cand):
+                return cand
+        return ''
+
+    def _scheme_name_candidate(self):
+        """还没保存皮肤时给输入框/程序化保存用的默认名（图片文件名去扩展名）"""
+        stem = os.path.splitext(os.path.basename(self.cfg.get('image') or ''))[0]
+        return stem if _valid_skin_name(stem) else 'skin'
+
+    def _ensure_scheme_skin(self, auto=False, dry_run=False):
+        """R5：生成配色前先取得/确认皮肤名（用户反馈「没有先保存皮肤名字的提醒」）。
+
+        返回 {'ok','skin','saved','msg','cancelled'}：
+          · 已有皮肤档案 → 直接用（saved=False，不打扰）
+          · 没有档案 → 先提示保存并完成保存；用户拒绝/没填名字 → ok=False（不落盘、不建档案）
+          · auto=True（自动化/测试）跳过弹窗，直接按候选名程序化保存
+          · dry_run=True 例外：零副作用，只用候选名试算方案名，不建任何档案
+        """
+        res = {'ok': False, 'skin': '', 'saved': False, 'msg': '', 'cancelled': False}
+        n = self._saved_skin_name()
+        if n:
+            res.update(ok=True, skin=n, msg='配色将绑定到皮肤「%s」' % n)
+            return res
+        cand = self._scheme_name_candidate()
+        if dry_run:
+            # dry-run 零副作用：用候选名算一遍方案名，但不保存皮肤档案
+            res.update(ok=True, skin=cand, saved=False,
+                       msg='dry-run：以皮肤名「%s」试算（未保存皮肤档案）' % cand)
+            return res
+        if not auto:
+            if not messagebox.askyesno(
+                    '先保存皮肤名（配色要用它命名）',
+                    '配色方案名以当前皮肤名命名，方便你在 weasel.custom.yaml 里找到、以后修改；\n'
+                    '切皮肤时也能整套恢复（图片 + 参数 + 配色）。\n\n'
+                    '当前还没有保存皮肤。现在保存吗？\n'
+                    '（点「否」= 先不生成配色）', parent=self.root):
+                res.update(msg='未保存皮肤，已取消生成配色（配色名要跟随皮肤名）',
+                           cancelled=True)
+                return res
+            name = simpledialog.askstring(
+                '保存皮肤（配色将绑定到它）',
+                '皮肤名称（1-40 字符，中文/字母/数字/空格/横线）：',
+                initialvalue=cand, parent=self.root)
+            if not name or not name.strip():
+                res.update(msg='未填写皮肤名，已取消生成配色', cancelled=True)
+                return res
+            ok, nm, m = self._save_skin_named(name.strip())
+            if not ok:
+                res.update(msg=m or '保存皮肤失败')
+                return res
+            res.update(ok=True, skin=nm, saved=True, msg='皮肤「%s」已保存（%s）' % (nm, m))
+            return res
+        ok, nm, m = self._save_skin_named(cand, ask_overwrite=False)
+        if not ok:
+            res.update(msg=m or '保存皮肤失败')
+            return res
+        res.update(ok=True, skin=nm, saved=True, msg='皮肤「%s」已保存（%s）' % (nm, m))
+        return res
 
     def _set_scheme_hint(self, text, ok=None):
         """向导内配色结果提示（成功绿 / 警告橙 / 普通灰）"""
@@ -5535,7 +5685,8 @@ class ConfigWizard:
         返回 {'ok','msg','plan','apply','deploy','theme',...}，向导与测试共用同一份结果。
         """
         res = {'ok': False, 'msg': '', 'plan': None, 'apply': None, 'deploy': None,
-               'theme': None, 'theme_info': {}, 'skin': '', 'scheme_light': '',
+               'theme': None, 'theme_info': {}, 'skin': '', 'skin_saved': False,
+               'bound': False, 'needs_skin': False, 'scheme_light': '',
                'scheme_dark': '', 'backup': None}
         img = self.cfg.get('image')
         if not img or not os.path.exists(img):
@@ -5551,7 +5702,18 @@ class ConfigWizard:
                 messagebox.showwarning('生成候选框配色', res['msg'], parent=self.root)
             return res
         try:
-            skin = self._scheme_skin_name()
+            # R5：先绑皮肤名 —— 没有皮肤档案就先提示保存（配色名跟随皮肤名，便于查找/切皮肤整套恢复）
+            ens = self._ensure_scheme_skin(auto=auto, dry_run=dry_run)
+            res['skin_saved'] = ens['saved']
+            if not ens['ok']:
+                res['msg'] = ens['msg']
+                res['needs_skin'] = True
+                self._set_scheme_hint('配色未生成：%s' % ens['msg'], ok=False)
+                # 用户主动取消/没填名字已在提示框里表达过，不再叠一个弹窗；真失败才弹
+                if not auto and not ens.get('cancelled'):
+                    messagebox.showwarning('先保存皮肤名', ens['msg'], parent=self.root)
+                return res
+            skin = ens['skin']
             res['skin'] = skin
             frames, meta = collect_scheme_frames(img, self._Image)
             theme = extract_scheme_theme(frames, self._Image)
@@ -5626,10 +5788,15 @@ class ConfigWizard:
             # 记录到 cfg：随 config.json / 皮肤档案保存 → 切皮肤时整套恢复（含光环联动）
             self.cfg['rime_scheme'] = names[0]
             self.cfg['rime_scheme_dark'] = names[1]
+            self.cfg['name'] = skin
+            # R5：顺手把配色名写进皮肤档案（只改这两个键）→ 切皮肤时整套恢复不用再手动存一次
+            res['bound'] = bind_scheme_to_skin(skin, names[0], names[1])
             man[skin] = list(names)
             save_scheme_manifest(man)
             res['ok'] = True
-            res['msg'] = '配色已生成：%s（亮）/ %s（暗）；%s' % (names[0], names[1], dep['msg'])
+            res['msg'] = '配色已生成：%s（亮）/ %s（暗）；%s（皮肤「%s」%s）' % (
+                names[0], names[1], dep['msg'], skin,
+                '已绑定' if res['bound'] else '档案未绑定（请用「💾 存为皮肤」保存一次）')
             self._set_scheme_hint('配色：%s / %s%s' % (
                 names[0], names[1],
                 '（已写入并部署）' if dep['ok'] else '（已写入，部署未成功：详见弹窗/日志）'), dep['ok'])
@@ -5688,6 +5855,8 @@ class ConfigWizard:
                 if skin in man:
                     man.pop(skin, None)
                     save_scheme_manifest(man)
+                # R5：皮肤档案也解绑（还原后那套方案已不在 yaml 里，留着会切皮肤时又写回去）
+                bind_scheme_to_skin(skin, '', '')
             except Exception:
                 pass
             res['ok'] = True
