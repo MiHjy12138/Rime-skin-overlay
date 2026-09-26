@@ -558,8 +558,13 @@ def resolve_layers(cfg, skin_dir=None):
 def save_layers_into_cfg(cfg, layers=None):
     """把图层写回档案形态：schema 2 + layers + 顶层兼容字段同步（原地改并返回 cfg）。
 
-    第 0 层存盘时 offset 归零（顶层 offset 才是权威）；其余字段双向对齐，
-    保证老代码读顶层键时看到的就是主层的值。
+    单向权威（F-V3 的延伸）：顶层兼容字段是**第 0 层（主层）的权威来源**，所以这里
+    是「顶层 → 主层」回填 + 主层 offset 归零，而不是拿 layers[0] 的历史值覆盖顶层。
+
+    为什么必须单向：向导打开时 cfg 来自 config.json（顶层 scale=0.9），而 cfg['layers']
+    可能是更早存档里遗留的主层（scale 字段是历史值 1.0）。若用后者覆盖前者，用户保存时
+    顶层参数会被静默改掉（实测 R01：0.9 被写成 1.0）。反过来，用户在向导里改主层参数时
+    _layer_set_params 已经**同时**写了顶层与层内，所以回填不会丢东西。
     """
     cfg = cfg if isinstance(cfg, dict) else {}
     layers = layers if layers is not None else resolve_layers(cfg)
@@ -568,6 +573,24 @@ def save_layers_into_cfg(cfg, layers=None):
         layers = [make_layer_from_cfg(cfg)]
     layers = layers[:MAX_LAYERS]
     arch = [dict(x, effects=dict(x.get('effects') or {})) for x in layers]
+    # ---- 顶层 → 主层回填（顶层权威；只回填配置里真的存在的键）----
+    if 'scale' in cfg:
+        arch[0]['scale'] = _as_float(cfg.get('scale'), arch[0]['scale'], 0.2, 2.0)
+    if 'flip_h' in cfg:
+        arch[0]['flip'] = bool(cfg.get('flip_h'))
+    if 'side' in cfg:
+        arch[0]['anchor'] = anchor_from_side(cfg.get('side'))
+    _eff_keys = ('corner_enabled', 'corner_radius', 'feather_enabled', 'feather_radius')
+    if any(k in cfg for k in _eff_keys):
+        e = arch[0]['effects']
+        if 'corner_enabled' in cfg:
+            e['corner_enabled'] = bool(cfg.get('corner_enabled'))
+        if 'corner_radius' in cfg:
+            e['corner_radius'] = _as_int(cfg.get('corner_radius'), 24, 0, 120)
+        if 'feather_enabled' in cfg:
+            e['feather_enabled'] = bool(cfg.get('feather_enabled'))
+        if 'feather_radius' in cfg:
+            e['feather_radius'] = _as_int(cfg.get('feather_radius'), 24, 0, 80)
     arch[0]['offset_x'] = 0
     arch[0]['offset_y'] = 0
     cfg['schema'] = LAYER_SCHEMA
@@ -3836,6 +3859,50 @@ class ImagePreprocessDialog:
 
 
 # ============ 配置向导（所见即所得）============
+def screen_work_area(root=None):
+    """屏幕工作区矩形 (top, bottom)（像素，已排除任务栏）。失败回落 (0, screenheight)。"""
+    try:
+        import ctypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                        ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+        r = _RECT()
+        # SPI_GETWORKAREA = 0x0030
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+            top, bottom = int(r.top), int(r.bottom)
+            if bottom - top > 200:
+                return top, bottom
+    except Exception:
+        pass
+    try:
+        return 0, int(root.winfo_screenheight())
+    except Exception:
+        return 0, 768
+
+
+def screen_work_area_height(root=None):
+    """屏幕可用工作区高度（像素，已排除任务栏）。
+
+    v2.0-t15：向导要按「用户实际能看见的高度」约束自己 —— 只用 winfo_screenheight()
+    会把任务栏那 40~80px 也算进去，导致按钮行正好卡在任务栏底下点不到。
+    取不到工作区时回落 winfo_screenheight()，再不行给 768 兜底（绝不抛）。
+    """
+    top, bottom = screen_work_area(root)
+    spi_h = bottom - top
+    scr_h = 0
+    try:
+        if root is not None:
+            scr_h = int(root.winfo_screenheight())
+    except Exception:
+        scr_h = 0
+    cands = [h for h in (spi_h, scr_h) if h > 200]
+    if not cands:
+        return 768
+    return min(cands)
+
+
 class ConfigWizard:
     LAYOUT_INFO = {
         'horizontal_single': ('单行横排', 460, 42),
@@ -3873,21 +3940,39 @@ class ConfigWizard:
         self._build_ui()
 
     def _build_ui(self):
-        """两栏布局：左=普通设置（含预览），右=高级设置（省竖向空间）"""
+        """布局（v2.0-t15 重排）：
+          顶部固定区（提示 + ① 图片）
+          可滚动主体（② ~ ⑭：左栏普通设置 + 右栏高级设置）← 内容高时在这里滚
+          底部固定按钮行（保存并启动 / 取消 / 清理垃圾…）← 永远贴着窗口底、任何分辨率都可见
+
+        重排动机：⑫ 图层区加控件后窗口需求高度 1107px > 1080p 工作区 1040px，
+        按钮行被推到屏外（bottom=1128）→ 用户点不到保存。现在按钮行用 side='bottom'
+        优先占位，主体塞进 Canvas 按工作区高度封顶，放不下就出滚动条。
+        """
         pad = {'padx': 12, 'pady': 4}
         frm = tk.Frame(self.root)
-        frm.pack(**pad)
+        frm.pack(fill='both', expand=True, **pad)
+        # 三行 grid：0=顶部固定 / 1=可滚动主体（吸收所有压缩）/ 2=底部固定按钮行。
+        # 用 grid 而不是 pack 的原因：pack 在空间不足时会先把后 pack 的控件挤出可视区
+        # （实测按钮行被推到底边外 26~31px），grid 的第 1 行带 weight=1 只会被压缩，
+        # 第 0/2 行永远拿满自己的需求高度 → 按钮行在任何分辨率下都在窗内。
+        frm.grid_columnconfigure(0, weight=1)
+        frm.grid_rowconfigure(1, weight=1)
+
+        # ===== 顶部固定区（不随主体滚动）=====
+        self.top_area = tk.Frame(frm)
+        self.top_area.grid(row=0, column=0, sticky='ew')
 
         # 顶部提示（一行，省竖向空间）
-        tk.Label(frm,
+        tk.Label(self.top_area,
                  text='支持 PNG/JPG/WEBP/GIF/BMP（动图保持会动）　建议竖版 2:3、≤2000×2000　💡 预处理 = 裁剪 / 纯色背景抠图',
                  fg='#e67e22', font=('Microsoft YaHei', 9), justify='left').pack(anchor='w', pady=(0, 1))
         # 品红冲突提示（动态抠色键）：图片含品红时显示，提示已自动切换
-        self.lbl_keyhint = tk.Label(frm, text='', fg='#e67e22', font=('Microsoft YaHei', 9), justify='left')
+        self.lbl_keyhint = tk.Label(self.top_area, text='', fg='#e67e22', font=('Microsoft YaHei', 9), justify='left')
         self.lbl_keyhint.pack(anchor='w', pady=(0, 2))
 
         # ① 图片选择（整行）
-        row1 = tk.Frame(frm)
+        row1 = tk.Frame(self.top_area)
         row1.pack(fill='x', pady=3)
         tk.Label(row1, text='① 图片:', font=('Microsoft YaHei', 10)).pack(side='left')
         self.btn_img = tk.Button(row1, text='选择图片...', command=self._pick_image,
@@ -3903,8 +3988,23 @@ class ConfigWizard:
         self.lbl_img = tk.Label(row1, text='未选择', fg='#888', font=('Microsoft YaHei', 9))
         self.lbl_img.pack(side='left')
 
+        # ==== 底部固定按钮行（grid 第 2 行：永远拿满需求高度，不会溢出窗口）====
+        self.btn_row = tk.Frame(frm)
+        self.btn_row.grid(row=2, column=0, sticky='ew', pady=(6, 0))
+        tk.Button(self.btn_row, text='保存并启动', command=self._save_and_start,
+                  bg='#4CAF50', fg='white', font=('Microsoft YaHei', 10, 'bold')).pack(side='left', padx=4)
+        tk.Button(self.btn_row, text='取消', command=self._on_cancel,
+                  font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
+        tk.Button(self.btn_row, text='🧹 清理垃圾…', command=self._cleanup_junk,
+                  font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
+        tk.Label(self.btn_row, text='💡 保存后启动；下次双击可重新配置',
+                 fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
+
+        # ==== 可滚动主体（② ~ ⑭；内容高于工作区时在这里滚，顶部与按钮行都不动）====
+        body = self._build_scroll_body(frm)
+
         # ==== 左右分栏：左=普通设置（含预览） / 右=高级设置 ====
-        cols = tk.Frame(frm)
+        cols = tk.Frame(body)
         cols.pack(fill='x', pady=(2, 0))
         left = tk.Frame(cols)
         left.pack(side='left', anchor='n')
@@ -3938,16 +4038,19 @@ class ConfigWizard:
         self.var_flip = tk.BooleanVar(master=self.root, value=False)
         tk.Checkbutton(row4, text='水平翻转', variable=self.var_flip,
                        font=('Microsoft YaHei', 9),
-                       command=self._update_preview).pack(side='left', padx=(12, 0))
+                       command=self._on_layer_flip).pack(side='left', padx=(12, 0))
 
         # ④⑤⑥ 缩放 / 水平 / 垂直（合一行，紧凑）
+        # v2.0-t15：这三条滑条 = **当前选中图层**的缩放/水平/垂直（图层区不再重复一套），
+        # 选中哪层就自动切换到哪层的值（_on_layer_select），拖动即写入该层（_on_main_slider）
         row5 = tk.Frame(left)
         row5.pack(fill='x', pady=1)
-        tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10)).pack(side='left')
+        self.lbl_slider_target = tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10))
+        self.lbl_slider_target.pack(side='left')
         self.var_scale = tk.DoubleVar(master=self.root, value=1.0)
         tk.Scale(row5, from_=0.2, to=2.0, resolution=0.1, orient='horizontal',
                  variable=self.var_scale, length=140, sliderlength=13,
-                 command=lambda _: self._update_preview(),
+                 command=self._on_main_slider,
                  font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
         self.lbl_scale = tk.Label(row5, text='1.0x', fg='#888', font=('Microsoft YaHei', 9),
                                   width=4)
@@ -3956,7 +4059,7 @@ class ConfigWizard:
         self.var_offx = tk.IntVar(master=self.root, value=0)
         tk.Scale(row5, from_=-200, to=200, orient='horizontal',
                  variable=self.var_offx, length=140, sliderlength=13,
-                 command=lambda _: self._update_preview(),
+                 command=self._on_main_slider,
                  font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
         self.lbl_offx = tk.Label(row5, text='0px', fg='#888', font=('Microsoft YaHei', 9),
                                  width=5)
@@ -3965,11 +4068,14 @@ class ConfigWizard:
         self.var_offy = tk.IntVar(master=self.root, value=0)
         tk.Scale(row5, from_=-150, to=150, orient='horizontal',
                  variable=self.var_offy, length=140, sliderlength=13,
-                 command=lambda _: self._update_preview(),
+                 command=self._on_main_slider,
                  font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
         self.lbl_offy = tk.Label(row5, text='0px', fg='#888', font=('Microsoft YaHei', 9),
                                  width=5)
         self.lbl_offy.pack(side='left')
+        self.lbl_slider_hint = tk.Label(left, text='', fg='#888',
+                                        font=('Microsoft YaHei', 8), justify='left')
+        self.lbl_slider_hint.pack(anchor='w')
 
         # ⑦ 预览区（候选框 + 图片 组合）
         tk.Label(left, text='⑦ 预览（候选框 + 图片组合样式）:', font=('Microsoft YaHei', 9),
@@ -4068,32 +4174,15 @@ class ConfigWizard:
             tk.Radiobutton(row_la, text=_t, variable=self.var_layer_anchor, value=_v,
                            font=('Microsoft YaHei', 8),
                            command=self._on_layer_param_change).pack(side='left')
-        row_lp = tk.Frame(lay_box)
-        row_lp.pack(anchor='w', pady=(1, 0))
-        tk.Label(row_lp, text='左右', font=('Microsoft YaHei', 8)).pack(side='left')
-        self.var_lay_offx = tk.IntVar(master=self.root, value=0)
-        tk.Scale(row_lp, from_=-200, to=200, orient='horizontal', length=86, sliderlength=12,
-                 variable=self.var_lay_offx, command=lambda _v: self._on_layer_param_change(),
-                 font=('Microsoft YaHei', 8)).pack(side='left')
-        tk.Label(row_lp, text='上下', font=('Microsoft YaHei', 8)).pack(side='left')
-        self.var_lay_offy = tk.IntVar(master=self.root, value=0)
-        tk.Scale(row_lp, from_=-200, to=200, orient='horizontal', length=86, sliderlength=12,
-                 variable=self.var_lay_offy, command=lambda _v: self._on_layer_param_change(),
-                 font=('Microsoft YaHei', 8)).pack(side='left')
-        row_ls = tk.Frame(lay_box)
-        row_ls.pack(anchor='w')
-        tk.Label(row_ls, text='这层大小', font=('Microsoft YaHei', 8)).pack(side='left')
-        self.var_lay_scale = tk.DoubleVar(master=self.root, value=1.0)
-        tk.Scale(row_ls, from_=0.2, to=2.0, resolution=0.1, orient='horizontal', length=86,
-                 sliderlength=12, variable=self.var_lay_scale,
-                 command=lambda _v: self._on_layer_param_change(),
-                 font=('Microsoft YaHei', 8)).pack(side='left')
-        self.var_lay_flip = tk.BooleanVar(master=self.root, value=False)
-        tk.Checkbutton(row_ls, text='水平翻转', variable=self.var_lay_flip,
+        # 翻转与上方 ③ 是同一个变量（改哪个都作用于当前选中图层）
+        tk.Checkbutton(row_la, text='水平翻转', variable=self.var_flip,
                        font=('Microsoft YaHei', 8),
-                       command=self._on_layer_param_change).pack(side='left')
+                       command=self._on_layer_flip).pack(side='left', padx=(8, 0))
+        # v2.0-t15：缩放/水平/垂直 不再在本区重复一套 —— 复用上方 ④⑤⑥（选中哪层就调哪层）
+        tk.Label(lay_box, text='↖ 这一层的大小/位置用上方 ④缩放 ⑤水平 ⑥垂直 调',
+                 fg='#888', font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(1, 0))
         row_lr = tk.Frame(lay_box)
-        row_lr.pack(anchor='w')
+        row_lr.pack(anchor='w', pady=(1, 0))
         self.var_lay_follow = tk.BooleanVar(master=self.root, value=False)
         tk.Checkbutton(row_lr, text='随候选框变宽往外让', variable=self.var_lay_follow,
                        font=('Microsoft YaHei', 8),
@@ -4156,17 +4245,284 @@ class ConfigWizard:
         self.lbl_autostart = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8))
         self.lbl_autostart.pack(anchor='w', pady=(0, 2))
 
-        # ⑮ 按钮行（整行）
-        row8 = tk.Frame(frm)
-        row8.pack(fill='x', pady=6)
-        tk.Button(row8, text='保存并启动', command=self._save_and_start,
-                  bg='#4CAF50', fg='white', font=('Microsoft YaHei', 10, 'bold')).pack(side='left', padx=4)
-        tk.Button(row8, text='取消', command=self._on_cancel,
-                  font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
-        tk.Button(row8, text='🧹 清理垃圾…', command=self._cleanup_junk,
-                  font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
-        tk.Label(row8, text='💡 保存后启动；下次双击可重新配置',
-                 fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
+        # 收尾：按屏幕工作区给滚动区定高（内容放得下 = 不滚、观感不变；放不下 = 出滚动条）
+        self._fit_window_height()
+
+    # ---------- v2.0-t15 布局：可滚动主体 ----------
+    def _build_scroll_body(self, parent):
+        """把 ② ~ ⑭ 装进 Canvas + Scrollbar 的可滚动容器（grid 第 1 行），返回内容 frame。
+
+        要点：Canvas 不设固定宽度 —— 宽度跟随内容（保证 ≥1080p 下窗口宽度与观感不变）；
+        高度先设成内容高度让窗口拿到正确需求，窗口放不下时由 _fit_window_height 封顶，
+        多出来的内容由 grid 压缩这一行 → 出滚动条。顶部区与按钮行在这个容器外面，
+        所以它们不随内容滚动。
+        """
+        self.body_wrap = tk.Frame(parent)
+        self.body_wrap.grid(row=1, column=0, sticky='nsew')
+        self.body_canvas = tk.Canvas(self.body_wrap, highlightthickness=0, bd=0,
+                                     bg=self.root.cget('bg'))
+        self.body_scrollbar = tk.Scrollbar(self.body_wrap, orient='vertical',
+                                           command=self.body_canvas.yview)
+        self.body_canvas.configure(yscrollcommand=self.body_scrollbar.set)
+        self.body_canvas.pack(side='left', fill='both', expand=True)
+        inner = tk.Frame(self.body_canvas)
+        self.body_inner = inner
+        self._body_win = self.body_canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', self._on_body_configure)
+        self.body_canvas.bind('<Configure>', self._on_body_configure)
+        # 滚轮：canvas 与内容区各绑一次，再挂一个全局兜底（子控件上的滚轮也能滚）
+        for w in (self.body_canvas, inner):
+            w.bind('<MouseWheel>', self._on_body_wheel)
+        try:
+            self.root.bind_all('<MouseWheel>', self._on_body_wheel, add='+')
+        except Exception:
+            pass
+        self._scroll_needed = False
+        return inner
+
+    def _on_body_configure(self, _e=None):
+        """内容尺寸变化 → 更新滚动范围；同时让 Canvas 宽度跟随内容（窗口宽度不被 Canvas 定死）"""
+        try:
+            self.body_canvas.configure(scrollregion=self.body_canvas.bbox('all'))
+        except Exception:
+            pass
+        try:
+            want = int(self.body_inner.winfo_reqwidth())
+            if want > 0 and int(self.body_canvas.cget('width')) != want:
+                self.body_canvas.configure(width=want)
+        except Exception:
+            pass
+
+    def _body_scroll_height(self):
+        """当前内容需求高度（用于判断要不要滚动条）"""
+        try:
+            return int(self.body_inner.winfo_reqheight())
+        except Exception:
+            return 0
+
+    def _fit_window_height(self):
+        """按屏幕工作区给窗口封顶：按钮行永远在可视区内，多出来的内容交给滚动条。
+
+        布局是 grid 三行（顶固定 / 主体 weight=1 / 底固定），所以这里只做三件事：
+          1) 让 canvas 先撑到内容高度 → 窗口拿到「完整内容」的需求高度；
+          2) 需求高度超过工作区就按工作区封顶（此时主体行被 grid 压缩 → 出滚动条）；
+          3) 显式定位到工作区内（Tk 首次 map 会居中，可能把底边放到任务栏下）。
+        踩过并已修的坑：一开始用 pack(side='bottom') 让按钮行贴底，空间不足时 Tk 会把
+        后 pack 的主体挤出可视区（实测按钮行跑到窗口外 26~31px）—— grid 的固定行不会。
+        """
+        try:
+            self.root.update_idletasks()
+            cv = self.body_canvas
+            work_h = int(screen_work_area_height(self.root))
+            content_h = self._body_scroll_height()
+
+            cv.configure(height=max(200, content_h))       # 先按完整内容要高度
+            self.root.update_idletasks()
+            need_h = int(self.root.winfo_reqheight())
+            w = int(self.root.winfo_reqwidth())
+
+            self._scroll_needed = need_h > work_h
+            if self._scroll_needed:
+                self.body_scrollbar.pack(side='right', fill='y')
+            else:
+                self.body_scrollbar.pack_forget()
+                try:
+                    cv.yview_moveto(0)
+                except Exception:
+                    pass
+            self.root.update_idletasks()
+
+            h = min(need_h, max(240, work_h - self._frame_extra()))
+            try:
+                wt, wb = screen_work_area(self.root)
+                scr_w = int(self.root.winfo_screenwidth())
+                x = max(0, (scr_w - w) // 2)
+                y = wt + max(0, ((wb - wt) - (h + self._frame_extra())) // 2)
+                self.root.geometry(f'{w}x{h}+{x}+{y}')
+            except Exception:
+                pass
+            self.root.update_idletasks()
+            # 标题栏高度只有窗口 map 之后才量得准 → 再校正一次（只做一次，防递归）
+            if not getattr(self, '_fit_refined', False):
+                self._fit_refined = True
+                try:
+                    self.root.after_idle(self._fit_window_height)
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                _write_log(f'[向导布局] 高度封顶失败: {e}')
+            except Exception:
+                pass
+
+    def _frame_extra(self):
+        """窗口外框比客户区多出来的高度（标题栏等）。
+
+        Windows 上 Tk 的 winfo_rooty() 含标题栏而 winfo_height() 只算客户区 —— 实测差
+        31px，不把它算进预算窗口底边就会压到任务栏下面（按钮行看得见却点不到）。
+        窗口还没 map 时量不到，先用 60px 的保守值，map 后由 _fit_window_height 的
+        二次校正换成实测值。
+        """
+        try:
+            r = int(self.root.winfo_rooty()) - int(self.root.winfo_y())
+            if r > 0:
+                return r
+        except Exception:
+            pass
+        return 60
+
+    def _on_body_wheel(self, event):
+        """鼠标滚轮滚主体区（指针在滚动区内才响应，避免干扰其它区域）"""
+        try:
+            cv = self.body_canvas
+            if not self._pointer_in_scroll(event):
+                return
+            delta = getattr(event, 'delta', 0) or 0
+            if not delta:
+                return
+            step = int(-delta / 120) or (-1 if delta > 0 else 1)
+            cv.yview_scroll(step, 'units')
+        except Exception:
+            pass
+
+    def _pointer_in_scroll(self, event):
+        """滚轮事件是否落在滚动区内。
+
+        优先看事件源控件（bind_all 时 event.widget 就是鼠标下那个控件）—— 直接比对它是否
+        属于滚动区子树；x_root/y_root 只在真实鼠标事件里才可靠（event_generate 造的事件
+        里它们是 0），所以放在后面做兜底。
+        """
+        try:
+            cv = self.body_canvas
+            w = getattr(event, 'widget', None)
+            if w is not None:
+                sw = str(w)
+                if sw == str(cv) or sw.startswith(str(self.body_inner)) \
+                        or sw.startswith(str(self.body_wrap)):
+                    return True
+        except Exception:
+            pass
+        try:
+            cv = self.body_canvas
+            x = getattr(event, 'x_root', None)
+            y = getattr(event, 'y_root', None)
+            if not x or not y:
+                return False
+            return (cv.winfo_rootx() <= x <= cv.winfo_rootx() + cv.winfo_width()
+                    and cv.winfo_rooty() <= y <= cv.winfo_rooty() + cv.winfo_height())
+        except Exception:
+            return False
+
+    def _on_main_slider(self, *_a):
+        """④缩放 / ⑤水平 / ⑥垂直 滑条 = **当前选中图层**的参数（v2.0-t15）。
+
+        写入规则与 F-V3 的单一权威一致：第 0 层（主图）写顶层兼容字段、层内 offset 归零；
+        其余层写各自 layers[i]。
+        """
+        if getattr(self, '_layer_loading', False):
+            return
+        try:
+            if hasattr(self, 'lbl_scale'):
+                self.lbl_scale.config(text=f'{float(self.var_scale.get()):.1f}x')
+            if hasattr(self, 'lbl_offx'):
+                self.lbl_offx.config(text=f'{int(self.var_offx.get())}px')
+            if hasattr(self, 'lbl_offy'):
+                self.lbl_offy.config(text=f'{int(self.var_offy.get())}px')
+        except Exception:
+            pass
+        try:
+            i = self._cur_layer_index()
+            self._layer_set_params(i, scale=float(self.var_scale.get()),
+                                   offset_x=int(self.var_offx.get()),
+                                   offset_y=int(self.var_offy.get()))
+        except Exception:
+            pass
+        self._update_preview()
+
+    def _on_layer_flip(self):
+        """水平翻转：上方 ③ 与图层区共用同一个 var_flip —— 勾一下就写进当前选中图层"""
+        if getattr(self, '_layer_loading', False):
+            return
+        try:
+            i = self._cur_layer_index()
+            self._layer_set_params(i, flip=bool(self.var_flip.get()))
+        except Exception:
+            pass
+        self._update_preview()
+
+    def _layer_get_params(self, i):
+        """取第 i 层的 (scale, offset_x, offset_y, flip) —— 第 0 层以顶层兼容字段为权威"""
+        try:
+            layers = self._layers()
+            if not layers:
+                return 1.0, 0, 0, False
+            i = max(0, min(int(i), len(layers) - 1))
+            if i == 0:
+                return (round(float(self.cfg.get('scale', 1.0) or 1.0), 2),
+                        int(self.cfg.get('offset_x', 0) or 0),
+                        int(self.cfg.get('offset_y', 0) or 0),
+                        bool(self.cfg.get('flip_h', False)))
+            ld = layers[i]
+            return (round(float(ld.get('scale', 1.0) or 1.0), 2),
+                    int(ld.get('offset_x', 0) or 0),
+                    int(ld.get('offset_y', 0) or 0),
+                    bool(ld.get('flip', False)))
+        except Exception:
+            return 1.0, 0, 0, False
+
+    def _layer_set_params(self, i, scale=None, offset_x=None, offset_y=None, flip=None):
+        """把参数写进第 i 层。第 0 层写顶层兼容字段（层内 offset 归零，防 F-V3 双计）。"""
+        layers = self._layers()
+        if not layers:
+            return False
+        i = max(0, min(int(i), len(layers) - 1))
+        ld = layers[i]
+        if i == 0:
+            if scale is not None:
+                self.cfg['scale'] = round(float(scale), 2)
+                ld['scale'] = self.cfg['scale']
+            if offset_x is not None:
+                self.cfg['offset_x'] = int(offset_x)
+                ld['offset_x'] = 0
+            if offset_y is not None:
+                self.cfg['offset_y'] = int(offset_y)
+                ld['offset_y'] = 0
+            if flip is not None:
+                self.cfg['flip_h'] = bool(flip)
+                ld['flip'] = bool(flip)
+        else:
+            if scale is not None:
+                ld['scale'] = round(min(2.0, max(0.2, float(scale))), 2)
+            if offset_x is not None:
+                ld['offset_x'] = int(offset_x)
+            if offset_y is not None:
+                ld['offset_y'] = int(offset_y)
+            if flip is not None:
+                ld['flip'] = bool(flip)
+        return True
+
+    def _sync_slider_to_layer(self):
+        """把上方 ④⑤⑥ + 翻转 切到当前选中图层的值（点选层时调用，不触发写回）"""
+        try:
+            i = self._cur_layer_index()
+            sc, ox, oy, fl = self._layer_get_params(i)
+            self._layer_loading = True
+            self.var_scale.set(sc)
+            self.var_offx.set(ox)
+            self.var_offy.set(oy)
+            self.var_flip.set(fl)
+            try:
+                self.lbl_scale.config(text=f'{sc:.1f}x')
+                self.lbl_offx.config(text=f'{ox}px')
+                self.lbl_offy.config(text=f'{oy}px')
+                self.lbl_slider_target.config(
+                    text=f'④ 缩放（第 {i + 1} 层）:')
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            self._layer_loading = False
 
     def _update_render_hint(self):
         """渲染模式提示（大白话，不摆 compat/alpha 术语）"""
@@ -4206,23 +4562,32 @@ class ConfigWizard:
     def _preview_specs(self):
         """预览用图层列表：只有 ≥2 层才返回（单层返回 [] → 预览走 v1.6 原路径，行为零变化）。
 
-        第 0 层的锚点/缩放/偏移取**向导当前 UI 值**（滑块还没写回 cfg 时要即时可见）。
+        v2.0-t15：把**当前选中图层**的 UI 值（锚点/缩放/偏移/翻转/随宽度比例）合进那一层
+        —— 这样「点选第 N 层 → 拖上方 ④⑤⑥」时，预览里变的正是第 N 层（而不是永远变主层）。
+        其余层沿用它们各自的持久值（层间记忆）。
         """
         try:
             layers = resolve_layers(self.cfg)
             if len(layers) <= 1:
                 return []
-            l0 = dict(layers[0])
+            i = int(getattr(self, '_layer_sel', 0))
+            if not (0 <= i < len(layers)):
+                i = 0
+            ld = dict(layers[i])
             try:
-                l0['anchor'] = anchor_from_side(self.var_side.get())
-                l0['scale'] = round(float(self.var_scale.get()), 2)
-                l0['flip'] = bool(self.var_flip.get())
-                l0['offset_x'] = int(self.var_offx.get())
-                l0['offset_y'] = int(self.var_offy.get())
-                l0['effects'] = {k: v for k, v in self._effects_cfg().items() if k != 'flip_h'}
+                ld['anchor'] = str(self.var_layer_anchor.get() or 'right_edge')
+                ld['scale'] = round(float(self.var_scale.get()), 2)
+                ld['flip'] = bool(self.var_flip.get())
+                ld['offset_x'] = int(self.var_offx.get())
+                ld['offset_y'] = int(self.var_offy.get())
+                ld['follow_width_ratio'] = (int(self.var_lay_follow_r.get()) / 100.0
+                                            if self.var_lay_follow.get() else 0.0)
+                if i == 0:
+                    ld['effects'] = {k: v for k, v in self._effects_cfg().items()
+                                     if k != 'flip_h'}
             except Exception:
                 pass
-            layers[0] = l0
+            layers[i] = ld
             return layers
         except Exception:
             return []
@@ -4355,16 +4720,48 @@ class ConfigWizard:
 
     def _pick_image(self):
         path = filedialog.askopenfilename(
-            title='选择图片',
+            title='选择图片', parent=self.root,
             filetypes=[('图片文件', '*.png *.jpg *.jpeg *.webp *.gif *.bmp'),
                        ('所有文件', '*.*')])
         if not path:
             return
+        self._set_main_image(path)
+
+    def _set_main_image(self, path, suffix=''):
+        """换主图（选图 / 预处理共用）——把「顶层 image」与「第 0 层图层图」一次改同步。
+
+        v2.0-t15 修复「点选图片时无法预览」，三处根因一起收口：
+          · 图层路径：以前只改 cfg['image']，layers[0].image 还指旧图 → 预览/保存/删层
+            三条链路看到两张不同的图（状态分裂）。现在同步写进 layers[0]。
+          · 缓存：预览缓存键是 (path, mtime)，同名覆盖或陈旧缓存会让画面停在上一次；
+            换图时直接丢掉缓存（同步 _cache 与 PhotoImage 引用）。
+          · 刷新时机：换完图立即 update_idletasks + _update_preview，尺寸变化也重算窗口高度。
+        """
         self.cfg['image'] = path
-        self.lbl_img.config(text=os.path.basename(path), fg='#333')
+        try:
+            layers = self._layers()
+            if layers:
+                layers[0]['image'] = path      # 关键：第 0 层跟着走，别留旧路径
+        except Exception:
+            pass
+        self._cache = None                      # 丢预览缓存，强制重新打开
+        try:
+            if self.tk_img is not None:
+                _release_photo(self.tk_img)
+                self.tk_img = None
+            for p in self._photo_refs:
+                _release_photo(p)
+            self._photo_refs.clear()
+        except Exception:
+            pass
+        off = os.path.basename(path) if not suffix else f'{os.path.basename(path)}{suffix}'
+        self.lbl_img.config(text=off, fg='#2e7d32' if suffix else '#333')
         self.btn_prep.config(state='normal')
-        # 动图检测：n_frames>1 才亮出「预览动画」按钮
-        self._refresh_anim_state()
+        self._refresh_anim_state()   # 动图检测：n_frames>1 才亮出「预览动画」按钮
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
         self._update_preview()
         self._update_key_hint()
 
@@ -4380,11 +4777,7 @@ class ConfigWizard:
             dlg = ImagePreprocessDialog(self.root, self.cfg['image'])
             self.root.wait_window(dlg.root)
             if dlg.result_path:
-                self.cfg['image'] = dlg.result_path
-                self.lbl_img.config(text=os.path.basename(dlg.result_path) + '（已预处理）', fg='#2e7d32')
-                self._refresh_anim_state()   # 预处理产物可能是动图（APNG）：重新点亮「预览动画」
-                self._update_preview()
-                self._update_key_hint()
+                self._set_main_image(dlg.result_path, '（已预处理）')
         except Exception as e:
             messagebox.showerror('预处理失败', str(e))
 
@@ -4451,11 +4844,15 @@ class ConfigWizard:
         if i == 0:
             return ('第 1 层是主图：和左侧 ③ 贴边方向 / ④ 缩放 / 水平翻转 / ⑤⑥ 微调是同一份设置；'
                     '另外两层都叠在它周围。')
-        return ('这一层跟着候选框走：贴左/贴右/居中任选；勾「随候选框变宽往外让」后，'
-                '打字时候选框变宽 → 它会按比例再往外让一点。')
+        return ('这一层跟着候选框走：贴左/贴右/居中任选；大小与位置用上方 ④⑤⑥ 调；'
+                '勾「随候选框变宽往外让」后，打字时候选框变宽 → 它会按比例再往外让一点。')
 
     def _on_layer_select(self, _e=None):
-        """选中某层 → 回显该层参数（第 1 层与左侧主参数双向同步）。"""
+        """选中某层 → 上方 ④⑤⑥/翻转 与图层区参数一起切到该层（v2.0-t15 点选即同步）。
+
+        切换只回显、不写回（_layer_loading 挡住回调），所以「切走再切回」仍是各层原值 ——
+        这就是层间短时记忆：参数一直存在 cfg['layers'][i] / 顶层字段里，不是在 UI 里临时存。
+        """
         try:
             sel = self.layer_list.curselection()
             if not sel:
@@ -4467,18 +4864,25 @@ class ConfigWizard:
             self._layer_sel = i
             ld = layers[i]
             self._layer_loading = True
-            if i == 0:
-                self.var_layer_anchor.set(anchor_from_side(self.cfg.get('side')))
-                self.var_lay_offx.set(int(self.cfg.get('offset_x', 0) or 0))
-                self.var_lay_offy.set(int(self.cfg.get('offset_y', 0) or 0))
-                self.var_lay_scale.set(float(self.cfg.get('scale', 1.0) or 1.0))
-                self.var_lay_flip.set(bool(self.cfg.get('flip_h', False)))
-            else:
-                self.var_layer_anchor.set(ld.get('anchor', 'right_edge'))
-                self.var_lay_offx.set(int(ld.get('offset_x', 0) or 0))
-                self.var_lay_offy.set(int(ld.get('offset_y', 0) or 0))
-                self.var_lay_scale.set(float(ld.get('scale', 1.0) or 1.0))
-                self.var_lay_flip.set(bool(ld.get('flip', False)))
+            self.var_layer_anchor.set(anchor_from_side(self.cfg.get('side')) if i == 0
+                                      else ld.get('anchor', 'right_edge'))
+            # ④⑤⑥ + 翻转：切到该层的值（第 0 层取顶层兼容字段）
+            sc, ox, oy, fl = self._layer_get_params(i)
+            self.var_scale.set(sc)
+            self.var_offx.set(ox)
+            self.var_offy.set(oy)
+            self.var_flip.set(fl)
+            try:
+                self.lbl_scale.config(text=f'{sc:.1f}x')
+                self.lbl_offx.config(text=f'{ox}px')
+                self.lbl_offy.config(text=f'{oy}px')
+                self.lbl_slider_target.config(text=f'④ 缩放（第 {i + 1} 层）:')
+                self.lbl_slider_hint.config(
+                    text=(f'↑ ④⑤⑥ 调的是第 {i + 1} 层'
+                          + ('（主图）' if i == 0 else f'（{os.path.basename(ld.get("image") or "")}）')
+                          + '；换层会自动切到那一层的值'))
+            except Exception:
+                pass
             r = abs(float(ld.get('follow_width_ratio', 0.0) or 0.0))
             self.var_lay_follow.set(r > 1e-9)
             self.var_lay_follow_r.set(int(round(r * 100)))
@@ -4487,9 +4891,15 @@ class ConfigWizard:
             pass
         finally:
             self._layer_loading = False
+        # 点选即刷新预览（v2.0-t15：以前只回显控件不重绘 → 用户看着像"点了没反应/无法预览"）
+        self._update_preview()
 
     def _on_layer_param_change(self, *_a):
-        """把控件上的层参数写回 cfg（第 1 层写顶层兼容字段，保证与主参数同一份数据）。"""
+        """图层区自有控件（锚点 / 随宽度比例）写回当前选中层。
+
+        缩放/水平/垂直/翻转已改由上方 ④⑤⑥（_on_main_slider / _on_layer_flip）负责，
+        本方法不再碰它们 —— 单一入口，避免两套控件互相覆盖。
+        """
         if getattr(self, '_layer_loading', False):
             return
         try:
@@ -4502,34 +4912,15 @@ class ConfigWizard:
             ld['anchor'] = anc if anc in LAYER_ANCHORS else 'right_edge'
             ld['follow_width_ratio'] = (int(self.var_lay_follow_r.get()) / 100.0
                                         if self.var_lay_follow.get() else 0.0)
-            ox = int(self.var_lay_offx.get())
-            oy = int(self.var_lay_offy.get())
-            sc = round(float(self.var_lay_scale.get()), 2)
-            fl = bool(self.var_lay_flip.get())
             if i == 0:
+                # 主层的贴边方向就是顶层 side（老字段继续可用）
                 self.cfg['side'] = side_from_anchor(ld['anchor'])
-                self.cfg['offset_x'] = ox
-                self.cfg['offset_y'] = oy
-                self.cfg['scale'] = sc
-                self.cfg['flip_h'] = fl
-                ld['offset_x'] = 0       # 主层：顶层 offset 才是权威（防翻倍）
-                ld['offset_y'] = 0
-                ld['scale'] = sc
-                ld['flip'] = fl
-                # 左侧主参数控件跟着走（同一份数据，两处显示必须一致）
-                for name, v in (('var_side', self.cfg['side']), ('var_scale', sc),
-                                ('var_offx', ox), ('var_offy', oy), ('var_flip', fl)):
-                    w = getattr(self, name, None)
-                    if w is not None:
-                        try:
-                            w.set(v)
-                        except Exception:
-                            pass
-            else:
-                ld['offset_x'] = ox
-                ld['offset_y'] = oy
-                ld['scale'] = sc
-                ld['flip'] = fl
+                w = getattr(self, 'var_side', None)
+                if w is not None:
+                    try:
+                        w.set(self.cfg['side'])
+                    except Exception:
+                        pass
             self.layer_list.delete(i)
             self.layer_list.insert(i, self._layer_label(i, ld))
             self.layer_list.selection_clear(0, 'end')
@@ -4698,17 +5089,27 @@ class ConfigWizard:
             name = existing[0]
         tcfg = dict(self.cfg)
         tcfg['layout'] = self.var_layout.get()
-        tcfg['side'] = self.var_side.get()
         tcfg['layer'] = self.var_layer.get()
-        tcfg['scale'] = round(float(self.var_scale.get()), 2)
-        tcfg['offset_x'] = int(self.var_offx.get())
-        tcfg['offset_y'] = int(self.var_offy.get())
         try:
+            # ④⑤⑥/翻转 属于「当前选中图层」：先落回那一层（同 _save_and_start 的口径），
+            # 顶层兼容字段只由主层决定，避免把第 N 层的值当成主图参数存进档案
             _lyr = self._layers()
-            _lyr[0]['image'] = tcfg.get('image') or _lyr[0].get('image')
-            save_layers_into_cfg(tcfg, _lyr)     # ② 套层：多图层一起进档案
-        except Exception:
-            pass
+            i = self._cur_layer_index()
+            self._layer_set_params(i, scale=float(self.var_scale.get()),
+                                   offset_x=int(self.var_offx.get()),
+                                   offset_y=int(self.var_offy.get()),
+                                   flip=bool(self.var_flip.get()))
+            tcfg['side'] = self.var_side.get()
+            _lyr0 = self._layers()
+            if _lyr0:
+                _lyr0[0]['anchor'] = anchor_from_side(tcfg['side'])
+                _lyr0[0]['image'] = tcfg.get('image') or _lyr0[0].get('image')
+            save_layers_into_cfg(tcfg, _lyr0)     # ② 套层：多图层一起进档案
+        except Exception as _e:
+            try:
+                _write_log(f'[向导] 存皮肤时图层写回失败: {_e}')
+            except Exception:
+                pass
         try:
             save_skin(name, tcfg)
         except ValueError as e:
@@ -5018,6 +5419,17 @@ class ConfigWizard:
                             _release_photo(self._photo_refs.pop(0))
                         self._preview_layers.append((px, py, im, tk_im))
                     self.tk_img = None
+                else:
+                    # v2.0-t15：算不出画布尺寸（所有图层图都缺失/加载失败）时给出明确文字，
+                    # 不再留一块静默空白 —— 用户看到的「无法预览」多数就是这一支。
+                    miss = [i + 1 for i, im in enumerate(imgs) if im is None]
+                    cv.create_text(self.CV_W // 2, 120,
+                                   text=f'图片加载失败：第 {"/".join(map(str, miss))} 层的图片'
+                                        f'找不到或读不出来\n请用 ① 重新选择，或删掉这几层',
+                                   fill='#c0392b', font=('Microsoft YaHei', 10),
+                                   justify='center')
+                    self._preview_layers = []
+                    self.tk_img = None
             except Exception as e:
                 cv.create_text(380, 180, text=f'图层预览失败: {e}', fill='red',
                                font=('Microsoft YaHei', 9))
@@ -5194,11 +5606,26 @@ class ConfigWizard:
 
     def _save_and_start(self):
         self.cfg['layout'] = self.var_layout.get()
-        self.cfg['side'] = self.var_side.get()
         self.cfg['layer'] = self.var_layer.get()
-        self.cfg['scale'] = round(float(self.var_scale.get()), 2)
-        self.cfg['offset_x'] = int(self.var_offx.get())
-        self.cfg['offset_y'] = int(self.var_offy.get())
+        # ④⑤⑥/翻转 现在是「当前选中图层」的滑条（v2.0-t15）：先把当前值落回那一层，
+        # 再由 save_layers_into_cfg 把主层的值同步到顶层兼容字段。
+        # 不能像以前那样无条件用 var_scale/var_offx/var_offy 覆盖顶层 —— 否则选中第 2 层
+        # 时保存会把第 2 层的缩放写进主图（实测 R01：0.9 被写成 1.0）。
+        try:
+            self._layer_set_params(self._cur_layer_index(),
+                                   scale=float(self.var_scale.get()),
+                                   offset_x=int(self.var_offx.get()),
+                                   offset_y=int(self.var_offy.get()),
+                                   flip=bool(self.var_flip.get()))
+            self.cfg['side'] = self.var_side.get()
+            _lyr0 = self._layers()
+            if _lyr0:
+                _lyr0[0]['anchor'] = anchor_from_side(self.cfg['side'])
+        except Exception as _e:
+            try:
+                _write_log(f'[向导] 保存图层参数失败: {_e}')
+            except Exception:
+                pass
         if not self.cfg.get('image'):
             messagebox.showwarning('提示', '请先选择图片！')
             return
@@ -5230,7 +5657,8 @@ class ConfigWizard:
         self.cfg.pop('blur_radius', None)
         self.cfg['feather_enabled'] = bool(self.var_feather.get())
         self.cfg['feather_radius'] = int(self.var_feather_r.get())
-        self.cfg['flip_h'] = bool(self.var_flip.get())
+        # 注意：flip_h 不再在这里从 var_flip 写顶层 —— var_flip 是「当前选中图层」的翻转
+        # （v2.0-t15 复用），主层的翻转已由上面的 _layer_set_params 处理好
         self.cfg.pop('feather_dither', None)   # 旧字段清理（点阵羽化已成为唯一实现）
         # 渲染模式（v2.0-①）：UI 只有中文选项，写回时归一成 compat/alpha（非法值回落 compat）
         self.cfg['render_mode'] = resolve_render_mode({'render_mode': self.var_render.get()})

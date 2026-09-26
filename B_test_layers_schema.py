@@ -1025,21 +1025,23 @@ def test_wizard(tmp, gui_ok):
         check('G04 有添加/删除图层按钮',
               hasattr(wiz, 'btn_layer_add') and hasattr(wiz, 'btn_layer_del'))
         check('G05 有锚点选择控件', hasattr(wiz, 'var_layer_anchor'))
-        check('G06 有该层 offset 控件', hasattr(wiz, 'var_lay_offx')
-              and hasattr(wiz, 'var_lay_offy'))
-        check('G07 有该层缩放/翻转控件', hasattr(wiz, 'var_lay_scale')
-              and hasattr(wiz, 'var_lay_flip'))
+        check('G06 该层 offset 已并入上方 ⑤⑥ 滑条（图层区不再自带独立控件）',
+              (not hasattr(wiz, 'var_lay_offx')) and (not hasattr(wiz, 'var_lay_offy'))
+              and hasattr(wiz, 'var_offx') and hasattr(wiz, 'var_offy'))
+        check('G07 缩放/翻转同样复用上方 ④ 与 ③（翻转与图层区共用 var_flip）',
+              (not hasattr(wiz, 'var_lay_scale')) and hasattr(wiz, 'var_scale')
+              and hasattr(wiz, 'var_flip'))
         wiz.layer_list.selection_clear(0, 'end')
         wiz.layer_list.selection_set(1)
         wiz._on_layer_select()
         check('G08 选中第 2 层后回显其 anchor=right_edge',
               wiz.var_layer_anchor.get() == 'right_edge', repr(wiz.var_layer_anchor.get()))
-        check('G09 选中第 2 层后回显其 scale=0.9',
-              abs(float(wiz.var_lay_scale.get()) - 0.9) < 1e-6, repr(wiz.var_lay_scale.get()))
-        wiz.var_lay_offy.set(37)
-        wiz._on_layer_param_change()
+        check('G09 选中第 2 层后回显其 scale=0.9（上方 ④ 切到该层值）',
+              abs(float(wiz.var_scale.get()) - 0.9) < 1e-6, repr(wiz.var_scale.get()))
+        wiz.var_offy.set(37)
+        wiz._on_main_slider()
         lay1 = wiz.cfg['layers'][1]
-        check('G10 改该层 offset_y 写回 cfg.layers[1]', int(lay1.get('offset_y', 0)) == 37,
+        check('G10 拖上方 ⑥ 写回 cfg.layers[1].offset_y', int(lay1.get('offset_y', 0)) == 37,
               repr(lay1.get('offset_y')))
         check('G11 选中第 2 层时第 0 层不受影响',
               int(wiz.cfg['layers'][0].get('offset_y', 0)) == 0,
@@ -1050,14 +1052,14 @@ def test_wizard(tmp, gui_ok):
         check('G12 选中第 1 层时回显顶层兼容字段（offset_y）',
               int(wiz.var_offy.get()) == int(wiz.cfg.get('offset_y', 0)),
               f'var={wiz.var_offy.get()} cfg={wiz.cfg.get("offset_y")}')
-        wiz.var_lay_offx.set(21)
-        wiz._on_layer_param_change()
-        check('G13 改第 0 层 offset_x 同步顶层兼容字段 cfg.offset_x',
+        wiz.var_offx.set(21)
+        wiz._on_main_slider()
+        check('G13 拖上方 ⑤ 改第 0 层 offset_x 同步顶层兼容字段 cfg.offset_x',
               int(wiz.cfg.get('offset_x', 0)) == 21, repr(wiz.cfg.get('offset_x')))
         check('G13b 第 0 层自己的 offset_x 归零（防与顶层翻倍）',
               int(wiz.cfg['layers'][0].get('offset_x', -1)) == 0,
               repr(wiz.cfg['layers'][0].get('offset_x')))
-        check('G13c 左侧主参数控件同步显示同一值',
+        check('G13c 上方滑条显示同一值',
               int(wiz.var_offx.get()) == 21, repr(wiz.var_offx.get()))
 
         # 预览多层绘制
