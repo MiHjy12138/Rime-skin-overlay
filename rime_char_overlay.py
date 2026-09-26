@@ -2179,6 +2179,18 @@ class Renderer:
         self.overlay = overlay
         self.mode = mode or self.mode
         self.cfg = getattr(overlay, 'cfg', None) or {}
+        self._defer_push = False   # 定位路径：贴图/位图提交推迟到窗口几何就位之后
+
+    def set_defer_push(self, flag):
+        """延迟提交开关（R14）。
+
+        定位路径一帧内的顺序是「先算布局 → 合成新内容 → 再改窗口几何」。若合成时就把新
+        内容提交上屏（alpha = UpdateLayeredWindow 立即生效），屏幕上会先出现「新内容 +
+        旧位置/旧尺寸」的一帧：图片闪回旧位置、或按旧窗口尺寸被裁/露底 —— 这就是用户看到
+        的「打字时图片短暂闪烁」。打开本开关后，提交交给窗口几何就位之后的推图路径。
+        compat 不受影响（Tk Label 由系统异步重绘，本就没有立即提交）。
+        """
+        self._defer_push = bool(flag)
 
     @property
     def root(self):
@@ -2386,8 +2398,14 @@ class LayeredRenderer(CompatRenderer):
         先摘掉 Tk 的 -transparentcolor：它在 Windows 上走 SetLayeredWindowAttributes
         （LWA_COLORKEY），与 UpdateLayeredWindow 对同一个 WS_EX_LAYERED 窗口互斥 ——
         不清掉会把位图内容整片抠掉（手册 ① 步 5「内容完全由位图决定」）。
+
+        R14：定位路径（_defer_push）下**不在这里提交位图** —— ULW 提交是同步立即生效的，
+        此刻窗口几何尚未更新（还是旧位置/旧尺寸），先提交就会看到「新内容闪在旧几何上」。
+        提交由窗口几何就位后的 _push_render_frame() 完成。
         """
         self.drop_tk_transparency()
+        if getattr(self, '_defer_push', False):
+            return True
         return self.push_static()
 
     def drop_tk_transparency(self):
@@ -7716,6 +7734,17 @@ class FollowOverlay:
             except Exception:
                 pass
 
+    def _push_render_frame_if_composed(self):
+        """死区路径（窗口没动）的内容上屏（R14）。
+
+        本帧重合成过就必须让新内容上屏：alpha 下 _compose_into_renderer 已把提交推迟，
+        这里补上；compat 下是空操作（Tk 自己会重绘）。没重合成过的帧一律不推 ——
+        否则每帧一次 UpdateLayeredWindow = 每帧整窗内容替换，反而成了新的闪烁源。
+        """
+        if not getattr(self, '_composed_this_frame', False):
+            return
+        self._push_render_frame()
+
     def _sync_tk_geometry(self):
         """低频（尺寸变化/手动交互后）把镜像坐标同步回 Tk：
         SetWindowPos 直移后 Tk 内部 winfo_x/y 可能过时，凡 w/h 变化
@@ -7867,6 +7896,8 @@ class FollowOverlay:
         只看坐标的死区判断会把整条 resize 路径吞掉（实测窗口会停在旧宽度）。
         """
         layers, dims, plan = self._layer_plan(rect)
+        self._composed_this_frame = False   # R14：每帧重置「本帧换过内容」标记
+        self._pending_geom = None           # R14：每帧重置待落的 Tk geometry 记账
         wx, wy, ww, wh, pl = plan
         if not self._layers_active():
             return int(wx), int(wy), None, None, False
@@ -7877,19 +7908,36 @@ class FollowOverlay:
             return int(wx), int(wy), None, None, False
         plan_key = (ww, wh, tuple(pl))
         if plan_key != getattr(self, '_composed_plan', None):
+            self._composed_this_frame = True     # R14：本帧换了内容 → 死区路径也要让它上屏
             try:
-                self._compose_into_renderer(layers, sizes=dims, rect=rect, plan_key=plan_key)
+                self._compose_into_renderer(layers, sizes=dims, rect=rect, plan_key=plan_key,
+                                            defer_push=True)
             except Exception as e:
                 try:
                     _write_log(f'[套层] 候选框变宽后重合成失败: {e}')
                 except Exception:
                     pass
-            try:
-                self.root.geometry(f'{ww}x{wh}+{int(wx)}+{int(wy)}')
-            except Exception:
-                pass
+            # R14：Tk geometry 记账**推迟到窗口几何就位之后**（_flush_tk_geometry）——
+            # 提前写会排进 Tk idle，与随后的 SetWindowPos 各改一次尺寸，中间那一拍窗口
+            # 尺寸与位图尺寸不一致（露底/裁剪）正是闪烁帧。
+            self._pending_geom = (ww, wh, int(wx), int(wy))
         size_changed = (ww, wh) != tuple(getattr(self, '_applied_size', None) or (0, 0))
         return int(wx), int(wy), ww, wh, size_changed
+
+    def _flush_tk_geometry(self):
+        """把本帧的 Tk geometry 记账落到 Tk（在窗口几何就位之后调用）。
+
+        只做「Tk 内部尺寸/位置与真实窗口同源」这一件事：值取自 SetWindowPos 用过的同一份
+        布局结果，因此 Tk 下一次布局不会把窗口拉回旧尺寸，也不会再触发一次 resize。
+        """
+        pg = getattr(self, '_pending_geom', None)
+        if not pg:
+            return
+        self._pending_geom = None
+        try:
+            self.root.geometry(f'{int(pg[0])}x{int(pg[1])}+{int(pg[2])}+{int(pg[3])}')
+        except Exception:
+            pass
 
     def _rect_changed(self):
         """候选框矩形（位置或尺寸）与上次已应用的记录不同 → True（O(1) 一次 GetWindowRect）。
@@ -7960,7 +8008,7 @@ class FollowOverlay:
         return compose_layers(frames, (ww, wh), pl, Image)
 
     def _compose_into_renderer(self, layers=None, key=None, apply=True, sizes=None, rect=None,
-                               plan_key=None):
+                               plan_key=None, defer_push=False):
         """合成 → 交给渲染层出图（compat = 键色抠色 + Label；alpha = 保留 RGBA 推位图）。
 
         这是 ② 与 ① 的接口点：合成只做一次，抠色/贴图/推位图的差别全部留在 Renderer 里。
@@ -7968,6 +8016,8 @@ class FollowOverlay:
         apply=False 表示窗口级设置不动，只换帧（动图节拍路径）。
         sizes/rect/plan_key 由定位路径传入：同一帧共用一份布局输入（R3：防「窗口按旧矩形、
         画面按新矩形」的错位），并让「已合成布局」记账与实际合成保持一致。
+        defer_push=True（R14，仅定位路径）：alpha 下**不在此处提交位图**，等窗口几何就位后
+        由 _push_render_frame() 提交 —— 否则新内容会先闪在旧位置/旧尺寸上。
         """
         renderer = _renderer_of(self)
         frames = []
@@ -7990,7 +8040,18 @@ class FollowOverlay:
         old = getattr(self, 'img', None)
         self.img = renderer.to_photo(flat)
         if apply:
-            renderer.apply_window(self.key_rgb)
+            # defer_push 只是「提交时机」开关：渲染器不支持也必须照常出图（不能成为崩溃/黑窗源）
+            try:
+                renderer.set_defer_push(defer_push)
+            except Exception:
+                pass
+            try:
+                renderer.apply_window(self.key_rgb)
+            finally:
+                try:
+                    renderer.set_defer_push(False)
+                except Exception:
+                    pass
             renderer.apply_label(getattr(self, 'label', None), self.img, self.key_rgb)
         else:
             renderer.apply_photo_only(getattr(self, 'label', None), self.img)
@@ -8062,10 +8123,17 @@ class FollowOverlay:
                         # （省一次系统调用与重绘；尺寸变了必须走完整路径，否则窗口停在旧宽度）
                         if (self.visible and not size_changed
                                 and abs(x - self._x) < 2 and abs(y - self._y) < 2):
+                            # R14：窗口没动，但本帧可能换了内容（布局变、尺寸不变）→ 仍要上屏
+                            self._flush_tk_geometry()
+                            self._push_render_frame_if_composed()
                             self._apply_layer(self._cached_hwnd)  # 成功定位后同步图层（事件驱动，频率低）
                             return True
                         moved = self._move_to(x, y, w, h)
                         self._pos_dirty = False
+                        # R14：窗口几何就位之后才做两件收尾 ——
+                        # · Tk geometry 记账（同值，只让 Tk 内部与真实窗口一致）；
+                        # · 内容上屏（alpha 的位图提交发生在移动之后，位图才会落在新位置上）
+                        self._flush_tk_geometry()
                         if not self.visible:
                             self.root.deiconify()
                             self.visible = True
