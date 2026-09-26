@@ -3987,6 +3987,34 @@ def screen_work_area_height(root=None):
     return min(cands)
 
 
+def screen_work_area_width(root=None):
+    """屏幕可用工作区宽度（像素，已排除停靠栏）。
+
+    v2.0-R4：向导的「⚙ 高级设置」改成横排多列后，列数要按用户实际能用的宽度算
+    （1080p = 1920 → 3 列；1366 宽 → 3 列；1024 → 2 列；再窄 → 1 列），
+    同时窗口自身宽度也按它封顶，绝不把内容顶出屏幕。取不到就回落屏幕宽度、再兜底 1280。
+    """
+    try:
+        import ctypes
+
+        class _RECT(ctypes.Structure):
+            _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                        ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+        r = _RECT()
+        # SPI_GETWORKAREA = 0x0030
+        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0):
+            w = int(r.right) - int(r.left)
+            if w > 200:
+                return w
+    except Exception:
+        pass
+    try:
+        return int(root.winfo_screenwidth())
+    except Exception:
+        return 1280
+
+
 class ConfigWizard:
     LAYOUT_INFO = {
         'horizontal_single': ('单行横排', 460, 42),
@@ -4087,16 +4115,18 @@ class ConfigWizard:
                  fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
 
         # ==== 可滚动主体（② ~ ⑭；内容高于工作区时在这里滚，顶部与按钮行都不动）====
+        # v2.0-R4 重排：主体不再左右分栏，而是「上=设置+预览 / 下=高级设置横排多列」
+        #   · 上半块 self.top_block：② 候选框类型 / ④⑤⑥ 滑条 / ⑦ 预览画布
+        #   · 下半块 self.adv_area：⚙ 高级设置（⑧~⑭），按工作区宽度分 1~3 列并排
+        # 动机（用户原话）：「你不如把高级设置完整放预览框下面横排放置。」
+        # 右栏竖排时高级设置需求高 901px 独占窗口高度（左栏只有 390px），横排后最高列
+        # 只有 ~315px → 窗口需求高度从 1038 降到 ~840。
         body = self._build_scroll_body(frm)
 
-        # ==== 左右分栏：左=普通设置（含预览） / 右=高级设置 ====
-        cols = tk.Frame(body)
-        cols.pack(fill='x', pady=(2, 0))
-        left = tk.Frame(cols)
-        left.pack(side='left', anchor='n')
-        adv = tk.LabelFrame(cols, text='⚙ 高级设置', font=('Microsoft YaHei', 9),
-                            fg='#555', padx=8, pady=6)
-        adv.pack(side='left', anchor='n', fill='y', padx=(14, 0))
+        # ---- 上半块：② / ④⑤⑥ / ⑦ 预览 ----
+        self.top_block = tk.Frame(body)
+        self.top_block.pack(fill='x', pady=(2, 0))
+        left = self.top_block      # 沿用原变量名：下面 ②~⑦ 的构建代码一行不用改
 
         # ② 候选框类型（读取 Rime 配置按钮放这一行）
         row3 = tk.Frame(left)
@@ -4164,8 +4194,11 @@ class ConfigWizard:
                                 highlightthickness=1, highlightbackground='#ccc')
         self.canvas.pack(pady=2)
 
-        # ==== 高级设置栏 ====
+        # ==== 下半块：⚙ 高级设置（R4：横排多列，按编号找）====
+        cols, col_of = self._adv_columns(body)
+
         # ⑧ 图层（图片相对候选框层级；below 仅重叠居中可见）
+        adv = cols[col_of['layer']]
         tk.Label(adv, text='⑧ 图层:', font=('Microsoft YaHei', 10)).pack(anchor='w')
         row_layer = tk.Frame(adv)
         row_layer.pack(anchor='w', pady=(0, 2))
@@ -4179,6 +4212,7 @@ class ConfigWizard:
         self.lbl_layer_hint.pack(anchor='w', pady=(0, 4))
 
         # ⑨ 特效（显示期：圆角；只影响外挂显示，不改图片文件）
+        adv = cols[col_of['fx']]
         tk.Label(adv, text='⑨ 特效（只影响显示）:', font=('Microsoft YaHei', 10)).pack(anchor='w')
         row_fx = tk.Frame(adv)
         row_fx.pack(anchor='w', pady=(0, 4))
@@ -4192,6 +4226,7 @@ class ConfigWizard:
                  font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
 
         # ⑩ 点阵羽化（用 4×4 有序抖动把边缘 alpha 近似成渐变）+ R1「增强（真羽化）」开关
+        adv = cols[col_of['feather']]
         tk.Label(adv, text='⑩ 点阵羽化:', font=('Microsoft YaHei', 10)).pack(anchor='w')
         row_fe = tk.Frame(adv)
         row_fe.pack(anchor='w')
@@ -4237,6 +4272,7 @@ class ConfigWizard:
         self._update_render_hint()
 
         # ⑫ 图层（v2.0-② 套层皮肤）：一个皮肤 = 多个图片图层，各层可锚到候选框左/右/中间
+        adv = cols[col_of['lay']]
         lay_box = tk.LabelFrame(adv, text='🧩 ⑫ 图层（可叠多张）',
                                 font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=4)
         lay_box.pack(fill='x', pady=(4, 0))
@@ -4295,6 +4331,7 @@ class ConfigWizard:
         self._layer_sync_from_cfg()
 
         # ⑬ 皮肤管理（图片 + 全套参数整套切换）
+        adv = cols[col_of['skin']]
         skin_box = tk.LabelFrame(adv, text='💾 ⑬ 皮肤管理',
                                  font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=4)
         skin_box.pack(fill='x', pady=(2, 0))
@@ -4331,6 +4368,7 @@ class ConfigWizard:
         self._refresh_skin_list()
 
         # ⑭ 开机自启（真相 = 启动文件夹快捷方式，勾选态直接读实际状态）
+        adv = cols[col_of['start']]
         row_start = tk.Frame(adv)
         row_start.pack(anchor='w', pady=(6, 0))
         self.var_autostart = tk.BooleanVar(master=self.root, value=autostart_installed())
@@ -4342,6 +4380,53 @@ class ConfigWizard:
 
         # 收尾：按屏幕工作区给滚动区定高（内容放得下 = 不滚、观感不变；放不下 = 出滚动条）
         self._fit_window_height()
+
+    # ---------- v2.0-R4 布局：高级设置横排多列 ----------
+    def _adv_column_count(self):
+        """「⚙ 高级设置」列数：按工作区宽度自适应（每列约 380px，最多 3 列，最少 1 列）。
+
+        除数取 380 而不是先写的 330：⑩/⑪ 那张卡实测最宽 385px，列宽要按最宽卡算，
+        窄屏才不会把内容顶出窗口。实测：1080p（1920）→ 3 列；1366 → 3；1024 → 2；
+        900 → 2；800 → 1（此时窗口宽度改由 640px 的预览块决定）。
+        """
+        try:
+            w = int(screen_work_area_width(self.root))
+        except Exception:
+            w = 0
+        if w <= 0:
+            w = 1280
+        return max(1, min(3, (w - 60) // 380))
+
+    def _adv_columns(self, body):
+        """建「⚙ 高级设置」的横排多列骨架，返回 (列 Frame 列表, 卡片→列 映射)。
+
+        卡片→列用一张手工平衡表（各卡片实测高度：⑫≈315 / ⑩⑪≈190 / ⑬≈170 /
+        ⑧≈80 / ⑨≈72 / ⑭≈56）：
+          · 3 列 → 列高 ≈ [315, 270, 298]，最高列只有 315（原来是整列竖排 901）
+          · 2 列 → 列高 ≈ [440, 443]，仍然平衡
+          · 1 列 → 退化成原来的自然竖排顺序
+        这就是「窗口显著变小」的主要来源；预览块宽度不受影响。
+        """
+        n = int(self._adv_column_count())
+        self.adv_area = tk.LabelFrame(body, text='⚙ 高级设置（横排多列，按编号找）',
+                                      font=('Microsoft YaHei', 9), fg='#555',
+                                      padx=8, pady=6)
+        self.adv_area.pack(fill='x', pady=(8, 0))
+        cols = []
+        for c in range(n):
+            f = tk.Frame(self.adv_area)
+            f.grid(row=0, column=c, sticky='nw', padx=(0, 12))
+            cols.append(f)
+        self.adv_cols = cols
+        if n >= 3:
+            col_of = {'lay': 0, 'feather': 1, 'layer': 1,
+                      'skin': 2, 'fx': 2, 'start': 2}
+        else:
+            col_of = {k: i % n for i, k in enumerate(
+                ('layer', 'fx', 'feather', 'lay', 'skin', 'start'))}
+        col_of = {k: max(0, min(v, n - 1)) for k, v in col_of.items()}
+        self._adv_col_of = col_of
+        return cols, col_of
 
     # ---------- v2.0-t15 布局：可滚动主体 ----------
     def _build_scroll_body(self, parent):
@@ -4415,6 +4500,11 @@ class ConfigWizard:
             self.root.update_idletasks()
             need_h = int(self.root.winfo_reqheight())
             w = int(self.root.winfo_reqwidth())
+            # v2.0-R4：宽度也按工作区封顶（横排多列后内容可能比屏幕宽 → 绝不顶出屏）
+            try:
+                w = min(w, max(600, int(screen_work_area_width(self.root)) - 20))
+            except Exception:
+                pass
 
             self._scroll_needed = need_h > work_h
             if self._scroll_needed:
