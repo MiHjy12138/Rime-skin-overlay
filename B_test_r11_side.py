@@ -195,6 +195,17 @@ def _make_wiz(cfg, saved):
     wiz._layer_sync_from_cfg()
     wiz.root.update_idletasks()
     wiz.root.update()
+    # v2.0-R15（第四轮 N1）改写**取样前提**（HANDOFF-2.1 §6-13）：向导现在默认折叠，
+    # ⑧~⑭ 不 map ⇒ 卡内/卡间坐标探针全归零（③ 行也会被 y_of_prefix 取 min 量成 0）。
+    # 本脚本量的是「③ 在通用区、② 与 ④ 之间」这个**展开态**布局，故取样前显式展开；
+    # **判据表达式一条未改、强度未降**。
+    # 判别力证据：注释掉下面三行（退回旧取样顺序）后 A05 必 FAIL。
+    try:
+        wiz._toggle_adv_collapse(False)
+        wiz.root.update_idletasks()
+        wiz.root.update()
+    except Exception:
+        pass
     return wiz
 
 

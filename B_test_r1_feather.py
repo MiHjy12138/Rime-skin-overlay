@@ -255,6 +255,16 @@ def _make_wiz(cfg, saved):
         wiz.cfg.update(cfg)
     wiz.root.update_idletasks()
     wiz.root.update()
+    # v2.0-R15（第四轮 N1）改写**取样前提**：向导现在默认折叠 ⇒ ⑩/⑪/⑫ 这些在
+    # 高级设置块里的控件不 map，F04/F05 的位置探针归零。本脚本量的是展开态排布，
+    # 先显式展开；判据一条未改、强度未降。
+    # 判别力证据：注释掉下面三行后 F04/F05 必 FAIL。
+    try:
+        wiz._toggle_adv_collapse(False)
+        wiz.root.update_idletasks()
+        wiz.root.update()
+    except Exception:
+        pass
     return wiz
 
 

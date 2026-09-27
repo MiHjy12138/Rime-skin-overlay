@@ -173,6 +173,16 @@ def _make_wiz(cfg, saved):
     wiz._layer_sync_from_cfg()
     wiz.root.update_idletasks()
     wiz.root.update()
+    # v2.0-R15（第四轮 N1）改写**取样前提**：向导现在默认折叠 ⇒ ⑧~⑭ 不 map，
+    # 通用区 ③ 的坐标探针会被 min-y 取成 0。本脚本量的是展开态布局，先显式展开；
+    # 判据一条未改、强度未降。
+    # 判别力证据：注释掉下面三行后 A03 必 FAIL。
+    try:
+        wiz._toggle_adv_collapse(False)
+        wiz.root.update_idletasks()
+        wiz.root.update()
+    except Exception:
+        pass
     return wiz
 
 

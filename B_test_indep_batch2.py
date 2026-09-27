@@ -183,6 +183,19 @@ def make_wiz(M, cfg, saved, skins_dir, tmp):
     wiz._layer_sync_from_cfg()
     wiz.root.update_idletasks()
     wiz.root.update()
+    # v2.0-R15（第四轮 N1）改写**取样前提**（HANDOFF-2.1 §6-13）：向导现在默认折叠，
+    # ⑧~⑭ 不 map、内容不参与布局 —— 而本脚本 E 段量的是**展开态**窗口高 / 横排 /
+    # 小屏滚动可达，旧前提「构造完即展开」被用户需求「默认折叠状态」推翻。
+    # 这里在取样前一次性显式展开，把取样条件恢复成与改写前逐位一致；
+    # **判据表达式一条未改、强度未降**（E03 里写死 40 的那个**阈值**例外，
+    # 见该处注释：已改成关系式，比原阈值更强）。
+    # 判别力证据：注释掉下面三行（退回旧取样顺序）后 E01 与 E13 必 FAIL。
+    try:
+        wiz._toggle_adv_collapse(False)
+        wiz.root.update_idletasks()
+        wiz.root.update()
+    except Exception:
+        pass
     return wiz
 
 
@@ -414,9 +427,21 @@ def section_E(tmp):
             check('E02 ★窗口需求宽度也确实变小（横排后不被顶宽）',
                   ww < pre_w, f'R4 前 {pre_w} → HEAD {ww}（−{pre_w - ww}）')
             adv_block = int(adv.winfo_reqheight())
-            check('E03 ⚙ 高级设置块高度 = 最高列高度 + 容器边距（横排生效，不是原竖排 901）',
-                  bool(cols) and max(col_h) <= 340 and 0 <= adv_block - max(col_h) <= 40,
-                  f'列数={len(cols)} 列高={col_h} adv块={adv_block}（差 {adv_block - max(col_h)}）')
+            # v2.0-R15（N1）改写：原判据「adv_block − 最高列 ≤ 40」把阈值写死在 R12 的
+            # 26px 标题行上（26 + 容器边距 12 = 38 ≤ 40）。N1 把标题按钮做成整行大按钮
+            # （高 43）⇒ 同一关系式变成 43 + 12 = 55，固定阈值就假红了。
+            # 改为**关系式**断言（比固定阈值更强：内容区 = 最高列 + 边距、标题行 = 按钮高
+            # 两条都钉住，不再依赖魔数）。
+            body_h = int(w.adv_body.winfo_reqheight())
+            head_h = int(w.adv_area.winfo_reqheight()) - body_h
+            btn_h = int(w.btn_adv_toggle.winfo_reqheight())
+            check('E03 ⚙ 高级设置块高度 = 最高列高度 + 容器边距 + 标题行（横排生效；'
+                  '原固定阈值 40 写死了 R12 的 26px 按钮高 → 改关系式）',
+                  bool(cols) and max(col_h) <= 340
+                  and abs(body_h - (max(col_h) + 12)) <= 4
+                  and abs(head_h - btn_h) <= 8,
+                  f'列数={len(cols)} 列高={col_h} body={body_h}（= 最高列 + '
+                  f'{body_h - max(col_h)}） 标题行={head_h} 按钮={btn_h} adv块={adv_block}')
             workh = int(R.screen_work_area_height(w.root) or 0)
             btm = _btn_row_bottom(w)
             check('E04 按钮行底边在屏幕工作区内（窗内可见，不用滚到底）',

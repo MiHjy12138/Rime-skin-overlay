@@ -116,6 +116,17 @@ def _wiz_probe(work_h=None, cfg=None):
         wiz._layer_sync_from_cfg()
     wiz.root.update_idletasks()
     wiz.root.update()
+    # v2.0-R15（第四轮 N1）改写**取样前提**（HANDOFF-2.1 §6-13）：向导现在默认折叠，
+    # ⑧~⑭ 不 map、滚动区内容变矮 —— 而本脚本量的是「展开态放不下 ⇒ 必须可滚动」，
+    # 旧前提「构造完即展开」被用户需求推翻。取样前一次性显式展开把条件恢复成旧口径；
+    # **判据表达式一条未改、强度未降**。
+    # 判别力证据：把这三行注释掉（= 退回旧取样顺序）后 W11/W12/W13/W15/W16 全部 FAIL。
+    try:
+        wiz._toggle_adv_collapse(False)
+        wiz.root.update_idletasks()
+        wiz.root.update()
+    except Exception:
+        pass
     return wiz, _SAVED_STUB[0]
 
 
