@@ -45,3 +45,15 @@ build_*/
 dist_*/
 spike_*.py
 preprocessed_*.png
+
+# 例外：打包脚本 spec **必须入库** —— 上面那行 `*.spec` 会把它一起忽略掉，
+# 后果是全新 clone 里没有 spec、出不了包（2026-09-27 收尾时发现：历轮文档写着
+# 「spec 已纳入版本库」，实际 git ls-files 里查不到它）。
+!RimeSkinOverlay.spec
+
+# 本地文档 / 证据（不入库，只留本机；`!` 例外见上）
+_evidence_*/
+HANDOFF-*.md
+环境台账.md
+轻装版流程-*.md
+UPGRADE_IDEAS.md
