@@ -338,10 +338,14 @@ def test_column_balance(tmp):
         check('D01 列高可量（≥2 列）', len(hs) >= 2, f'列高={hs}')
         check('D02 ★三列极差 ≤80px（D04 阈值不放宽）', spread <= 80,
               f'列高={hs} 极差={spread}')
-        card = getattr(w, 'lbl_alpha_feather', None)
-        if card is not None:
-            col_h = int(card.master.winfo_reqheight())
-            check('D03 ★⑪ 所在列高度已量（供交接单记账）', col_h > 0, f'col_h={col_h}')
+        # D03 原先是「⑪ 所在列高度 > 0」——那是**恒真断言**（控件存在就成立），
+        # 对抗自审时判定它没有判别力，改成能真被抓红的一条：⑩ 标题行（标题 + 「? 说明」
+        # + 本轮常驻的那句说明）的需求宽不能超过列宽设计上限 380px。
+        # 判别力：把常驻说明写长（≈再加 6 个汉字）→ 必 FAIL。
+        head = getattr(w, 'row_fe_head', None)
+        hw = int(head.winfo_reqwidth()) if head is not None else 0
+        check('D03 ★⑩ 标题行需求宽 ≤ 380px（常驻说明不撑爆列宽）',
+              0 < hw <= 380, f'req_w={hw}px')
     finally:
         _kill(w)
 
