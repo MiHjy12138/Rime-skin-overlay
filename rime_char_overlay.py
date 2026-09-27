@@ -7040,7 +7040,9 @@ class ConfigWizard:
         # 候选框（居中于画布）——先算几何，实际绘制按图层顺序统一进行
         cw, ch = self.LAYOUT_INFO[layout][1], self.LAYOUT_INFO[layout][2]
         base_x = (self.CV_W - cw) // 2
-        base_y = (360 - ch) // 2
+        # R20 修复：这里原先是硬编码的 `(360 - ch) // 2` —— 画布高 CV_H 早就是 260，
+        # 360 是旧尺寸的残留，导致候选框整体偏下（实测上留白 137 / 下留白 14）。
+        base_y = (self.CV_H - ch) // 2
         # 候选框配色（用 Rime 皮肤主色，简单示意）
         accent = get_rime_accent() if self.PIL else (0, 137, 123)
         hex_acc = '#%02x%02x%02x' % accent
@@ -7061,8 +7063,9 @@ class ConfigWizard:
                 wx0, wy0, ww, wh, pl = plan_layer_layout(preview_layers, sizes,
                                                          (0, 0, cw, ch))
                 if ww > 0 and wh > 0:
+                    # R20：同单层口径 —— 画布内留白 15 + 候选框外那行类型名 28
                     fit = min((self.CV_W - 30) / float(ww),
-                              (self.CV_H - 40) / float(wh), 1.0)
+                              (self.CV_H - 30 - 28) / float(wh), 1.0)
                     if fit < 1.0:
                         imgs = [None if im is None else
                                 im.resize((max(1, int(im.size[0] * fit)),
@@ -7074,7 +7077,7 @@ class ConfigWizard:
                         wx0, wy0, ww, wh, pl = plan_layer_layout(preview_layers, sizes,
                                                                  (0, 0, cw, ch))
                     base_x = (self.CV_W - cw) // 2
-                    base_y = (360 - ch) // 2
+                    base_y = (self.CV_H - ch) // 2      # R20：同单层，去掉硬编码 360
                     pos = {p[0]: (p[1], p[2]) for p in pl}
                     for k, im in enumerate(imgs):
                         if im is None:
@@ -7120,28 +7123,45 @@ class ConfigWizard:
                 # 特效与运行时一致（圆角 / 模糊按显示尺寸套）
                 img = self._image_effects(img)
                 new_w, new_h = img.size
-                # 若图片+候选框超出画布，整体等比缩小（保持相对位置比例）
-                total_w = new_w + 8 + cw
-                total_h = max(new_h, ch)
                 cv_w, cv_h = self.CV_W, self.CV_H
-                if total_w > cv_w - 30 or total_h > cv_h - 30:
-                    fit_all = min((cv_w - 30) / total_w, (cv_h - 30) / total_h, 1.0)
-                    if fit_all < 1.0:
-                        img = img.resize((max(1, int(new_w * fit_all)),
-                                          max(1, int(new_h * fit_all))), self._Image.LANCZOS)
-                        new_w, new_h = img.size
-                        cw, ch = int(cw * fit_all), int(ch * fit_all)
-                        base_x = (cv_w - cw) // 2
-                        base_y = (cv_h - ch) // 2
-                # 贴边（偏移量与运行时一致）
                 gap = 8
-                if side == 'right':
-                    ix = base_x + cw + gap + offx
-                elif side == 'left':
-                    ix = base_x - new_w - gap + offx
-                else:  # center：水平居中于候选框（配合图层叠放）
-                    ix = base_x + (cw - new_w) // 2 + offx
-                iy = base_y + (ch - new_h) // 2 + offy
+                pad = 15          # 画布内留白（自适应缩放的外边距）
+
+                def _place(w_, h_, cw_, ch_, ox, oy):
+                    """按贴边规则算「候选框左上角 + 图左上角」（与运行时同一套公式）"""
+                    bx = (cv_w - cw_) // 2
+                    by = (cv_h - ch_) // 2
+                    if side == 'right':
+                        px = bx + cw_ + gap + ox
+                    elif side == 'left':
+                        px = bx - w_ - gap + ox
+                    else:      # center：水平居中于候选框（配合图层叠放）
+                        px = bx + (cw_ - w_) // 2 + ox
+                    return bx, by, px, by + (ch_ - h_) // 2 + oy
+
+                base_x, base_y, ix, iy = _place(new_w, new_h, cw, ch, offx, offy)
+                # R20 修复（先生实测「预览窗口自适应缩放，当前皮肤直接出顶了」）：
+                #   fit 必须按**内容外接框**算 —— 图 + 候选框 + 偏移量合起来才是这次预览的
+                #   真实占位。旧写法只比「图高 vs 画布高」，把偏移漏在外面：offy=-132 一上，
+                #   图就被推出画布上边（实测顶边 y=-42），头顶直接看不见。
+                x0, y0 = min(ix, base_x), min(iy, base_y)
+                x1, y1 = max(ix + new_w, base_x + cw), max(iy + new_h, base_y + ch)
+                span_w, span_h = max(1, x1 - x0), max(1, y1 - y0)
+                # 候选框下方那行类型名画在**框外**（见 _draw_candidate），事先量不到它的高度 ——
+                # 留 28px 余量：不留的话 fit 少算一截，底部那行文字照样越界（实测差 23px，
+                # 而且内容会比可用区还高，后面的平移就无解了）。
+                below = 28
+                fit_all = min((cv_w - 2 * pad) / float(span_w),
+                              (cv_h - 2 * pad - below) / float(span_h), 1.0)
+                if fit_all < 1.0:
+                    img = img.resize((max(1, int(new_w * fit_all)),
+                                      max(1, int(new_h * fit_all))), self._Image.LANCZOS)
+                    new_w, new_h = img.size
+                    cw, ch = max(1, int(cw * fit_all)), max(1, int(ch * fit_all))
+                    # 偏移量也要等比缩 —— 只缩图不缩偏移的话，图小了偏移照旧，照样出界
+                    offx = int(round(offx * fit_all))
+                    offy = int(round(offy * fit_all))
+                    base_x, base_y, ix, iy = _place(new_w, new_h, cw, ch, offx, offy)
                 # 预览不加光环（实际运行时有皮肤联动光环）
                 # v2.0-R7：合成到画布底色（兼容 = 硬边点阵、增强 = 颜色到底色的平滑过渡）
                 # v2.0-R15/N2：显示端再装回 alpha 掩膜 —— 抠图/透明边不再整块盖住模拟候选框
@@ -7212,8 +7232,59 @@ class ConfigWizard:
         else:
             self._draw_candidate(cv, layout, base_x, base_y, cw, ch, hex_acc)
             _draw_img_layer()
+        # R20：预览自适应 —— 画完统一把越界内容摆回画布内（见 _fit_canvas_view）
+        self._fit_canvas_view(cv)
         # 图层提示行随 图层/贴边 变化刷新
         self._update_layer_hint()
+
+    def _fit_canvas_view(self, cv, pad=8):
+        """R20：把画布里的内容整体平移进可视区（预览自适应的收口）。
+
+        先生实测「预览窗口自适应缩放，当前皮肤直接出顶了」。事先那一步 fit 负责**缩**，
+        这里负责**摆正** —— 在画完之后按所有 item 的实际外接框平移一次，比事先逐支推算更稳：
+        单层 / 多层 / 任意贴边与偏移组合都走同一条收口，不用各算各的。
+
+        · **只平移、不改比例**：预览里「图相对候选框偏了多少」这个关系不会被改掉。
+        · 先缩后移：内容真比画布大时，上面的 fit 已经把它缩进画布，这里只是摆正位置。
+        """
+        try:
+            # 必须先 idle：文字 item 的外接框要等 Tk 量完字体才有值，否则这里读到的是
+            # 残缺框，平移量算不够（实测漏掉候选框下方那行类型名，仍越界 2~3px）。
+            try:
+                cv.update_idletasks()
+            except Exception:
+                pass
+            boxes = []
+            for it in cv.find_all():
+                try:
+                    bb = cv.bbox(it)
+                except Exception:
+                    bb = None
+                if bb:
+                    boxes.append(bb)
+            if not boxes:
+                return None
+            x0 = min(int(b[0]) for b in boxes)
+            y0 = min(int(b[1]) for b in boxes)
+            x1 = max(int(b[2]) for b in boxes)
+            y1 = max(int(b[3]) for b in boxes)
+            dx = dy = 0
+            # 先按「右/下越界」往回收，再按「左/上越界」往里推；内容小于可用区时两者不打架
+            if x1 > self.CV_W - pad:
+                dx = (self.CV_W - pad) - x1
+            if x0 + dx < pad:
+                dx = pad - x0
+            if y1 > self.CV_H - pad:
+                dy = (self.CV_H - pad) - y1
+            if y0 + dy < pad:
+                dy = pad - y0
+            if dx or dy:
+                cv.move('all', dx, dy)
+                _write_log(f'[preview] R20 自适应平移 dx={dx} dy={dy} '
+                           f'(内容框 {x0},{y0} → {x1},{y1}；画布 {self.CV_W}x{self.CV_H})')
+        except Exception:
+            pass
+        return None
 
     def _update_layer_hint(self):
         """图层提示行：below 选中时提示适用条件（v1.3 教训文案）；
