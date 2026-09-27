@@ -1212,7 +1212,38 @@ def _probe_overlay(cfg, fake):
         R._ACTIVE_OVERLAY = None
 
 
-def test_release_compat(gui_ok):
+def _make_xinling_fixture(tmp):
+    """t7-B：在临时目录里自造一份「心灵信标」最小皮肤夹具（老档案形态），返回 (皮肤根目录, 档案路径)。
+
+    为什么自造：本机 release/skins 里已没有这份皮肤（只剩「芙芙」），而原始字节**不可恢复** ——
+    _baseline/v16/userdata_fingerprint.json 只记录了它的 sha256/size（image.gif 86978B、
+    skin.json 435B，采集时 exists=true）。release/ 又是 gitignore 的本地运行目录，
+    不能为了测试往里塞皮肤，所以按项目既有先例（char.png 缺失时脚本用 PIL 现生成）自己造。
+
+    夹具几何**全部取自仓库内已入库的记录性事实**，不是为断言凑数：
+      · 参数：由本段 H10~H15 自身记录 —— side=center / layer=below / scale=0.9 /
+        offset=(-162,-42)；base_height=300 是老档案 schema 与产品默认值（release/config.json
+        与「芙芙」skin.json 都是 300）。
+      · 自然尺寸：由 H12 记录的显示尺寸基线 356x270 反解 —— 产品口径
+        （rime_char_overlay.py:7880/7901）h = base_height × scale = 270，
+        w = int(自然宽 × h / 自然高) ⇒ 自然宽 × 270/300 ∈ [356,357) ⇒ 自然宽 = 396（整数唯一解）。
+      · 形态：老档案 = 顶层字段、**无 layers 键**（H14 要断的正是这一点）。
+    """
+    root = os.path.join(tmp, 'skins_fixture')
+    d = os.path.join(root, '心灵信标')
+    os.makedirs(d, exist_ok=True)
+    img = os.path.join(d, 'image.png')
+    make_img(img, (396, 300), (30, 90, 160, 200))
+    cfg = {'image': img, 'layout': 'horizontal_double', 'side': 'center',
+           'layer': 'below', 'scale': 0.9, 'offset_x': -162, 'offset_y': -42,
+           'base_height': 300, 'name': '心灵信标'}
+    j = os.path.join(d, 'skin.json')
+    with open(j, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    return root, j
+
+
+def test_release_compat(gui_ok, tmp):
     section('H. 端到端向后兼容：release 老配置 / 老皮肤落点 == v1.6（F-V1 回归）')
     rel = os.path.join(BASE, 'release')
     cfg_path = os.path.join(rel, 'config.json')
@@ -1277,9 +1308,23 @@ def test_release_compat(gui_ok):
             check('H09 ★两条通路一致：启动路径 == 皮肤路径（同一份数据同一落点）',
                   pos_skin == pos, f'startup={pos} skin={pos_skin}')
 
+        # ---- 心灵信标：本机 release/skins 已无此皮肤，改用测试自造「复刻夹具」----
+        #   数据源从 release/skins 换成 tempdir 夹具；H10~H15 的判据表达式一条未改
+        #   （H10 断言仍是 bool(find_skin('心灵信标'))，H11~H15 原样）。
+        #   判别力实测：夹具就位 → 全绿；夹具目录为空 / 图片缺失 → H10 立刻 FAIL。
+        xl_root, xl_json = _make_xinling_fixture(tmp)
+        R.SKINS_DIR = xl_root
         sk_xl = R.find_skin('心灵信标')
-        check('H10 皮肤路径能读到 心灵信标 档案（center/below/scale0.9/-162,-42）', bool(sk_xl))
+        check('H10 皮肤路径能读到 心灵信标 档案（center/below/scale0.9/-162,-42；自造复刻夹具）',
+              bool(sk_xl))
         if sk_xl:
+            check('H10b ★夹具参数读完没走形（side/offset/scale 逐项 == 档案里写的值）',
+                  sk_xl.get('side') == 'center'
+                  and (int(sk_xl.get('offset_x', 0)), int(sk_xl.get('offset_y', 0))) == (-162, -42)
+                  and float(sk_xl.get('scale', 1.0)) == 0.9,
+                  f'side={sk_xl.get("side")} '
+                  f'offset=({sk_xl.get("offset_x")},{sk_xl.get("offset_y")}) '
+                  f'scale={sk_xl.get("scale")}')
             pos_xl, size_xl = _probe_overlay(sk_xl, fake)
             exp_xl = _v16_xy(size_xl[0], size_xl[1], rect, sk_xl.get('side', 'center'),
                              cfg_off_x=int(sk_xl.get('offset_x', 0)),
@@ -1288,13 +1333,14 @@ def test_release_compat(gui_ok):
                   pos_xl == exp_xl, f'got={pos_xl} exp={exp_xl}')
             check('H12 心灵信标 落点 == (136,64)（尺寸 356x270 手算基线）',
                   pos_xl == (136, 64), f'got={pos_xl} size={size_xl}')
+            check('H12b 显示尺寸 == 356x270（base_height 300 × scale 0.9；自然 396x300）',
+                  size_xl == (356, 270), f'size={size_xl}')
             check('H13 心灵信标 x 偏移没丢：与"丢 offset"版本的差值 == 162',
                   (_v16_xy(size_xl[0], size_xl[1], rect, sk_xl.get('side', 'center'))[0]
                    - pos_xl[0]) == 162,
                   f'delta={_v16_xy(size_xl[0], size_xl[1], rect, sk_xl.get("side", "center"))[0] - pos_xl[0]}')
             # 真正的"启动路径"：直接把 skin.json 原文喂给 FollowOverlay（不经 list_skins 的 migrate）
             # —— 模拟老版本程序把档案当配置用 / 用户手工把 skin.json 拷成 config.json 的场景
-            xl_json = os.path.join(rel, 'skins', '心灵信标', 'skin.json')
             with open(xl_json, encoding='utf-8') as f:
                 raw_xl = json.load(f)
             check('H14 心灵信标 skin.json 原文是"老档案"形态（无 layers 键）',
@@ -1324,6 +1370,7 @@ def main():
     print('=== B_test_layers_schema：v2.0-② 套层皮肤（多图层 + 锚点布局 + 单窗多图合成）===')
     print('Python', sys.version.split()[0])
     tmp = tempfile.mkdtemp(prefix='layers_schema_')
+    R.HERE = tmp          # 只读约束（HANDOFF-2.1 §8.5）：日志/临时产物只落临时目录，不碰项目 error.log
     gui_ok = _has_gui()
     print('GUI 可用:', gui_ok, ' | 临时目录:', tmp)
     try:
@@ -1334,7 +1381,7 @@ def main():
         test_compose()
         test_runtime(tmp, gui_ok)
         test_wizard(tmp, gui_ok)
-        test_release_compat(gui_ok)
+        test_release_compat(gui_ok, tmp)
     finally:
         try:
             shutil.rmtree(tmp, ignore_errors=True)

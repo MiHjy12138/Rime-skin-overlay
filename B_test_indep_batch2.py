@@ -1270,6 +1270,7 @@ def main():
         print('RESULT: FAIL（GUI/PIL 不可用 → 独立验证无法成立，禁止静默跳过）')
         return 1
     tmp = tempfile.mkdtemp(prefix='indep_batch2_')
+    R.HERE = tmp          # 只读约束（HANDOFF-2.1 §8.5）：日志/临时产物只落临时目录，不碰项目 error.log
     want = {s.strip().upper() for s in a.sections.split(',') if s.strip()}
     try:
         if 'E' in want:

@@ -686,6 +686,7 @@ def main():
     print('=== B_test_wizard_layout：t15 向导布局（按钮行可见 / 高级栏可滚动）+ 图层交互 ===')
     print('Python', sys.version.split()[0])
     tmp = tempfile.mkdtemp(prefix='wizard_layout_')
+    R.HERE = tmp          # 只读约束（HANDOFF-2.1 §8.5）：日志/临时产物只落临时目录，不碰项目 error.log
     gui_ok = _has_gui()
     print('GUI 可用:', gui_ok, ' | 临时目录:', tmp)
     real_save = R.save_config

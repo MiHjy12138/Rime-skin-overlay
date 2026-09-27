@@ -452,6 +452,7 @@ def main():
     print('=== B_test_r1_feather：R1 增强羽化（⑩ 旁开关 ↔ 内部渲染模式 + 预览真 alpha 合成）===')
     print('Python', sys.version.split()[0], '| PIL 可用:', PIL_OK)
     tmp = tempfile.mkdtemp(prefix='r1_feather_')
+    R.HERE = tmp          # 只读约束（HANDOFF-2.1 §8.5）：日志/临时产物只落临时目录，不碰项目 error.log
     gui_ok = _has_gui()
     print('GUI 可用:', gui_ok, '| 临时目录:', tmp)
     saved = {}

@@ -494,6 +494,7 @@ def main():
     print('=== B_test_r11_side：R11 ③ 贴边方向回通用区 + 统一管所有图层 ===')
     print('Python', sys.version.split()[0])
     tmp = tempfile.mkdtemp(prefix='r11_side_')
+    R.HERE = tmp          # 只读约束（HANDOFF-2.1 §8.5）：日志/临时产物只落临时目录，不碰项目 error.log
     gui_ok = _has_gui()
     print('GUI 可用:', gui_ok, '| 临时目录:', tmp)
     saved = {}

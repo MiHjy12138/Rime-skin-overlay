@@ -466,6 +466,7 @@ def main():
     print('=== B_test_r2_layer_side：R2 贴边方向纳入图层 + 主层贴边 bug（R11 需求回退后改写）===')
     print('Python', sys.version.split()[0])
     tmp = tempfile.mkdtemp(prefix='r2_layer_side_')
+    R.HERE = tmp          # 只读约束（HANDOFF-2.1 §8.5）：日志/临时产物只落临时目录，不碰项目 error.log
     gui_ok = _has_gui()
     print('GUI 可用:', gui_ok, '| 临时目录:', tmp)
     saved = {}
