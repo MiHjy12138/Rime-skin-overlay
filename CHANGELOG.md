@@ -46,8 +46,10 @@
      _evidence_* / 环境台账.md。交接单 HANDOFF-*.md 已按先生指示删除（不再需要跨会话对接）。
      2.0 最终身份：产品提交 f048539 / blob 5c49613b69e805ecd41a18e9e4fd0648a545beb1 /
      447,142 B / sha256 0BA0EF2727B896BD2E6D273B580067CA198B8936719BA00CDA738F2462C6F773。
-     交付包：E:\桌面\RimeSkinOverlay-v2.0.zip 31,068,038 B /
-     sha256 C33F69F44D3C051C58F7806D42181C5125BD7581398533016D6AEE0F74477E29；
+     交付包：E:\桌面\RimeSkinOverlay-v2.0.zip 31,068,805 B /
+     sha256 CD56727DB0A894C6531315357C3DC8BB5739FBC79F34FC00EF908380D1F33072；
+     发布件：github.com/MiHjy12138/Rime-skin-overlay/releases/tag/v2.0（tag = 83c8d53，与包内产品提交同源）；
+     GitHub 侧回执 digest 与上列 sha256 一致。
      内含 exe 31,350,192 B / sha256 b458e16f…d7cd1c2（同一份也在 release\ 与桌面运行目录）。
      未在真机验证（一律「未验证」）：⑪ 新位置与两段常驻说明在 125% / 150% DPI 下的排版 ·
      ⑩ 那句说明旁边没了按钮参照会不会被误当成标题 · ① 只报状态够不够用 · ④ 层号灰/橙的醒目度 ·
