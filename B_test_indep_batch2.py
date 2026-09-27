@@ -226,6 +226,25 @@ def _all_widgets(win, out=None):
     return out
 
 
+def _in_container(win, anc):
+    """win 是否落在容器 anc 之内（从 win.master 往上找）——
+    「控件层级」口径（v2.0-N3 起用于判 ③/翻转是否被搬进图层卡），不依赖任何文案。"""
+    p = getattr(win, 'master', None)
+    while p is not None:
+        if p is anc:
+            return True
+        p = getattr(p, 'master', None)
+    return False
+
+
+def _num_set(titles):
+    """标题多重集/集合 → 出现的**编号字符集**（不比对整串文案措辞）。
+    t11 契约第 4 条：把「标题文案一个不少」换成「编号一个不少」——措辞随需求变，
+    编号才是需求登记的锚点（先例 22a8dac：定位不再依赖 text）。"""
+    ts = titles.keys() if isinstance(titles, dict) else titles
+    return {c for t in ts for c in NUM_CHARS if c in t}
+
+
 def _var_attr_map(wiz):
     """Tk 变量对象 → 向导属性名（如 var_scale）。PY_VARn 每次实例不同，不能拿来对照。"""
     import tkinter as tk
@@ -494,17 +513,58 @@ def section_E(tmp):
                   and binds_v.get('var_side', 0) >= 3,
                   f"var_layer_anchor 单选={inter_v.get(('Radiobutton', 'var_layer_anchor'), 0)} "
                   f"var_side 绑定={binds_v.get('var_side', 0)}")
-            # 编号标题：⑪ 按需求删除；③ 与图层区说明行的**文案**按 R11 改写（编号仍在）——
-            # 故以「编号 ③ 的新标题仍在 + ⑪ 字样不再出现」守判别力，而不是逐字比对旧文案。
-            LOST_OK = {k for k in _titles_pre
-                       if '⑪' in k or '③ 贴边方向（当前层' in k or '都作用于它' in k}
-            lost_titles_v = {k: v for k, v in _titles_pre.items()
-                             if k not in LOST_OK and titles.get(k, 0) < v}
+            # v2.0-N3 改写定位口径（t11 契约第 4 条；项目先例 22a8dac）：旧判据用**文案子串**
+            # 「'③' in t and '所有图层' in t」定位 ③ 的标题 —— R11 的「所有图层统一」措辞已被用户
+            # 第四轮推翻（现在是「（第 N 层）」），文案一变就红。改成两条不绑措辞的口径：
+            #   ① ③ / 翻转两个控件按**变量绑定 + 控件层级**定位（变量 + 是否落在图层卡内）；
+            #   ② 「编号齐全」改成**编号维度**（从标题里抽编号字符集），不比对整串文案。
             has_11_left = [t for t in titles if '⑪' in t]
-            has_3_new = [t for t in titles if '③' in t and '所有图层' in t]
-            check('E08 编号标题（⑪ 已按 R10 删除；③ 文案按 R11 改写但编号仍在）',
-                  not lost_titles_v and not has_11_left and bool(has_3_new),
-                  f'丢失={lost_titles_v or "无"} ⑪残留={has_11_left or "无"} 新③标题={has_3_new or "无"}')
+            pre_nums = _num_set(_titles_pre)
+            head_nums = _num_set(titles)
+            # 需求主动删改登记（不是措辞白名单）：⑪ 按 R10 删除；③ 的文案被 R11→N3 两轮改写，
+            # 但编号仍在，故仍出现在 head_nums 里。
+            DELETED_BY_DEMAND = {'⑪'}
+            miss_nums = sorted((pre_nums - DELETED_BY_DEMAND) - head_nums)
+            side_rb_w = [x for x in _all_widgets(w.root)
+                         if x.winfo_class() == 'Radiobutton'
+                         and str(x.cget('variable')) == str(w.var_side)]
+            flip_chk_w = [x for x in _all_widgets(w.root)
+                          if x.winfo_class() == 'Checkbutton'
+                          and str(x.cget('variable')) == str(w.var_flip)]
+            side_in_card = bool(side_rb_w) and _in_container(side_rb_w[0].master, w.layer_list)
+            flip_in_card = bool(flip_chk_w) and _in_container(flip_chk_w[0].master, w.layer_list)
+            check('E08 ★③ 与翻转按**变量绑定 / 控件层级**定位：③ = 绑 var_side 的恰 3 个单选、'
+                  '翻转 = 绑 var_flip 的恰 1 个勾选框，且两者都在通用区（不在图层卡内 = 只一处）；'
+                  '⑪ 字样不再出现；编号一个不少（除 R10 主动删的 ⑪）',
+                  len(side_rb_w) == 3 and len(flip_chk_w) == 1
+                  and not side_in_card and not flip_in_card
+                  and not has_11_left and not miss_nums,
+                  f'③单选={len(side_rb_w)} 翻转勾选={len(flip_chk_w)} '
+                  f'③在图层卡内={side_in_card} 翻转在图层卡内={flip_in_card} '
+                  f'⑪残留={has_11_left or "无"} 缺编号={miss_nums or "无"}')
+            # E08b 判别力（§6-13 + t11 契约第 5 条）：抹掉某个编号（⑤）的标题文案 = 模拟
+            # 「某个编号整组从界面消失」→ 上面 E08 的**同一条**「编号一个不少」判据必须 FAIL。
+            _victims = []
+            for _x in _all_widgets(w.root):
+                try:
+                    if '⑤' in str(_x.cget('text')):
+                        _victims.append((_x, _x.cget('text')))
+                except Exception:
+                    pass
+            for _x, _t in _victims:
+                try:
+                    _x.config(text='（编号被抹）')
+                except Exception:
+                    pass
+            _miss_after = sorted((pre_nums - DELETED_BY_DEMAND) - _num_set(inventory(w)[2]))
+            for _x, _t in _victims:
+                try:
+                    _x.config(text=_t)
+                except Exception:
+                    pass
+            check('E08b ★判别力：抹掉 ⑤ 编号标题后「编号一个不少」判据必须 FAIL（非恒真）',
+                  bool(_victims) and bool(_miss_after),
+                  f'被抹控件={len(_victims)} 抹后缺编号={_miss_after or "无"}')
             note(f'新增编号标题（R4/R11 引入的说明行，允许）：'
                  f'{ {k: v for k, v in titles.items() if k not in _titles_pre} or "无"}')
             # 列数 vs 工作区宽度（可注入）
@@ -588,8 +648,43 @@ def section_E(tmp):
                     h2, w2r = int(w2.root.winfo_reqheight()), int(w2.root.winfo_reqwidth())
                     has_img = bool(getattr(w2, 'tk_img', None)) or bool(w2._preview_specs())
                     inter2, binds2, titles2 = inventory(w2)
-                    miss = {k: v for k, v in _titles_pre.items()
-                            if k not in LOST_OK and titles2.get(k, 0) < v}
+                    # v2.0-N3：与 E08 同一口径（**编号维度** + 控件变量绑定），不再依赖
+                    # LOST_OK 那种写死旧文案的白名单 —— 下一轮文案再变也不会红。
+                    miss_nums2 = sorted((pre_nums - DELETED_BY_DEMAND) - _num_set(titles2))
+                    _rb2 = [x for x in _all_widgets(w2.root)
+                            if x.winfo_class() == 'Radiobutton'
+                            and str(x.cget('variable')) == str(w2.var_side)]
+                    _ck2 = [x for x in _all_widgets(w2.root)
+                            if x.winfo_class() == 'Checkbutton'
+                            and str(x.cget('variable')) == str(w2.var_flip)]
+                    ctrl2_ok = (len(_rb2) == 3 and len(_ck2) == 1
+                                and not _in_container(_rb2[0].master, w2.layer_list)
+                                and not _in_container(_ck2[0].master, w2.layer_list))
+                    # E12b 判别力（§6-13）：抹掉 ⑤ 编号标题 → 本段**同一条**「编号一个不少」
+                    # 判据必须 FAIL（证明不是恒真）。注意必须在 _save_and_start() **之前**做 ——
+                    # 保存会销毁向导窗口，之后再遍历就找不到任何控件（第一版放后面 = 假红）。
+                    _victims2 = []
+                    for _x in _all_widgets(w2.root):
+                        try:
+                            if '⑤' in str(_x.cget('text')):
+                                _victims2.append((_x, _x.cget('text')))
+                        except Exception:
+                            pass
+                    for _x, _t in _victims2:
+                        try:
+                            _x.config(text='（编号被抹）')
+                        except Exception:
+                            pass
+                    _miss2b = sorted((pre_nums - DELETED_BY_DEMAND)
+                                     - _num_set(inventory(w2)[2]))
+                    for _x, _t in _victims2:
+                        try:
+                            _x.config(text=_t)
+                        except Exception:
+                            pass
+                    check('E12b ★判别力：抹掉 ⑤ 编号标题后本节「编号一个不少」判据必须 FAIL（非恒真）',
+                          bool(_victims2) and bool(_miss2b),
+                          f'被抹控件={len(_victims2)} 抹后缺编号={_miss2b or "无"}')
                     workh2 = int(R.screen_work_area_height(w2.root) or 0)
                     left_11 = [t for t in titles2 if '⑪' in t]
                     s4.clear()
@@ -597,10 +692,12 @@ def section_E(tmp):
                     out = dict(s4)
                     drift = {k: (before[k], out.get(k)) for k in before if out.get(k) != before[k]}
                     check('E12 ★端到端（release/config.json）：重排后预览与 ②~⑭ 齐全'
-                          '（⑪ 已按 R10 删除）、保存零漂移、窗口 ≤ 工作区',
-                          has_img and not miss and not drift and 0 < h2 <= workh2
-                          and not left_11,
-                          f'需求={w2r}x{h2} 预览={"有" if has_img else "无"} 缺标题={miss or "无"} '
+                          '（⑪ 已按 R10 删除）、③/翻转按变量绑定仍在通用区、保存零漂移、'
+                          '窗口 ≤ 工作区',
+                          has_img and not miss_nums2 and ctrl2_ok and not drift
+                          and 0 < h2 <= workh2 and not left_11,
+                          f'需求={w2r}x{h2} 预览={"有" if has_img else "无"} '
+                          f'缺编号={miss_nums2 or "无"} 控件={ctrl2_ok} '
                           f'漂移={drift or "无"} 工作区={workh2} ⑪残留={left_11 or "无"}')
                 finally:
                     if w2 is not None:

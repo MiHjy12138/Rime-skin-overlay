@@ -524,7 +524,7 @@ def sec_B(tmp):
 # C 段 · R11：③ 位置 + 统一管所有图层
 # ==========================================================================
 def sec_C(tmp):
-    section('C. R11 —— ③ 回通用区（②④ 之间）且一处管所有图层')
+    section('C. N3（推翻 R11）—— ③ 只出现一处（②④ 之间）、但**按当前选中层**分别调')
     imgs = [make_static_png(os.path.join(tmp, f'fig_c{i}.png'), size=(120 + i * 10, 160),
                             color=(30 + i * 60, 120, 200, 255)) for i in range(3)]
     cfg = layers_cfg(imgs, ['left_edge', 'center', 'right_edge'], flips=[False, True, False])
@@ -546,27 +546,83 @@ def sec_C(tmp):
               len(side_rb) == 3 and same_row and not in_lay_card and lay_y > min(tops),
               f'单选={tops} ③行={y3} 同卡片={in_lay_card} 图层列表 y={lay_y}')
 
-        # 语义：点一次 ③「左」→ 全部层 + cfg[side] + 列表文案
-        left = radio_of(wiz, wiz.var_side, '左')
-        left.invoke()
+        # ---- N3（用户第四轮，推翻 R11）：点一次 ③ = **只写当前选中层**，其余层一个都不许动。----
+        # 取样走用户真实通路（点通用区 ③ 的单选并 invoke），**不用 var.set + 预览** —— 后者靠的是
+        # 「实现读 Tk 变量推全层」这条 N3 已明令禁止的行为（见 t11 契约第 3 条(iii)：那是假绿）。
+        # 判据抽成闭包 c03_ok()：C03/C06/C06b 与就地负控 C09 共用**同一条表达式**，保证判别力段
+        # 红的确实是这条判据本身（不是另写一条）。
+        def snap_anchor():
+            return [d.get('anchor') for d in wiz.cfg['layers']]
+
+        def c03_ok(before, sel, want, expect_side):
+            """N3 判据：点击后**只有第 sel 层**变成 want，其余层逐层 == 点击前的快照；
+            sel==0（主层）时顶层 cfg['side'] 同步为 expect_side。
+            回退成 R11/R13「一处统一管所有图层」后其余层会被一起改 → 本式必假（判别力见 C09）。"""
+            exp = list(before)
+            exp[sel] = want
+            return snap_anchor() == exp and wiz.cfg.get('side') == expect_side
+
+        _SIDE_WORD = {'left_edge': '贴左', 'right_edge': '贴右', 'center': '居中'}
+
+        def rows_match_layers():
+            """图层列表**逐行**一致性：每行文案里的方向词 == 该层 cfg 里的持久值。
+            不比对字面文案措辞（措辞随需求变），只要求「界面说的」==「存档里的」——
+            回退成「统一全层」而列表只刷当前行时，其余行的持久值已被改、文案却陈旧 → 必假。"""
+            rws = [wiz.layer_list.get(i) for i in range(wiz.layer_list.size())]
+            lyr = wiz.cfg['layers']
+            if len(rws) != len(lyr):
+                return False, rws
+            ok = all(_SIDE_WORD.get(d.get('anchor'), '∅') in r for d, r in zip(lyr, rws))
+            return ok, rws
+
+        before = snap_anchor()
+        note(f'fixture 各层 anchor={before}（选中层默认=第 1 层，主层）')
+        radio_of(wiz, wiz.var_side, '中').invoke()
         wiz.root.update_idletasks()
-        anchors = [d.get('anchor') for d in wiz.cfg['layers']]
+        anchors = snap_anchor()
         rows = [wiz.layer_list.get(i) for i in range(wiz.layer_list.size())]
-        note(f'点「左」后：side={wiz.cfg.get("side")} anchors={anchors} 行={rows}')
-        check('C03 ★点一次 ③ = 全部 3 层 anchor 一起改（统一管所有图层）',
-              wiz.cfg.get('side') == 'left' and anchors == ['left_edge'] * 3, f'{anchors}')
-        check('C04 ★图层列表文案跟着每一层走（3 行都写「贴左」）',
-              len(rows) == 3 and all('贴左' in r for r in rows), f'{rows}')
+        _rows_ok, _rows_now = rows_match_layers()
+        note(f'选中第 1 层点「中」后：side={wiz.cfg.get("side")} anchors={anchors} 行={rows}')
+        check('C03 ★点一次 ③ = **只改当前选中层**（主层）：[center, center, right_edge] —— '
+              '第 3 层保持 right_edge 不被统一',
+              c03_ok(before, 0, 'center', 'center'), f'side={wiz.cfg.get("side")} anchors={anchors}')
+        check('C04 ★图层列表**逐行**反映各层自己的持久值（第 1 行「居中」跟着刚改的主层走、'
+              '第 3 行仍「贴右」；界面话 == 存档值，不是 3 行一律刷成同一个词）',
+              _rows_ok and '居中' in _rows_now[0] and '贴右' in _rows_now[2],
+              f'逐行一致={"是" if _rows_ok else "否"} 行={_rows_now}')
         check('C05 图层区回显镜像 == 当前选中层 anchor',
               str(wiz.var_layer_anchor.get()) == str(wiz.cfg['layers'][wiz._cur_layer_index()].get('anchor')),
               f'{wiz.var_layer_anchor.get()!r}')
 
-        mid = radio_of(wiz, wiz.var_side, '中')
-        mid.invoke()
+        # 再点另一个方向「右」：仍只改当前选中层（不是一次性巧合）
+        before = snap_anchor()
+        radio_of(wiz, wiz.var_side, '右').invoke()
         wiz.root.update_idletasks()
-        anchors2 = [d.get('anchor') for d in wiz.cfg['layers']]
-        check('C06 ★再点「中间」仍然全层同步（不是一次性巧合）',
-              wiz.cfg.get('side') == 'center' and anchors2 == ['center'] * 3, f'{anchors2}')
+        anchors2 = snap_anchor()
+        note(f'再点「右」后：side={wiz.cfg.get("side")} anchors={anchors2}')
+        check('C06 ★再点「右」仍只改当前选中层（不是一次性巧合）：[right_edge, center, right_edge]',
+              c03_ok(before, 0, 'right_edge', 'right'),
+              f'side={wiz.cfg.get("side")} anchors={anchors2}')
+
+        # 选中**非主层**（第 3 层）点 ③：只改该层；顶层 side 与主层/第 2 层纹丝不动
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(2)
+        wiz._on_layer_select()
+        wiz.root.update_idletasks()
+        before = snap_anchor()
+        radio_of(wiz, wiz.var_side, '左').invoke()
+        wiz.root.update_idletasks()
+        anchors3 = snap_anchor()
+        note(f'选中第 3 层点「左」后：side={wiz.cfg.get("side")} anchors={anchors3}')
+        check('C06b ★选中第 3 层点「左」= 只改第 3 层；顶层 side 与主层/第 2 层纹丝不动'
+              '（[right_edge, center, left_edge]）',
+              c03_ok(before, 2, 'left_edge', 'right'),
+              f'side={wiz.cfg.get("side")} anchors={anchors3}')
+        # C06b 之后切回主层，保持 C07/C08/C09 的取样起点与改写前一致
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(0)
+        wiz._on_layer_select()
+        wiz.root.update_idletasks()
 
         # 老 v1.6 单层档案：无 layers 键
         wiz2 = make_wiz(dict([('image', imgs[0]), ('side', 'left'), ('scale', 0.6)]), tmp)
@@ -594,17 +650,33 @@ def sec_C(tmp):
         finally:
             kill_wiz(wiz3)
 
-        # C09 判别力：把「点 ③ 同步全部层」打成旧行为（只写 cfg['side']）→ C03 判据必须失败
-        real = wiz._sync_side_to_all_layers
-        wiz._sync_side_to_all_layers = lambda force=False: None
+        # C09 判别力（v2.0-N3 **重建**）：原注入点（打桩 _sync_side_to_all_layers）在 N3 后
+        # **已不经过被测路径** —— _on_side_change 现在直接调 _layer_set_params，打桩那个入口
+        # 对判据零影响 ⇒ 旧 C09 会「仍然绿但已不是判别力证据」（t11 契约第 3 条①最想防的形态）。
+        # 改成把 _layer_set_params 打桩回**旧前提**「一处统一管所有图层」（R11/R13 语义），
+        # 再用上面 C03/C06 **同一条判据表达式** c03_ok() 复核 —— 必须 FAIL。
+        real_set = wiz._layer_set_params
+
+        def _old_unified_set(i, scale=None, offset_x=None, offset_y=None, flip=None, anchor=None):
+            r = real_set(i, scale=scale, offset_x=offset_x, offset_y=offset_y,
+                         flip=flip, anchor=anchor)
+            if anchor is not None:              # 旧语义：一处统一管所有图层
+                for d in wiz.cfg['layers']:
+                    d['anchor'] = wiz._layer_anchor_at(0)
+            return r
+
+        before = snap_anchor()
+        wiz._layer_set_params = _old_unified_set
         try:
-            radio_of(wiz, wiz.var_side, '右').invoke()
+            radio_of(wiz, wiz.var_side, '中').invoke()
             wiz.root.update_idletasks()
-            a_bad = [d.get('anchor') for d in wiz.cfg['layers']]
-            check('C09 ★判别力：③ 只刷预览不写状态（R2 前旧行为）时 C03 判据必须失败',
-                  a_bad != ['right_edge'] * 3, f'注入旧行为后 anchors={a_bad}')
         finally:
-            wiz._sync_side_to_all_layers = real
+            wiz._layer_set_params = real_set
+        a_bad = snap_anchor()
+        check('C09 ★判别力：把「只写当前层」打桩回旧前提「一处统一管所有图层」（R11/R13 语义）'
+              '→ C03/C06 同一条判据 c03_ok() 必须 FAIL',
+              not c03_ok(before, 0, 'center', 'center'),
+              f'回退前={before} 注入后={a_bad}')
     finally:
         kill_wiz(wiz)
 
@@ -1011,10 +1083,13 @@ def sec_F(tmp):
 # G 段 · R13：水平翻转在通用区 + 统一管所有图层
 # ==========================================================================
 def sec_G(tmp):
-    section('G. R13 —— 水平翻转在通用区，勾一次全层同步')
+    section('G. N3（推翻 R13）—— 水平翻转在通用区一处、但**按当前选中层**分别调')
     imgs = [make_static_png(os.path.join(tmp, f'fig_g{i}.png'), size=(120, 160),
                             color=(40, 90 + i * 40, 200, 255)) for i in range(3)]
-    cfg = layers_cfg(imgs, ['right_edge'] * 3, flips=[False, False, False])
+    # fixture 的 flip 初始值刻意**不是全 False**（t11 契约第 3 条②）：全 False 时「勾一次再取消」
+    # 之后仍全 False，判据区分不出「只改当前层」与「全层同步」= 判别力被掏空。这里把第 3 层
+    # 预置 True，它就成「未被选中的层不许被改写」的活体对照。
+    cfg = layers_cfg(imgs, ['right_edge'] * 3, flips=[False, False, True])
     wiz = make_wiz(cfg, tmp)
     try:
         chk = getattr(wiz, 'chk_flip', None)
@@ -1028,9 +1103,61 @@ def sec_G(tmp):
               chk is not None and y3 is not None and abs(y_flip - y3) <= 8
               and y_flip < lay_y and not in_lay_card,
               f'flip={y_flip} ③={y3} 图层列表={lay_y} 同卡片={in_lay_card}')
-        check('G02 勾选框文案标明「所有图层统一」语义', '图层' in class_text(chk),
-              f'{class_text(chk)!r}')
+        # G02 改写（t11 契约第 4 条：按**控件层级 / 变量绑定**定位，不绑文案措辞）：
+        # 旧判据 `'图层' in text` 固化的是 R13「所有图层统一」的文案，已被 N3 推翻；
+        # 新判据 = 控件按变量绑定唯一存在（形态仍是勾选框、仍只有一处）+ 文案**随选中层更新**
+        # （第 1 层 ↔ 第 3 层）—— 换措辞不会红，少一处/多了第二处/不随层更新都会红。
+        flip_ws = [w for w in all_widgets(wiz.root)
+                   if w.winfo_class() == 'Checkbutton'
+                   and str(w.cget('variable')) == str(wiz.var_flip)]
+        t1_text = class_text(flip_ws[0]) if flip_ws else ''
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(2)
+        wiz._on_layer_select()
+        wiz.root.update_idletasks()
+        t3_text = class_text(flip_ws[0]) if flip_ws else ''
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(0)
+        wiz._on_layer_select()
+        wiz.root.update_idletasks()
+        note(f'绑 var_flip 的 Checkbutton {len(flip_ws)} 个；文案：主层={t1_text!r} 第 3 层={t3_text!r}')
+        check('G02 ★翻转控件按**变量绑定**定位（恰 1 个绑 var_flip 的 Checkbutton）、'
+              '文案随选中层更新（主层写「第 1 层」/ 第 3 层写「第 3 层」）',
+              len(flip_ws) == 1 and '第 1 层' in t1_text and '第 3 层' in t3_text
+              and '第 1 层' in class_text(flip_ws[0]),
+              f'控件数={len(flip_ws)} 主层文案={t1_text!r} 第3层文案={t3_text!r}')
+        # G02b 判别力（§6-13）：把「控件文案随层更新」的入口打桩成 no-op → 切到第 3 层后文案
+        # 仍停留在「第 1 层」→ G02 的「文案随选中层更新」判据必须 FAIL（测完还原）。
+        _real_titles = wiz._sync_side_widget_titles
+        wiz._sync_side_widget_titles = lambda *a, **k: None
+        try:
+            wiz.layer_list.selection_clear(0, 'end')
+            wiz.layer_list.selection_set(2)
+            wiz._on_layer_select()
+            wiz.root.update_idletasks()
+            _t3_frozen = class_text(flip_ws[0]) if flip_ws else ''
+        finally:
+            wiz._sync_side_widget_titles = _real_titles
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(0)
+        wiz._on_layer_select()
+        wiz.root.update_idletasks()
+        check('G02b ★判别力：把文案随层更新的入口打桩成 no-op → 「文案随选中层更新」判据必须 FAIL（非恒真）',
+              '第 3 层' not in _t3_frozen, f'注入后第 3 层文案={_t3_frozen!r}')
 
+        def snap_flip():
+            return [bool(d.get('flip')) for d in wiz.cfg['layers']]
+
+        def g03_ok(before, sel, want, expect_top):
+            """N3 判据（G03/G05 与就地负控 G07 共用**同一条**表达式）：勾 / 取消之后
+            **只有第 sel 层**变成 want，其余层逐层 == 操作前的快照；sel==0（主层）时顶层
+            cfg['flip_h'] 同步。回退成 R13「一处统一管所有图层」后其余层会被一起改 → 本式必假。"""
+            exp = list(before)
+            exp[sel] = want
+            return snap_flip() == exp and bool(wiz.cfg.get('flip_h')) is bool(expect_top)
+
+        before = snap_flip()
+        note(f'勾选前各层 flip={before}（选中层=主层；第 3 层的 True 是活体对照）')
         n = {'c': 0}
         real_prev = wiz._update_preview
         wiz._update_preview = lambda *a, **k: (n.__setitem__('c', n['c'] + 1), real_prev(*a, **k))[1]
@@ -1039,17 +1166,21 @@ def sec_G(tmp):
             wiz.root.update_idletasks()
         finally:
             wiz._update_preview = real_prev
-        flips = [d.get('flip') for d in wiz.cfg['layers']]
+        flips = snap_flip()
         note(f'勾一次后：顶层 flip_h={wiz.cfg.get("flip_h")} 各层={flips} 预览重绘={n["c"]}')
-        check('G03 ★勾一次 = 全部 3 层 flip 一起 True（统一管所有图层）',
-              wiz.cfg.get('flip_h') is True and flips == [True] * 3, f'{flips}')
+        check('G03 ★勾一次 = **只改当前选中层**（主层）：[True, False, True] —— '
+              '第 2 层保持 False、第 3 层保持 True，都不许被统一',
+              g03_ok(before, 0, True, True), f'flip_h={wiz.cfg.get("flip_h")} 各层={flips}')
         check('G04 ★勾一次立刻重绘预览（用户能马上看到）', n['c'] >= 1, f'重绘 {n["c"]} 次')
 
+        before = snap_flip()
         chk.invoke()
         wiz.root.update_idletasks()
-        flips2 = [d.get('flip') for d in wiz.cfg['layers']]
-        check('G05 ★取消勾选 = 全部层一起回到 False',
-              wiz.cfg.get('flip_h') is False and flips2 == [False] * 3, f'{flips2}')
+        flips2 = snap_flip()
+        note(f'再取消后：顶层 flip_h={wiz.cfg.get("flip_h")} 各层={flips2}')
+        check('G05 ★取消勾选 = **只把当前选中层**（主层）回到 False：第 3 层的 True 必须保住 '
+              '（旧 fixture 全 False 时区分不出这一点，故本段 fixture 预置第 3 层 True）',
+              g03_ok(before, 0, False, False), f'flip_h={wiz.cfg.get("flip_h")} 各层={flips2}')
 
         # 反例：各层 flip 不一致的老档案 → 只打开不许静默改写其它层
         cfg2 = layers_cfg(imgs, ['right_edge'] * 3, flips=[False, True, False])
@@ -1065,17 +1196,31 @@ def sec_G(tmp):
         finally:
             kill_wiz(wiz2)
 
-        # G07 判别力：把统一翻转打成「只动当前层」→ G03 判据必须失败
-        real_sync = wiz._sync_flip_to_all_layers
-        wiz._sync_flip_to_all_layers = lambda force=False: False
+        # G07 判别力（v2.0-N3 **重建**）：原注入点（打桩 _sync_flip_to_all_layers）在 N3 后
+        # 已不经过被测路径（_on_flip_change 直接调 _layer_set_params）⇒ 旧 G07 会「仍然绿但
+        # 已不是判别力证据」。改成把 _layer_set_params 打桩回旧前提「一处统一管所有图层」
+        # （翻转推全层），再用上面 G03/G05 **同一条**判据表达式 g03_ok() 复核 —— 必须 FAIL。
+        real_set = wiz._layer_set_params
+
+        def _old_unified_flip(i, scale=None, offset_x=None, offset_y=None, flip=None, anchor=None):
+            r = real_set(i, scale=scale, offset_x=offset_x, offset_y=offset_y,
+                         flip=flip, anchor=anchor)
+            if flip is not None:                # 旧语义：一处统一管所有图层（翻转推全层）
+                for d in wiz.cfg['layers']:
+                    d['flip'] = bool(wiz.cfg.get('flip_h', False))
+            return r
+
+        before = snap_flip()
+        wiz._layer_set_params = _old_unified_flip
         try:
             chk.invoke()
             wiz.root.update_idletasks()
-            f_bad = [d.get('flip') for d in wiz.cfg['layers']]
-            check('G07 ★判别力：统一同步失效时 G03 判据必须失败（非恒真）',
-                  f_bad != [True] * 3, f'注入后={f_bad}')
         finally:
-            wiz._sync_flip_to_all_layers = real_sync
+            wiz._layer_set_params = real_set
+        f_bad = snap_flip()
+        check('G07 ★判别力：把「只写当前层」打桩回旧前提「一处统一管所有图层」（R13 语义）'
+              '→ G03/G05 同一条判据 g03_ok() 必须 FAIL',
+              not g03_ok(before, 0, True, True), f'回退前={before} 注入后={f_bad}')
     finally:
         kill_wiz(wiz)
 
@@ -1272,6 +1417,26 @@ R.ConfigWizard._toggle_adv_collapse = (
     lambda self, collapse=None: setattr(self, '_adv_collapsed', bool(collapse)))
 '''
 
+# v2.0-N3（第四轮）：把写回路径打桩回**旧前提**「一处统一管所有图层」（R11/R13 语义）——
+# ③ 与翻转都推全层。用 t11 改写后的新断言（C03/C04/C06/C06b/G03/G05）跑，必须 FAIL。
+INJ_OLD_UNIFIED_LAYERS = '''_real_set = R.ConfigWizard._layer_set_params
+
+
+def _old_unified(self, i, scale=None, offset_x=None, offset_y=None, flip=None, anchor=None):
+    r = _real_set(self, i, scale=scale, offset_x=offset_x, offset_y=offset_y,
+                  flip=flip, anchor=anchor)
+    if anchor is not None:
+        for d in self.cfg['layers']:
+            d['anchor'] = self._layer_anchor_at(0)
+    if flip is not None:
+        for d in self.cfg['layers']:
+            d['flip'] = bool(self.cfg.get('flip_h', False))
+    return r
+
+
+R.ConfigWizard._layer_set_params = _old_unified
+'''
+
 
 def sec_J(tmp):
     section('J. 判别力复现（独立复核 t6 的改写断言：回退场景下必须 FAIL）')
@@ -1282,6 +1447,12 @@ def sec_J(tmp):
         ('S3 增强档退化为硬边', 'B_test_indep_batch1.py', 'A', INJ_FORCE_HARD_EDGE, 'A14'),
         ('S4 ⑪ 单选被注回', 'B_test_indep_batch2.py', 'E', INJ_ADD_RENDER_RADIO, 'E06b'),
         ('S5 折叠执行点失效', 'B_test_indep_batch2.py', 'E', INJ_COLLAPSE_OFF, 'E01'),
+        # v2.0-N3（第四轮）：t11 改写后的**新断言**必须能被「回退成 R11/R13 旧前提」打红。
+        # 这里不是另写判据，而是回退产品写回路径后跑 t11 改好的那几条断言本身。
+        ('S6 ③ 回退成「一处统一管所有图层」', 'B_test_indep_batch3.py', 'C',
+         INJ_OLD_UNIFIED_LAYERS, ('C03', 'C04', 'C06', 'C06b')),
+        ('S7 翻转回退成「一处统一管所有图层」', 'B_test_indep_batch3.py', 'G',
+         INJ_OLD_UNIFIED_LAYERS, ('G03', 'G05')),
     ]
     env = dict(os.environ)
     env['PYTHONIOENCODING'] = 'utf-8'
@@ -1297,13 +1468,15 @@ def sec_J(tmp):
             out = p.stdout.decode('utf-8', 'replace')
         except Exception as e:
             rc, out = None, repr(e)
-        hit_fail = ('[FAIL] %s' % key) in out
+        keys = (key,) if isinstance(key, str) else tuple(key)
+        hit = {k: ('[FAIL] %s' % k) in out for k in keys}
+        miss = [k for k, v in hit.items() if not v]
         tail = [ln.strip() for ln in out.splitlines()
                 if ln.strip().startswith('[FAIL]') or 'WRAPPER_RC' in ln or 'RESULT:' in ln]
-        note(f'{tag} → {target} --sections {secs}：exit={rc}，命中 [FAIL] {key}={hit_fail}；'
+        note(f'{tag} → {target} --sections {secs}：exit={rc}，期望 FAIL={list(keys)}；'
              f'尾部={tail[-3:]}')
-        check(f'J·{tag}：回退场景下 {key} 判据必须 FAIL、该段 exit≠0（非恒真）',
-              rc not in (0, None) and hit_fail, f'exit={rc} 命中={hit_fail}')
+        check(f'J·{tag}：回退场景下 {" / ".join(keys)} 判据必须 FAIL、该段 exit≠0（非恒真）',
+              rc not in (0, None) and not miss, f'exit={rc} 命中={hit} 漏红={miss or "无"}')
 
 
 # ==========================================================================
@@ -1324,6 +1497,10 @@ def main():
     print('=' * 96)
 
     tmp = tempfile.mkdtemp(prefix='indep3_')
+    # 只读约束（HANDOFF-2.1 §8.5 · t11 契约第 7 条）：日志/临时产物只落临时目录，
+    # 不再给项目 error.log 增行。R.HERE 是调用时取模块全局（产品 _write_log 定义 :8485 /
+    # 写盘 :8492），运行期改这一处即可，不必碰产品代码。
+    R.HERE = tmp
     try:
         for s, fn in (('A', sec_A), ('B', sec_B), ('C', sec_C), ('D', sec_D),
                       ('E', sec_E), ('F', sec_F), ('G', sec_G), ('H', sec_H),

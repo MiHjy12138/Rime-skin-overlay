@@ -623,12 +623,41 @@ def section_B(tmp):
               len(side_radios) == 3 and len(lay_radios) == 0,
               f'通用区={side_radios} 图层区={lay_radios}')
         _select(wiz2, 0)
-        wiz2.var_side.set('center')
-        wiz2._update_preview()
-        check('B03 ★主层（第 0 层）贴边改得动：cfg[side] 与 layers[0].anchor 同步为 center',
+        # v2.0-N3 改写**取样通路**（HANDOFF-2.1 §6-13 + t11 契约第 3 条(iii)）：旧取样
+        # `var_side.set('center') + _update_preview()` 靠的是「实现会读 Tk 变量统一全层」——
+        # N3 已明令禁止该行为（_sync_side_to_all_layers 只信 cfg['side']），旧取样在新实现下
+        # **不走用户通路**，留着它等于「改绿了但取样路径是假的」。换成用户真实通路：点 ③ 的单选。
+        _side_rbs = _radio_widgets(wiz2, wiz2.var_side)
+        _rb_mid = _radio_widget(wiz2, wiz2.var_side, '中')
+        check('B03a ③ 的单选组按**变量绑定**定位（绑 var_side 的恰 3 个，其中一个含「中」）',
+              len(_side_rbs) == 3 and _rb_mid is not None,
+              f'{_radio_texts(wiz2, wiz2.var_side)}')
+        _rb_mid.invoke()
+        wiz2.root.update_idletasks()
+        check('B03 ★主层（第 0 层）贴边改得动（点一次 ③「中」）：cfg[side] 与 layers[0].anchor 同步为 center',
               wiz2.cfg.get('side') == 'center'
               and (wiz2.cfg['layers'][0].get('anchor') == 'center'),
               f"side={wiz2.cfg.get('side')} l0={wiz2.cfg['layers'][0].get('anchor')}")
+        # B03b 判别力（§6-13 + t11 契约第 5 条）：把写回打桩成「无论点什么恒写 right_edge」
+        # → B03 的**同款**判据必须 FAIL（证明它不是在验一个恒真式）。测完恢复桩、把状态点回 center。
+        _real_set0 = wiz2._layer_set_params
+
+        def _bad_anchor_set(i, scale=None, offset_x=None, offset_y=None, flip=None, anchor=None):
+            return _real_set0(i, scale=scale, offset_x=offset_x, offset_y=offset_y, flip=flip,
+                              anchor=('right_edge' if anchor is not None else anchor))
+
+        wiz2._layer_set_params = _bad_anchor_set
+        try:
+            _radio_widget(wiz2, wiz2.var_side, '中').invoke()
+            wiz2.root.update_idletasks()
+        finally:
+            wiz2._layer_set_params = _real_set0
+        _bad_l0 = wiz2.cfg['layers'][0].get('anchor')
+        check('B03b ★判别力：把写回打桩成「恒写 right_edge」→ B03 同款判据必须 FAIL（非恒真）',
+              not (wiz2.cfg.get('side') == 'center' and _bad_l0 == 'center'),
+              f'注入后 side={wiz2.cfg.get("side")} l0={_bad_l0}')
+        _radio_widget(wiz2, wiz2.var_side, '中').invoke()      # 恢复状态（层 0 回到 center）
+        wiz2.root.update_idletasks()
         # 运行时落点（不复用实现者测试：走 resolve_layers + plan_layer_layout）
         from PIL import Image as PILImage
         rl = R.resolve_layers(wiz2.cfg)
@@ -636,37 +665,77 @@ def section_B(tmp):
         wx, wy, ww, wh, pl = R.plan_layer_layout(rl, dims, (0, 0, 460, 84))
         pos = {p[0]: (p[1], p[2]) for p in pl}
         exp0x = 0 + (460 - dims[0][0]) // 2 + int(wiz2.cfg.get('offset_x', 0))
-        exp1x = 0 + (460 - dims[1][0]) // 2 + int(rl[1].get('offset_x', 0))
         check('B04 ★主层贴边真的落到运行时画面落点（居中公式逐位一致）',
               abs((wx + pos[0][0]) - exp0x) <= 1,
               f'层0 屏幕 x={wx + pos[0][0]} 期望={exp0x}（画布 {ww}x{wh}）')
-        # v2.0-R11：③ 统一管所有图层 —— 改一次 ③，第 2 层 anchor 也同步为 center、落点走同一套
-        # 居中公式（旧前提「第 2 层保持自己的 left_edge」已被需求推翻）；若统一同步失效，
-        # 第 2 层仍是 left_edge → 本条必红。
-        check('B05 ★R11 后 ③ 统一管所有图层：第 2 层 anchor 同步为 center、落点按居中公式',
-              rl[1]['anchor'] == 'center' and abs((wx + pos[1][0]) - exp1x) <= 1,
+        # v2.0-N3（前提被需求推翻）：③ 的作用对象 = **当前选中层** —— 改主层时第 2 层必须纹丝
+        # 不动（旧断言「第 2 层也同步为 center」固化的是 R11 的统一语义，已被用户第四轮推翻）。
+        # 落点仍按**该层自己的锚点**独立复算（left_edge 公式），不是只查持久值。
+        exp1x = 0 - dims[1][0] - R.DEFAULT_LAYER_GAP + int(rl[1].get('offset_x', 0))
+        check('B05 ★N3 后 ③ 只作用于当前选中层：第 2 层 anchor 保持 left_edge（不被统一），'
+              '落点按 left_edge 公式逐位一致',
+              rl[1]['anchor'] == 'left_edge' and abs((wx + pos[1][0]) - exp1x) <= 1,
               f"l1.anchor={rl[1]['anchor']} x={wx + pos[1][0]} 期望={exp1x}")
-        # 反向：选中第 2 层改居中 → 只改该层
+        # 反向：选中第 2 层点 ③「右」→ 只动该层；主层与顶层 side 一个都不许被带偏
         _select(wiz2, 1)
-        wiz2.var_layer_anchor.set('center')
-        wiz2._on_layer_param_change()
-        check('B06 改第 2 层：只动 layers[1]，主层/顶层 side 不被带偏',
-              wiz2.cfg['layers'][1].get('anchor') == 'center'
-              and wiz2.cfg['layers'][0].get('anchor') == 'center'   # 主层此前被改成 center
+        _radio_widget(wiz2, wiz2.var_side, '右').invoke()
+        wiz2.root.update_idletasks()
+        check('B06 选中第 2 层点 ③「右」：只动 layers[1]（→right_edge），主层保持 center、顶层 side 不被带偏',
+              wiz2.cfg['layers'][1].get('anchor') == 'right_edge'
+              and wiz2.cfg['layers'][0].get('anchor') == 'center'   # 主层此前被点成 center
               and wiz2.cfg.get('side') == 'center',
-              f"l1={wiz2.cfg['layers'][1].get('anchor')} l0={wiz2.cfg['layers'][0].get('anchor')}")
-        # 切层回显
+              f"l1={wiz2.cfg['layers'][1].get('anchor')} l0={wiz2.cfg['layers'][0].get('anchor')} "
+              f"side={wiz2.cfg.get('side')}")
+        # 切层回显（v2.0-N3 改写）：var_layer_anchor = **当前选中层** anchor 的镜像。
+        # 旧断言「各层 anchor 一致」是 R11 的统一语义；新事实下各层本就允许不同，判据改为
+        # 「镜像 == 当前层持久值」并**逐层各量一次**（两层值不同才算数）—— 镜像脱钩、切层不更新
+        # 持久值、或把两层统一成同一个值，都会红。
         _select(wiz2, 0)
-        wiz2.var_side.set('right')
-        wiz2._update_preview()
-        _select(wiz2, 1)
-        # v2.0-R11：var_layer_anchor 降级为「当前层 anchor 的回显镜像」（不再绑任何单选）；
-        # ③ 统一管所有图层 → 各层 anchor 本应一致。镜像值、被镜像的层值、各层一致性三者对齐
-        # 才算「切层不串层」——镜像脱钩或统一同步失效都会红。
         anchors_now = [x.get('anchor') for x in (wiz2.cfg.get('layers') or [])]
-        check('B06b ★切层回显：var_layer_anchor = 该层 anchor 的镜像，且各层一致（③ 统一）',
-              wiz2.var_layer_anchor.get() == anchors_now[1] and len(set(anchors_now)) == 1,
-              f'var_layer_anchor={wiz2.var_layer_anchor.get()!r} anchors={anchors_now}')
+        mirror0 = str(wiz2.var_layer_anchor.get())
+        _select(wiz2, 1)
+        anchors_now2 = [x.get('anchor') for x in (wiz2.cfg.get('layers') or [])]
+        mirror1 = str(wiz2.var_layer_anchor.get())
+        check('B06b ★切层回显：var_layer_anchor == 当前选中层 anchor 的镜像（主层/第 2 层各量一次，'
+              '两层持久值不同才算数）',
+              mirror0 == str(anchors_now[0]) and mirror1 == str(anchors_now2[1])
+              and anchors_now == anchors_now2 and anchors_now[0] != anchors_now[1],
+              f'主层: 镜像={mirror0!r}/持久={anchors_now[0]!r}；'
+              f'第2层: 镜像={mirror1!r}/持久={anchors_now2[1]!r}；各层={anchors_now}')
+        # B06c 判别力（§6-13 + t11 契约第 5 条）：把写回路径打桩回**旧前提**「一处统一管所有
+        # 图层」（R11/R13 语义）→ 上面 B05/B06/B06b 的**同款**判据必须 FAIL。复用同一条表达式，
+        # 不是另写一条恒真保护。
+        def _anchors():
+            return [x.get('anchor') for x in wiz2.cfg['layers']]
+
+        def _only_sel_changed(before, sel, want, expect_side):
+            exp = list(before)
+            exp[sel] = want
+            return _anchors() == exp and wiz2.cfg.get('side') == expect_side
+
+        _real_set = wiz2._layer_set_params
+
+        def _old_unified_set(i, scale=None, offset_x=None, offset_y=None, flip=None, anchor=None):
+            r = _real_set(i, scale=scale, offset_x=offset_x, offset_y=offset_y,
+                          flip=flip, anchor=anchor)
+            if anchor is not None:              # 旧语义：一处统一管所有图层
+                for d in wiz2.cfg['layers']:
+                    d['anchor'] = wiz2._layer_anchor_at(0)
+            return r
+
+        _select(wiz2, 0)
+        _before_b06c = _anchors()
+        wiz2._layer_set_params = _old_unified_set
+        try:
+            _radio_widget(wiz2, wiz2.var_side, '左').invoke()
+            wiz2.root.update_idletasks()
+        finally:
+            wiz2._layer_set_params = _real_set
+        _bad_b06c = _anchors()
+        check('B06c ★判别力：把「只写当前层」打桩回旧前提「一处统一管所有图层」'
+              '→ B05/B06 同款判据 _only_sel_changed() 必须 FAIL',
+              not _only_sel_changed(_before_b06c, 0, 'left_edge', 'left'),
+              f'回退前={_before_b06c} 注入后={_bad_b06c}')
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -846,6 +915,30 @@ def _radio_texts(wiz, var):
         except Exception:
             pass
     return out
+
+
+def _radio_widgets(wiz, var):
+    """按**变量绑定**找单选按钮（不看文案措辞 / 位置 / 实现者命名）"""
+    name = str(var)
+    out = []
+    for w in _all_widgets(wiz.root):
+        try:
+            if w.winfo_class() == 'Radiobutton' and str(w.cget('variable')) == name:
+                out.append(w)
+        except Exception:
+            pass
+    return out
+
+
+def _radio_widget(wiz, var, key):
+    """绑 var 的单选中「文案含 key」的那个（key 只作粗筛，判据本身不绑文案措辞）"""
+    for w in _radio_widgets(wiz, var):
+        try:
+            if key in str(w.cget('text')):
+                return w
+        except Exception:
+            pass
+    return None
 
 
 def _find_widget(wiz, cls=None, text_contains=None):
@@ -1394,14 +1487,45 @@ def section_D(tmp):
                 wiz._apply_skin_to_wizard()
                 a3 = (wiz.var_side.get(), wiz.var_layer_anchor.get(),
                       [x.get('anchor') for x in (wiz.cfg.get('layers') or [])])
-                # v2.0-R11（前提被需求推翻）：③ 统一管所有图层 —— 档案里带顶层 side 时，套用会把
-                # **所有层**的 anchor 统一成 side 的映射（新事实 ['left_edge','left_edge']；旧前提的
-                # 「第 2 层保留档案自己的 right_edge」被 R11 的「③ 统一管所有图层」推翻）。
-                # 往返一致性（a3 == a1）仍是判据：若统一同步失效，第 3 项会退回各层各自的值 → 必红。
-                check('D04 ★皮肤下拉框往返（新档案 2 层 ↔ v1.6 老档案 1 层）：③ 统一同步、往返一致',
-                      a1 == ('left', 'left_edge', ['left_edge', 'left_edge'])
+                # v2.0-N3（前提被需求推翻）：切皮肤**不再**把各层 anchor 统一到档案顶层 side，
+                # 各层保留新档案自己的 anchor（用户要的就是「每张图各自贴边」）—— 只有第 0 层
+                # （主层）由顶层 side 保底归一。旧断言固化的「统一成 ['left_edge','left_edge']」
+                # 是 R11 语义，已被推翻；新断言改为**各层保持档案值 + 往返逐位一致**（强度不降：
+                # 往返一致性、老档案 1 层、顶层 side 都照旧钉住；另加「第 2 层不许被统一」）。
+                check('D04 ★皮肤下拉框往返（新档案 2 层 ↔ v1.6 老档案 1 层）：各层保持档案里'
+                      '各自的 anchor（[left_edge, right_edge] 不被统一）、往返逐位一致',
+                      a1 == ('left', 'left_edge', ['left_edge', 'right_edge'])
                       and a2[0] == 'right' and a2[2] == 1 and a3 == a1,
                       f'new={a1} old={a2} new2={a3}')
+                # D04b 判别力（§6-13 + t11 契约第 5 条）：把切皮肤的两个「保底归一」入口打桩回
+                # **旧前提**「一处统一管所有图层」（R11/R13 语义：读 Tk 变量推全层）→ 上面 D04 的
+                # **同款**判据必须 FAIL。
+                _real_side, _real_flip = (wiz._sync_side_to_all_layers,
+                                          wiz._sync_flip_to_all_layers)
+
+                def _old_sync_side(force=False):
+                    for d in wiz.cfg.get('layers') or []:
+                        d['anchor'] = R.anchor_from_side(str(wiz.var_side.get()))
+                    return True
+
+                def _old_sync_flip(force=False):
+                    for d in wiz.cfg.get('layers') or []:
+                        d['flip'] = bool(wiz.var_flip.get())
+                    return True
+
+                wiz._sync_side_to_all_layers = _old_sync_side
+                wiz._sync_flip_to_all_layers = _old_sync_flip
+                try:
+                    wiz.skin_var.set('D_new')
+                    wiz._apply_skin_to_wizard()
+                finally:
+                    wiz._sync_side_to_all_layers = _real_side
+                    wiz._sync_flip_to_all_layers = _real_flip
+                a_bad_d04 = (wiz.var_side.get(), wiz.var_layer_anchor.get(),
+                             [x.get('anchor') for x in (wiz.cfg.get('layers') or [])])
+                check('D04b ★判别力：把切皮肤打桩回旧前提「一处统一管所有图层」→ D04 同款判据必须 FAIL',
+                      a_bad_d04 != ('left', 'left_edge', ['left_edge', 'right_edge']),
+                      f'注入后={a_bad_d04}')
             finally:
                 kill_wiz(wiz)
         finally:
@@ -1483,6 +1607,9 @@ def main():
         return 1
 
     tmp = tempfile.mkdtemp(prefix='indep_batch1_')
+    # 只读约束（HANDOFF-2.1 §8.5 · t11 契约第 7 条同款）：日志/临时产物只落临时目录，
+    # 不再给项目 error.log 增行（实测：补前单跑 +1616 B / batch3 的 J 段子进程 +940 B）。
+    R.HERE = tmp
     want = {s.strip().upper() for s in a.sections.split(',') if s.strip()}
     try:
         if 'A' in want:
