@@ -593,14 +593,641 @@ def section_B():
         '负控 inter=%d / 正臂 inter=%d' % (neg['inter'], rows[0][3]['inter']))
 
 
+# ==========================================================================
+# C 段 · N3（c38adff）独立验证：③ 贴边方向与水平翻转都只作用于**当前选中层**
+#   规矩：自己造 ≥3 层场景、自己点控件、自己量 `layers[j]['anchor'] / ['flip']` 与顶层键；
+#   不复用实现者（B_test_n3_side_per_layer.py）与 t11 改写过的 13 条断言。
+# ==========================================================================
+C_ANCHOR_WORD = {'left_edge': '左侧', 'right_edge': '右侧', 'center': '中间'}
+C_SIDE_WORD = {'left': '左侧', 'right': '右侧', 'center': '中间'}
+
+
+def c_figs(tmp, n=3):
+    """自造 n 张不同尺寸/颜色的 PNG（自己造夹具，不借实现者的）"""
+    from PIL import Image
+    out = []
+    sizes = [(120, 160), (90, 140), (200, 120)]
+    for i in range(n):
+        p = os.path.join(tmp, 'c_fig_%d.png' % i)
+        w, h = sizes[i % len(sizes)]
+        Image.new('RGBA', (w, h), (30 + i * 70, 90, 200, 255)).save(p)
+        out.append(p)
+    return out
+
+
+def c_walk(w, out=None):
+    out = [] if out is None else out
+    for c in list(w.winfo_children()):
+        out.append(c)
+        c_walk(c, out)
+    return out
+
+
+def c_side_radios(wiz):
+    """绑 var_side 的 Radiobutton（**变量绑定**定位，不看文案/位置）"""
+    return [w for w in c_walk(wiz.root)
+            if w.winfo_class() == 'Radiobutton'
+            and str(w.cget('variable')) == str(wiz.var_side)]
+
+
+def c_radio_selected_text(wiz):
+    """实测控件态（不读 Python 侧 var 对象）：绑 var_side 的单选里，
+    「该控件的 value == 其绑定变量在 Tk 变量表里的当前值」的那一颗就是被选中的。"""
+    sel = []
+    for w in c_side_radios(wiz):
+        try:
+            if str(w.getvar(str(w.cget('variable')))) == str(w.cget('value')):
+                sel.append(str(w.cget('text')))
+        except Exception:
+            pass
+    return sel[0] if len(sel) == 1 else ('<?%s>' % sel)
+
+
+def c_flip_selected(wiz):
+    """实测控件态（不读 Python 侧 var 对象）：绑 var_flip 的勾选框在 Tk 变量表里的实际布尔值。
+    注意：经典 Tk 的 Checkbutton 没有 ttk 的 instate()，故走 getvar(name)。"""
+    chk = getattr(wiz, 'chk_flip', None)
+    if chk is None:
+        return None
+    try:
+        return bool(chk.getvar(str(chk.cget('variable'))))
+    except Exception:
+        return None
+
+
+def c_side_by_word(wiz, word):
+    for w in c_side_radios(wiz):
+        try:
+            if word in str(w.cget('text')):
+                return w
+        except Exception:
+            pass
+    return None
+
+
+def c_build(mod, cfg, skins, tmp):
+    old = getattr(mod, 'SKINS_DIR', None)
+    mod.SKINS_DIR = skins
+    wiz = mod.ConfigWizard(lambda *a: None, None)
+    if old is not None:
+        mod.SKINS_DIR = old
+    import copy
+    wiz.cfg.update(copy.deepcopy(cfg))
+    wiz._layer_sync_from_cfg()
+    wiz.root.update_idletasks()
+    wiz.root.update()
+    return wiz
+
+
+def c_select(wiz, i):
+    wiz.layer_list.selection_clear(0, 'end')
+    wiz.layer_list.selection_set(i)
+    wiz._on_layer_select()
+    wiz.root.update_idletasks()
+    wiz.root.update()
+
+
+def c_layers_cfg(figs, anchors, flips, **top):
+    cfg = {'image': figs[0], 'layout': 'horizontal_double', 'side': 'right', 'layer': 'above',
+           'scale': 1.0, 'offset_x': 0, 'offset_y': 0, 'base_height': 300, 'name': 't12',
+           'schema_version': getattr(R_MOD, 'LAYERS_SCHEMA_VERSION', 2),
+           'flip_h': flips[0],
+           'layers': [{'image': f, 'anchor': a, 'scale': 1.0, 'offset_x': 0,
+                       'offset_y': 0, 'flip': fl}
+                      for f, a, fl in zip(figs, anchors, flips)]}
+    cfg.update(top)
+    return cfg
+
+
+R_MOD = None       # section_C 里赋成被测模块（c_layers_cfg 用它的 schema 常量）
+
+
+def section_C():
+    print('\n=== C 段 · N3 独立验证（③ / 翻转按当前选中层；撤销 R11/R13 统一语义）===')
+    print('自造 3 层夹具、自己点控件、自己量持久值与顶层键；不引用实现者测试的任何数字。\n')
+    global R_MOD
+    mod = load_module(SRC, 'rco_C')
+    R_MOD = mod
+    tmp = os.path.join(TMP, 'c')
+    os.makedirs(tmp, exist_ok=True)
+    skins = os.path.join(tmp, 'skins')
+    os.makedirs(skins, exist_ok=True)
+    figs = c_figs(tmp)
+
+    def anchors(wiz):
+        return [d.get('anchor') for d in wiz.cfg['layers']]
+
+    def flips(wiz):
+        return [bool(d.get('flip')) for d in wiz.cfg['layers']]
+
+    # ---------------- C01/C02 逐层写回：只有当前选中层变 ----------------
+    wiz = c_build(mod, c_layers_cfg(figs, ['right_edge', 'left_edge', 'center'],
+                                    [False, True, False]), skins, tmp)
+    try:
+        print('  [C01/C02 逐层写回]')
+        c_select(wiz, 1)                       # 选中第 2 层
+        b_a, b_f = anchors(wiz), flips(wiz)
+        b_top = (wiz.cfg.get('side'), bool(wiz.cfg.get('flip_h')))
+        c_side_by_word(wiz, '中间').invoke()
+        wiz.root.update_idletasks()
+        a1 = anchors(wiz)
+        c_flip_after_side = flips(wiz)
+        chk('C01 ★选中第 2 层点 ③「中间」：只有 layers[1].anchor 变（其余层与顶层 side 纹丝不动）',
+            a1 == ['right_edge', 'center', 'center'] and a1[0] == b_a[0]
+            and wiz.cfg.get('side') == b_top[0] and c_flip_after_side == b_f,
+            'before=%s → after=%s（顶层 side %r→%r，各层 flip %s 未动）'
+            % (b_a, a1, b_top[0], wiz.cfg.get('side'), c_flip_after_side))
+        b_a = anchors(wiz)
+        cur_f1 = c_flip_selected(wiz)          # 第 2 层当前勾选态（由 fixture 决定）
+        exp_f1 = list(b_f)
+        exp_f1[1] = (not cur_f1)               # Checkbutton.invoke() 是**切换**语义
+        wiz.chk_flip.invoke()
+        wiz.root.update_idletasks()
+        f1 = flips(wiz)
+        chk('C02 ★选中第 2 层切换翻转（%s→%s）：只有 layers[1].flip 变（层 0/2 与顶层 flip_h 纹丝不动）'
+            % (cur_f1, not cur_f1),
+            cur_f1 is not None and f1 == exp_f1 and anchors(wiz) == b_a
+            and bool(wiz.cfg.get('flip_h')) is False,
+            'before=%s → after=%s（期望 %s；顶层 flip_h=%r，anchors 未动=%s）'
+            % (b_f, f1, exp_f1, wiz.cfg.get('flip_h'), anchors(wiz) == b_a))
+        # 换一层再各改一次（证明不是"只对第 2 层生效"的巧合）
+        c_select(wiz, 2)
+        c_side_by_word(wiz, '右侧').invoke()
+        wiz.root.update_idletasks()
+        c_flip_after_side2 = flips(wiz)
+        chk('C02b ★换到第 3 层点 ③「右侧」：只有 layers[2].anchor 变，前两层保持',
+            anchors(wiz) == ['right_edge', 'center', 'right_edge'],
+            'anchors=%s' % anchors(wiz))
+        cur_f2 = c_flip_selected(wiz)
+        exp_f2 = list(c_flip_after_side2)
+        exp_f2[2] = (not cur_f2)
+        wiz.chk_flip.invoke()
+        wiz.root.update_idletasks()
+        chk('C02c ★第 3 层切换翻转（%s→%s）：只有 layers[2].flip 变，层 0/1 保持 %s'
+            % (cur_f2, not cur_f2, c_flip_after_side2[:2]),
+            cur_f2 is not None and flips(wiz) == exp_f2
+            and flips(wiz)[:2] == c_flip_after_side2[:2],
+            'before=%s → after=%s（期望 %s）' % (c_flip_after_side2, flips(wiz), exp_f2))
+
+        # ---------------- C03 R2 断头路：多图层下选中主层也能改得动 ----------------
+        print('  [C03 R2 断头路 · 主层可改]')
+        c_select(wiz, 0)
+        pre_a, pre_f = anchors(wiz), flips(wiz)
+        c_side_by_word(wiz, '左侧').invoke()
+        wiz.root.update_idletasks()
+        a_after = anchors(wiz)
+        chk('C03a ★R2 断头路：选中第 0 层（主层）点 ③「左侧」→ cfg[side] 与 layers[0].anchor 同步改',
+            wiz.cfg.get('side') == 'left' and a_after[0] == 'left_edge'
+            and a_after[1:] == pre_a[1:],
+            'side=%r layers=%s（改前 %s；其余层 %s 未动）'
+            % (wiz.cfg.get('side'), a_after, pre_a, a_after[1:]))
+        wiz.chk_flip.invoke()
+        wiz.root.update_idletasks()
+        f_after = flips(wiz)
+        chk('C03b ★R2 断头路：选中第 0 层勾翻转 → cfg[flip_h] 与 layers[0].flip 同步改，其余层不动',
+            bool(wiz.cfg.get('flip_h')) is True and f_after[0] is True
+            and f_after[1:] == pre_f[1:],
+            'flip_h=%r flips=%s（改前 %s）' % (wiz.cfg.get('flip_h'), f_after, pre_f))
+
+        # ---------------- C04 切层回显：3 层各不同、来回切 3 轮 ----------------
+        print('  [C04 切层回显 · 3 轮]')
+        # 把三层做成**各不相同**：anchor 与 flip 都要有区分度
+        plan = [(0, '右侧', False), (1, '左侧', True), (2, '中间', False)]
+        for i, word, want_flip in plan:
+            c_select(wiz, i)
+            c_side_by_word(wiz, word).invoke()
+            wiz.root.update_idletasks()
+            if c_flip_selected(wiz) != want_flip:
+                wiz.chk_flip.invoke()
+                wiz.root.update_idletasks()
+        a_now, f_now = anchors(wiz), flips(wiz)
+        print('      · 三层持久值：anchors=%s flips=%s' % (a_now, f_now))
+        rounds = []
+        seq = [0, 1, 2, 2, 1, 0, 1, 2, 0]        # 来回切 3 轮
+        ok_all = True
+        for i in seq:
+            c_select(wiz, i)
+            got_word = c_radio_selected_text(wiz)
+            got_flip = c_flip_selected(wiz)
+            want_word = C_ANCHOR_WORD.get(anchors(wiz)[i])
+            want_flip = bool(flips(wiz)[i])
+            ok = (got_word == want_word) and (got_flip == want_flip)
+            ok_all = ok_all and ok
+            rounds.append('层%d: ③=%s(期望%s) 翻转=%s(期望%s) %s'
+                          % (i + 1, got_word, want_word, got_flip, want_flip,
+                             'OK' if ok else '**不一致**'))
+        for r in rounds:
+            print('        %s' % r)
+        chk('C04 ★切层回显 9 次（3 轮）× 3 层：③ 单选选中项与翻转勾选框态都 == 该层持久值',
+            ok_all and len(set(a_now)) == 3 and len(set(f_now)) == 2,
+            'anchors=%s（3 个不同=%s） flips=%s' % (a_now, len(set(a_now)) == 3, f_now))
+        chk('C04b ★切层本身不改写任何持久值（9 次切层后 anchors/flips 逐位不变）',
+            anchors(wiz) == a_now and flips(wiz) == f_now,
+            'anchors=%s flips=%s' % (anchors(wiz), flips(wiz)))
+    finally:
+        close_wizard(wiz)
+
+
+def section_C2():
+    """C05~C09：撤销 5 点（保存 / 存皮肤 / 切皮肤 + 顶层键）与档案往返、旧档案保护。"""
+    print('\n=== C2 段 · 撤销 5 点的独立复核 + 档案往返 + 旧档案原样保留 ===')
+    mod = load_module(SRC, 'rco_C2')
+    tmp = os.path.join(TMP, 'c2')
+    os.makedirs(tmp, exist_ok=True)
+    skins = os.path.join(tmp, 'skins')
+    os.makedirs(skins, exist_ok=True)
+    figs = c_figs(tmp)
+    base = c_layers_cfg(figs, ['right_edge', 'left_edge', 'center'], [False, True, False])
+
+    def anchors(w):
+        return [d.get('anchor') for d in w.cfg['layers']]
+
+    def flips(w):
+        return [bool(d.get('flip')) for d in w.cfg['layers']]
+
+    def make_layer2_center_flip_true(w):
+        """把第 2 层做成 center + flip=True（主层保持 right/False）"""
+        c_select(w, 1)
+        c_side_by_word(w, '中间').invoke()
+        w.root.update_idletasks()
+        if c_flip_selected(w) is not True:
+            w.chk_flip.invoke()
+            w.root.update_idletasks()
+        c_select(w, 1)
+        return w
+
+    # ---------------- C05 保存通路 + 顶层键 ----------------
+    wiz = c_build(mod, base, skins, tmp)
+    cap = {}
+    try:
+        make_layer2_center_flip_true(wiz)
+        pre_a, pre_f = anchors(wiz), flips(wiz)
+        pre_top = (wiz.cfg.get('side'), bool(wiz.cfg.get('flip_h')))
+        print('  [C05 保存通路] 保存前：选中=%s anchors=%s flips=%s 顶层 side=%r flip_h=%r'
+              % (getattr(wiz, '_layer_sel', '?'), pre_a, pre_f, pre_top[0], pre_top[1]))
+        real_sc, real_sa = mod.save_config, mod.set_autostart
+        mod.save_config = lambda c: cap.update({'cfg': c})
+        mod.set_autostart = lambda *a, **k: (True, 'stub(t12)')
+        try:
+            wiz._save_and_start()             # 真实通路（会 destroy 窗口；cfg 引用仍可读）
+        finally:
+            mod.save_config, mod.set_autostart = real_sc, real_sa
+        saved = cap.get('cfg') or {}
+        sv_layers = saved.get('layers') or []
+        chk('C05 ★撤销点「保存」+ 顶层键：选中第 2 层（%s/flip=%s）保存 → 顶层 side/flip_h 取'
+            '**主层**值（%r/%r），各层持久值逐位 == 保存前快照（没被统一、也没把第 2 层顶上去）'
+            % (pre_a[1], pre_f[1], pre_top[0], pre_top[1]),
+            saved.get('side') == pre_top[0] and bool(saved.get('flip_h')) is bool(pre_top[1])
+            and [d.get('anchor') for d in sv_layers] == pre_a
+            and [bool(d.get('flip')) for d in sv_layers] == pre_f
+            and pre_a[1] != pre_top[0] and pre_f[1] != pre_top[1],
+            '落盘 side=%r flip_h=%r layers.anchor=%s layers.flip=%s（保存前 %s / %s；'
+            '第 2 层与主层取值本就不同 ⇒ 断言有区分度）'
+            % (saved.get('side'), saved.get('flip_h'),
+               [d.get('anchor') for d in sv_layers], [bool(d.get('flip')) for d in sv_layers],
+               pre_a, pre_f))
+        # C05b 判别力：把顶层键改回「读 UI 变量」的口径（side_from_anchor 返回当前选中层的
+        # var_side）→ C05 的同一条断言必须 FAIL
+        wiz2 = c_build(mod, base, skins, tmp)
+        try:
+            make_layer2_center_flip_true(wiz2)
+            cap2 = {}
+            real_sfa = mod.side_from_anchor
+            mod.side_from_anchor = lambda anc, _w=wiz2: str(_w.var_side.get())
+            real_sc2, real_sa2 = mod.save_config, mod.set_autostart
+            mod.save_config = lambda c: cap2.update({'cfg': c})
+            mod.set_autostart = lambda *a, **k: (True, 'stub(t12)')
+            try:
+                wiz2._save_and_start()
+            finally:
+                mod.side_from_anchor = real_sfa
+                mod.save_config, mod.set_autostart = real_sc2, real_sa2
+            sv2 = cap2.get('cfg') or {}
+            chk('C05b ★判别力：把顶层键改回「读 UI 变量」→ C05 同款断言必须 FAIL（非恒真）',
+                not (sv2.get('side') == 'right' and bool(sv2.get('flip_h')) is False
+                     and [d.get('anchor') for d in (sv2.get('layers') or [])]
+                     == ['right_edge', 'left_edge', 'center']),
+                '注入后落盘 side=%r flip_h=%r（= 第 2 层的值，正是要被挡住的那种串层）'
+                % (sv2.get('side'), sv2.get('flip_h')))
+        finally:
+            close_wizard(wiz2)
+    finally:
+        close_wizard(wiz)
+
+    # ---------------- C06 存皮肤通路 + 顶层键 + 档案往返 ----------------
+    wiz = c_build(mod, base, skins, tmp)
+    try:
+        make_layer2_center_flip_true(wiz)
+        pre_a6, pre_f6 = anchors(wiz), flips(wiz)
+        pre_top6 = (wiz.cfg.get('side'), bool(wiz.cfg.get('flip_h')))
+        old_sk = mod.SKINS_DIR
+        mod.SKINS_DIR = skins
+        try:
+            okv, nm, msg = wiz._save_skin_named('t12-c06', ask_overwrite=False)
+            back = mod.find_skin(nm or 't12-c06') or {}
+        finally:
+            mod.SKINS_DIR = old_sk
+        bl = back.get('layers') or []
+        chk('C06 ★撤销点「存皮肤」+ 顶层键：第 2 层（%s/flip=%s）时存档案 → 档案顶层 side/flip_h 取'
+            '主层值（%r/%r）、各层持久值逐位 == 存档前快照（不被统一）'
+            % (pre_a6[1], pre_f6[1], pre_top6[0], pre_top6[1]),
+            okv and back.get('side') == pre_top6[0]
+            and bool(back.get('flip_h')) is bool(pre_top6[1])
+            and [d.get('anchor') for d in bl] == pre_a6
+            and [bool(d.get('flip')) for d in bl] == pre_f6
+            and pre_a6[1] != pre_top6[0],
+            '存皮肤 ok=%s 名=%r 档案 side=%r flip_h=%r anchor=%s flip=%s（存档前 %s / %s）msg=%r'
+            % (okv, nm, back.get('side'), back.get('flip_h'),
+               [d.get('anchor') for d in bl], [bool(d.get('flip')) for d in bl],
+               pre_a6, pre_f6, msg))
+        # ---------------- C07 切皮肤通路：各层保持档案值、不被统一 ----------------
+        wiz3 = c_build(mod, c_layers_cfg(figs, ['right_edge'] * 3, [False, False, False]),
+                       skins, tmp)
+        try:
+            old_sk = mod.SKINS_DIR
+            mod.SKINS_DIR = skins
+            try:
+                wiz3.skin_var.set(nm or 't12-c06')
+                wiz3._apply_skin_to_wizard()
+            finally:
+                mod.SKINS_DIR = old_sk
+            wiz3.root.update_idletasks()
+            a3, f3 = anchors(wiz3), flips(wiz3)
+            old_sk = mod.SKINS_DIR
+            mod.SKINS_DIR = skins
+            try:
+                arch = mod.find_skin(nm or 't12-c06') or {}
+            finally:
+                mod.SKINS_DIR = old_sk
+            bl_arch = arch.get('layers') or []
+            chk('C07 ★撤销点「切皮肤」：套用该档案 → 各层保持档案里**各自**的值（不被统一到某一层）、'
+                '顶层 side 随档案主层更新',
+                a3 == [d.get('anchor') for d in bl_arch]
+                and f3 == [bool(d.get('flip')) for d in bl_arch]
+                and wiz3.cfg.get('side') == arch.get('side')
+                and len(set(a3)) >= 2,
+                '切后 anchors=%s flips=%s（档案 %s / %s）；顶层 side=%r（档案 %r，≥2 种取值=%s）'
+                % (a3, f3, [d.get('anchor') for d in bl_arch],
+                   [bool(d.get('flip')) for d in bl_arch], wiz3.cfg.get('side'),
+                   arch.get('side'), len(set(a3)) >= 2))
+            # ---------------- C08 档案往返：再存一次 → 逐层一致 ----------------
+            old_sk = mod.SKINS_DIR
+            mod.SKINS_DIR = skins
+            try:
+                okv2, nm2, _ = wiz3._save_skin_named('t12-c08', ask_overwrite=False)
+                back2 = mod.find_skin(nm2 or 't12-c08') or {}
+            finally:
+                mod.SKINS_DIR = old_sk
+            bl2 = back2.get('layers') or []
+            chk('C08 ★档案往返（存→读→再存→再读）：各层 anchor/flip 与顶层 side/flip_h 逐位一致',
+                okv2 and [d.get('anchor') for d in bl2] == a3
+                and [bool(d.get('flip')) for d in bl2] == f3
+                and back2.get('side') == wiz3.cfg.get('side')
+                and bool(back2.get('flip_h')) is bool(wiz3.cfg.get('flip_h')),
+                '往返 anchor=%s flip=%s side=%r flip_h=%r'
+                % ([d.get('anchor') for d in bl2], [bool(d.get('flip')) for d in bl2],
+                   back2.get('side'), back2.get('flip_h')))
+        finally:
+            close_wizard(wiz3)
+    finally:
+        close_wizard(wiz)
+
+    # ---------------- C09 旧档案（R11 前的左右夹持）原样保留 ----------------
+    wiz = c_build(mod, base, skins, tmp)
+    try:
+        pre_a, pre_f = anchors(wiz), flips(wiz)
+        wiz._update_preview()
+        wiz.root.update_idletasks()
+        for _ in range(3):                        # 连刷 3 次预览（历史 bug：重绘时静默改写）
+            wiz._update_preview()
+            wiz.root.update_idletasks()
+        a9, f9 = anchors(wiz), flips(wiz)
+        top9 = (wiz.cfg.get('side'), bool(wiz.cfg.get('flip_h')))
+        chk('C09 ★旧档案（各层 anchor 不同的左右夹持）打开 + 连刷 3 次预览：'
+            '逐层持久值一个没被静默改写、顶层键也没被某个子层的值顶替',
+            a9 == pre_a and f9 == pre_f and top9 == ('right', False),
+            '打开 %s / %s → 刷 3 次后 %s / %s；顶层 side=%r flip_h=%r'
+            % (pre_a, pre_f, a9, f9, top9[0], top9[1]))
+        chk('C09b ★反面对照：这份档案两次读出的值本身就"各层不同"（不是恒真）',
+            len(set(pre_a)) == 3 and len(set(pre_f)) == 2,
+            'anchors=%s flips=%s' % (pre_a, pre_f))
+    finally:
+        close_wizard(wiz)
+
+
+def c_y_prefix(wiz, ch):
+    """窗口里所有以 ch 开头的带字控件的最小屏幕 y（判编号行上下顺序）"""
+    ys = []
+    for w in c_walk(wiz.root):
+        try:
+            if w.winfo_class() in ('Label', 'Button', 'Checkbutton', 'Radiobutton') \
+                    and str(w.cget('text')).startswith(ch):
+                ys.append(int(w.winfo_rooty()))
+        except Exception:
+            pass
+    return min(ys) if ys else None
+
+
+def section_C3():
+    """C10~C13：三态窗口高（两臂对照）/ 控件形态 / 运行时逐层读锚点 / 判别力总验。"""
+    print('\n=== C3 段 · 三态高度（两臂对照）+ 控件形态 + 运行时逐层读锚点 + 判别力总验 ===')
+    mod = load_module(SRC, 'rco_C3')
+    tmp = os.path.join(TMP, 'c3')
+    os.makedirs(tmp, exist_ok=True)
+    skins = os.path.join(tmp, 'skins')
+    os.makedirs(skins, exist_ok=True)
+    figs = c_figs(tmp)
+    base = c_layers_cfg(figs, ['right_edge', 'left_edge', 'center'], [False, True, False])
+    PREV = '74f225f'                     # c38adff 的父提交（N2 之后、N3 之前）= 同场景基线
+
+    def tri(modx, tag):
+        """三态量测：折叠（构造完默认）/ 展开 / top_block（预览块）"""
+        w = c_build(modx, base, skins, tmp)
+        try:
+            w.root.update_idletasks()
+            w.root.update()
+            col = int(w.root.winfo_reqheight())
+            tb = int(w.top_block.winfo_reqheight()) if getattr(w, 'top_block', None) else -1
+            w._toggle_adv_collapse(False)
+            w.root.update_idletasks()
+            w.root.update()
+            exp = int(w.root.winfo_reqheight())
+            w._toggle_adv_collapse(True)
+            w.root.update_idletasks()
+            w.root.update()
+            col2 = int(w.root.winfo_reqheight())
+            print('      · %-10s 折叠=%spx 展开=%spx 再折叠=%spx top_block=%spx'
+                  % (tag, col, exp, col2, tb))
+            return {'col': col, 'exp': exp, 'col2': col2, 'top': tb}
+        finally:
+            close_wizard(w)
+
+    cur = tri(mod, 'current')
+    prev_path = extract_commit_file(PREV, 'rime_char_overlay.py', os.path.join(TMP, 'prev_n3'))
+    prev = tri(load_module(prev_path, 'rco_C3_prev'), 'prev %s' % PREV)
+    chk('C10 ★三态高度不退化（同场景两臂对照：当前 vs %s）：折叠态 ≤ 基线、展开态 ≤ 基线、'
+        '折叠确实生效（展开 − 折叠 ≥ 200px）' % PREV,
+        cur['col'] > 0 and cur['col'] <= prev['col'] and cur['exp'] <= prev['exp']
+        and (cur['exp'] - cur['col']) >= 200 and cur['col2'] == cur['col'],
+        '当前 折叠=%s 展开=%s / 基线%s 折叠=%s 展开=%s（差 %+d / %+d），top_block 当前=%s 基线=%s'
+        % (cur['col'], cur['exp'], PREV, prev['col'], prev['exp'],
+           cur['col'] - prev['col'], cur['exp'] - prev['exp'], cur['top'], prev['top']))
+
+    # ---------------- C10b 小屏（工作区 728）：折叠态不滚动、按钮行底边在窗内 ----------------
+    real_wh = mod.screen_work_area_height
+    mod.screen_work_area_height = lambda root=None: 728
+    w_small = None
+    try:
+        w_small = c_build(mod, base, skins, tmp)
+        w_small.root.update_idletasks()
+        w_small.root.update()
+        small_req = int(w_small.root.winfo_reqheight())
+        win_h = int(w_small.root.winfo_height())
+        win_top = int(w_small.root.winfo_rooty())
+        eff_h = win_h if win_h > 1 else small_req          # 未 map 时退回需求高
+        scroll = bool(getattr(w_small, '_scroll_needed', False))
+        _b, row = find_bottom_row(w_small)
+        # 口径修正：winfo_rooty 是**屏幕**坐标（窗口会被居中放置，不能直接与工作区高比）；
+        # 要量的是「底部按钮行相对窗口顶的底边 ≤ 窗口实际高」= 窗内可见。
+        row_rel = ((int(row.winfo_rooty()) + int(row.winfo_height()) - win_top)
+                   if row is not None else -1)
+        print('      · 小屏(工作区 728)：折叠态 req_h=%s win_h=%s _scroll_needed=%s '
+              '按钮行底边（相对窗口顶）=%s' % (small_req, win_h, scroll, row_rel))
+        chk('C10b ★小屏 728：折叠态不滚动（_scroll_needed False）、窗口实际高 ≤ 728、'
+            '底部按钮行在窗内可见（相对窗口的底边 ≤ 窗口高）',
+            scroll is False and 0 < eff_h <= 728 and 0 < row_rel <= eff_h,
+            'req_h=%s win_h=%s(取用 %s) scroll=%s 按钮行底边(窗内)=%s（工作区 728）'
+            % (small_req, win_h, eff_h, scroll, row_rel))
+    finally:
+        mod.screen_work_area_height = real_wh
+        if w_small is not None:
+            close_wizard(w_small)
+
+    # ---------------- C11 控件形态：③ 只一处 + 形态 + 文案 ----------------
+    wiz = c_build(mod, base, skins, tmp)
+    try:
+        wiz._toggle_adv_collapse(False)
+        wiz.root.update_idletasks()
+        wiz.root.update()
+        rbs = c_side_radios(wiz)
+        flip_chks = [x for x in c_walk(wiz.root)
+                     if x.winfo_class() == 'Checkbutton'
+                     and str(x.cget('variable')) == str(wiz.var_flip)]
+        lay_rbs = [x for x in c_walk(wiz.root)
+                   if x.winfo_class() == 'Radiobutton'
+                   and str(x.cget('variable')) == str(wiz.var_layer_anchor)]
+        side_v, flip_v = str(wiz.var_side), str(wiz.var_flip)
+        # 「形态仍是单选组 + 勾选框」：① 该行容器内只允许 Label/Radiobutton/Checkbutton/Frame；
+        # ② 不允许下拉框/组合框绑这两个变量（Listbox/Menu 没有 -variable，用容器类集合兜住）
+        weird = []
+        for x in c_walk(wiz.root):
+            if x.winfo_class() not in ('OptionMenu', 'TCombobox'):
+                continue
+            try:
+                if str(x.cget('variable')) in (side_v, flip_v):
+                    weird.append(x.winfo_class())
+            except Exception:
+                pass
+        row_side = rbs[0].master if rbs else None
+        row_kinds = sorted({x.winfo_class() for x in c_walk(row_side)}) \
+            if row_side is not None else []
+        y2, y3, y4 = c_y_prefix(wiz, '②'), c_y_prefix(wiz, '③'), c_y_prefix(wiz, '④')
+        t_side = str(wiz.lbl_side_title.cget('text'))
+        t_flip = str(wiz.chk_flip.cget('text'))
+        c_select(wiz, 1)
+        t_side2 = str(wiz.lbl_side_title.cget('text'))
+        t_flip2 = str(wiz.chk_flip.cget('text'))
+        c_select(wiz, 2)
+        t_side3 = str(wiz.lbl_side_title.cget('text'))
+        print('      · ③ 单选=%d 个（图层区绑 var_layer_anchor 的单选=%d）；编号行 y：②=%s ③=%s ④=%s'
+              % (len(rbs), len(lay_rbs), y2, y3, y4))
+        print('      · 文案：主层 ③=%r 翻转=%r / 第 2 层 ③=%r 翻转=%r / 第 3 层 ③=%r'
+              % (t_side, t_flip, t_side2, t_flip2, t_side3))
+        chk('C11 ★控件形态：③ 只出现一处（绑 var_side 的恰 3 个单选；图层区无第二套 = 0 个）、'
+            '③ 在 ② 与 ④ 之间、形态仍是单选组 + 勾选框（③ 所在行内只有 Label/Radiobutton/'
+            'Checkbutton/Frame，且无下拉框/组合框绑这两个变量）',
+            len(rbs) == 3 and len(flip_chks) == 1 and len(lay_rbs) == 0 and not weird
+            and set(row_kinds) <= {'Label', 'Radiobutton', 'Checkbutton', 'Frame'}
+            and None not in (y2, y3, y4) and y2 < y3 < y4,
+            '③单选=%d 翻转勾选=%d 图层区单选=%d 异常形态=%s ③行控件类=%s y(②<③<④)=%s<%s<%s'
+            % (len(rbs), len(flip_chks), len(lay_rbs), weird or '无', row_kinds, y2, y3, y4))
+        chk('C11b ★两控件文案标出「第 N 层」并随选中层更新（主层/第 2 层/第 3 层各读一次），'
+            '且都不含「所有图层」字样',
+            ('第 1 层' in t_side and '第 2 层' in t_side2 and '第 3 层' in t_side3
+             and '第 1 层' in t_flip and '第 2 层' in t_flip2)
+            and ('所有图层' not in t_side and '所有图层' not in t_side2
+                 and '所有图层' not in t_side3 and '所有图层' not in t_flip
+                 and '所有图层' not in t_flip2),
+            '③ 文案=%r/%r/%r 翻转=%r/%r' % (t_side, t_side2, t_side3, t_flip, t_flip2))
+
+        # ---------------- C12 运行时逐层读锚点（行为对照，不复算公式） ----------------
+        cfg_a = c_layers_cfg(figs, ['right_edge', 'center', 'right_edge'], [False, False, False])
+        cfg_b = c_layers_cfg(figs, ['right_edge', 'left_edge', 'right_edge'], [False, False, False])
+
+        def plan_x(cfgx):
+            rl = mod.resolve_layers(dict(cfgx))
+            dims = []
+            from PIL import Image
+            for ld in rl:
+                with Image.open(ld['image']) as im:
+                    dims.append((im.size[0], im.size[1]))
+            wx, wy, ww, wh, pl = mod.plan_layer_layout(rl, dims, (0, 0, 460, 84))
+            return {p[0]: wx + p[1] for p in pl}, [d.get('anchor') for d in rl]
+
+        xa, aa = plan_x(cfg_a)
+        xb, ab = plan_x(cfg_b)
+        only1 = all(xa[j] == xb[j] for j in (0, 2))
+        chk('C12 ★运行时逐层读锚点（on-layer anchor 真的决定落点，不是全层同一个）：'
+            '只把 layers[1].anchor 从 center 改成 left_edge → 只有第 2 层落点左移、层 0/2 不动',
+            aa == ['right_edge', 'center', 'right_edge'] and ab[1] == 'left_edge'
+            and only1 and xb[1] < xa[1],
+            'anchors %s→%s；x %s→%s（第 2 层 %s→%s，左移=%s）'
+            % (aa, ab, xa, xb, xa[1], xb[1], xb[1] < xa[1]))
+
+        # ---------------- C13 判别力总验：打桩回退成「写全部层」→ C01 判据必须 FAIL ----------------
+        c_select(wiz, 1)
+        before = [d.get('anchor') for d in wiz.cfg['layers']]
+        real_set = wiz._layer_set_params
+
+        def _old_all(i, scale=None, offset_x=None, offset_y=None, flip=None, anchor=None):
+            r = real_set(i, scale=scale, offset_x=offset_x, offset_y=offset_y,
+                         flip=flip, anchor=anchor)
+            if anchor is not None:
+                for d in wiz.cfg['layers']:
+                    d['anchor'] = wiz._layer_anchor_at(0)
+            if flip is not None:
+                for d in wiz.cfg['layers']:
+                    d['flip'] = bool(wiz.cfg.get('flip_h', False))
+            return r
+
+        wiz._layer_set_params = _old_all
+        try:
+            c_side_by_word(wiz, '中间').invoke()
+            wiz.root.update_idletasks()
+        finally:
+            wiz._layer_set_params = real_set
+        aft = [d.get('anchor') for d in wiz.cfg['layers']]
+        exp = list(before)
+        exp[1] = 'center'
+        chk('C13 ★判别力总验：把「只写当前层」打桩回退成「写全部层」→ C01 同款判据必须 FAIL（非恒真）',
+            aft != exp,
+            '回退前=%s 注入后=%s（期望若只改第 2 层应为 %s）' % (before, aft, exp))
+    finally:
+        close_wizard(wiz)
+
+
 def main():
-    which = [a.upper() for a in sys.argv[1:]] or ['A', 'B']
+    which = [a.upper() for a in sys.argv[1:]] or ['A', 'B', 'C']
     print('B_test_indep_batch4.py ｜ 第四轮独立探针 ｜ tempdir=%s' % TMP)
     print('被测源码: %s' % SRC)
     if 'A' in which:
         section_A()
     if 'B' in which:
         section_B()
+    if 'C' in which:
+        section_C()
+        section_C2()
+        section_C3()
     print('\n=== RESULT: %s（%d 条 FAIL）===' % ('FAIL' if FAILED else 'PASS', len(FAILED)))
     if FAILED:
         for t, d in FAILED:
