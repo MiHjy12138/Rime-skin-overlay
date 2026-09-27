@@ -494,6 +494,9 @@ def main():
     print('=== B_test_r13_flip：R13 水平翻转回通用区 + 统一管所有图层 ===')
     print('Python', sys.version.split()[0])
     tmp = tempfile.mkdtemp(prefix='r13_flip_')
+    # 只读约束（HANDOFF-2.1 §8.5 · t15）：日志/临时产物只落临时目录，不碰项目 error.log。
+    # 产品 _write_log 是调用时取模块全局 HERE，运行期改这一处即可（不改产品代码）。
+    R.HERE = tmp
     gui_ok = _has_gui()
     print('GUI 可用:', gui_ok, '| 临时目录:', tmp)
     saved = {}

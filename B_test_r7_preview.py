@@ -602,6 +602,9 @@ def main():
     print('=== B_test_r7_preview：R7 向导预览改回纯色底（去棋盘格）===')
     print('Python', sys.version.split()[0], '| PIL 可用:', PIL_OK)
     tmp = tempfile.mkdtemp(prefix='r7_preview_')
+    # 只读约束（HANDOFF-2.1 §8.5 · t15）：日志/临时产物只落临时目录，不碰项目 error.log。
+    # 产品 _write_log 是调用时取模块全局 HERE，运行期改这一处即可（不改产品代码）。
+    R.HERE = tmp
     gui_ok = _has_gui()
     print('GUI 可用:', gui_ok, '| 临时目录:', tmp)
     saved = {}

@@ -14,7 +14,7 @@ B_test_follow_sim.py —— 路径 B 改造验证（第三步）
 
 用法: python B_test_follow_sim.py
 """
-import sys, os, time, ctypes
+import sys, os, time, ctypes, tempfile
 import ctypes.wintypes as wintypes
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +41,13 @@ try:
 except Exception as e:
     old = None
     print('bak-b 加载失败（对照采样跳过）:', e)
+
+# 只读约束（HANDOFF-2.1 §8.5 · t15）：日志/临时产物只落临时目录，不碰项目 error.log。
+# 产品 _write_log 是调用时取模块全局 HERE，运行期改这一处即可（不改产品代码）。
+_TMP = tempfile.mkdtemp(prefix='follow_sim_')
+m.HERE = _TMP
+if old is not None:
+    old.HERE = _TMP
 
 # ---------- 假候选框窗口（真实 Win32 顶层窗口，类名 ATL: + 候选框样式）----------
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, wintypes.HWND, wintypes.UINT,

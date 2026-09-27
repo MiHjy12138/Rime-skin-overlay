@@ -227,6 +227,10 @@ def test_tray_mode(tmp):
 
 def main():
     tmp = tempfile.mkdtemp(prefix='fixes_')
+    # 只读约束（HANDOFF-2.1 §8.5 · t15）：日志/临时产物只落临时目录，不碰项目 error.log。
+    # 产品 _write_log / ImagePreprocessDialog._apply 都是调用时取模块全局 HERE
+    # （:8599 / :4436），运行期改这一处即可 —— 预处理 png 与配置窗日志都不再落项目目录。
+    R.HERE = tmp
     print('=' * 60)
     test_anim_preprocess(tmp)
     test_wizard_guard(tmp)

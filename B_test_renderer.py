@@ -101,6 +101,9 @@ def main():
         return 0
 
     tmp = tempfile.mkdtemp(prefix='renderer_test_')
+    # 只读约束（HANDOFF-2.1 §8.5 · t15）：日志/临时产物只落临时目录，不碰项目 error.log。
+    # 产品 _write_log 是调用时取模块全局 HERE，运行期改这一处即可（不改产品代码）。
+    R.HERE = tmp
     img_path = os.path.join(BASE, 'char.png')
     if not os.path.exists(img_path):     # 夹具兜底（160x240 透明底 RGBA）
         Image.new('RGBA', (160, 240), (0, 0, 0, 0)).save(img_path)

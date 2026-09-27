@@ -431,6 +431,9 @@ def main():
 
     chk = Checker()
     tmp = tempfile.mkdtemp(prefix='r14_flicker_')
+    # 只读约束（HANDOFF-2.1 §8.5 · t15）：日志/临时产物只落临时目录，不碰项目 error.log。
+    # 产品 _write_log 是调用时取模块全局 HERE，运行期改这一处即可（不改产品代码）。
+    m.HERE = tmp
     cands = []
     ovs = []
     try:
