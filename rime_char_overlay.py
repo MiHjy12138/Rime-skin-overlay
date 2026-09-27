@@ -5612,6 +5612,10 @@ class ConfigWizard:
 
         v2.0-R7：底从 R1 的棋盘格改回**纯色底**（= 画布底色）—— 用户把棋盘格当成了「不透明」，
         明确要求预览里不要棋盘格；合成口径（上面那两步）不变，只换底。
+
+        v2.0-R15 / N2：本函数只负责**颜色合成口径**（输出 RGB；判据 D2 与 r7/batch 的口径断言
+        都读它）。最终真正贴到画布上的那一份由 `_preview_display_img()` 在本产物之上装回
+        alpha 掩膜（带 alpha 的抠图不再整块盖住模拟候选框），见该函数。
         """
         try:
             return compose_on_solid(self._preview_render_mode_img(img),
@@ -5621,6 +5625,37 @@ class ConfigWizard:
                 return img.convert('RGB')
             except Exception:
                 return img
+
+    def _preview_display_img(self, img):
+        """预览「真正贴到画布上」的那一份：纯色底合成 + **装回 alpha 掩膜**（v2.0-R15 / N2）。
+
+        用户第四轮原话：「预处理后的图片和本身带透明通道的图片在预览框都盖住了输入法本身，
+        人物边缘已抠但依然盖着，只影响预览，不影响实际体验。」
+        根因不在绘制顺序，而在**合成把 alpha 拍平**（t1 三臂判别实验：同一画布/同一位置/同一
+        绘制顺序，唯一变量 = 是否先合成 —— solid 臂盖住、rgba 臂透出）：`_preview_compose()`
+        给的是不透明 RGB，Tk 视其为整块不透明位图 → 连图片自身 alpha==0 的抠图边缘也一起盖住
+        下层的模拟候选框。
+
+        这里在合成的**颜色**之上把「与渲染模式对齐」的 alpha 掩膜装回去（= t1 的 armB 口径）：
+          · alpha==0 的真透明像素 → 放行下层（候选框在预览里完整可见）；
+          · 半透明像素 → 按 alpha 与下层混合（与运行时分层窗的逐像素 alpha 行为一致）；
+          · 颜色仍来自 `_preview_compose()` —— R1 的「兼容=硬边点阵 / 增强=平滑过渡」在画布
+            底色上逐位不变（compat 的掩膜是二值化后的 alpha，增强是逐像素 alpha）。
+
+        为什么放在**显示端**而不是塞进 `_preview_compose()`：
+          · `_preview_compose()` 的 RGB 输出就是「合成口径」本身：N2 判据的 D2（合成产物无
+            alpha）与 r7 / batch3 的口径断言都读它，改成 RGBA 会把合成事实与显示行为混为一谈；
+          · 显示路径仍经过 `_preview_compose()`，r7 B06 / batch3 A10 那种「把预览合成换成
+            棋盘格 → 显示端必须跟着变」的 monkeypatch 判别力才保得住。
+        """
+        comp = self._preview_compose(img)
+        try:
+            mask = self._preview_render_mode_img(img).split()[3]
+            out = comp.convert('RGBA')
+            out.putalpha(mask)          # alpha==0 放行下层；半透明按 alpha 混合
+            return out
+        except Exception:
+            return comp
 
     def _effects_cfg(self):
         """向导里的特效参数（与 config 同名字段，可直接喂给 apply_display_effects）
@@ -6680,8 +6715,9 @@ class ConfigWizard:
                             continue
                         dx, dy = pos.get(k, (0, 0))
                         px, py = base_x + wx0 + dx, base_y + wy0 + dy
-                        # v2.0-R7：预览先合成到画布底色再显示（Tk 图片丢 alpha，白底上看不出透明/半透明）
-                        tk_im = self._ImageTk.PhotoImage(self._preview_compose(im),
+                        # v2.0-R7 合成到画布底色 + v2.0-R15/N2 装回 alpha 掩膜
+                        # （每层各装各的：透明处放行下层，候选框/下层图都不会被整块盖住）
+                        tk_im = self._ImageTk.PhotoImage(self._preview_display_img(im),
                                                          master=self.root)
                         self._photo_refs.append(tk_im)
                         if len(self._photo_refs) > MAX_LAYERS + 2:
@@ -6741,8 +6777,9 @@ class ConfigWizard:
                     ix = base_x + (cw - new_w) // 2 + offx
                 iy = base_y + (ch - new_h) // 2 + offy
                 # 预览不加光环（实际运行时有皮肤联动光环）
-                # v2.0-R7：合成到画布底色再显示 —— 兼容 = 硬边点阵、增强 = 颜色到底色的平滑过渡
-                self.tk_img = self._ImageTk.PhotoImage(self._preview_compose(img),
+                # v2.0-R7：合成到画布底色（兼容 = 硬边点阵、增强 = 颜色到底色的平滑过渡）
+                # v2.0-R15/N2：显示端再装回 alpha 掩膜 —— 抠图/透明边不再整块盖住模拟候选框
+                self.tk_img = self._ImageTk.PhotoImage(self._preview_display_img(img),
                                                        master=self.root)
                 self._photo_refs.append(self.tk_img)
                 if len(self._photo_refs) > 3:
