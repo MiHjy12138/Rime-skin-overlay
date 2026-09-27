@@ -5,7 +5,9 @@ B_test_layer_sim.py —— v1.5 图层(below/above)功能验证（模拟窗口�
 在无真实小狼毫候选框的环境用「假候选框」窗口验证图层插序语义：
   S1  below + 贴边=中间 + 候选框【置顶】   → 图片窗插到候选框正下方（被压）
   S2  below + 贴边=中间 + 候选框【非置顶】 → 图片窗保持 topmost（保底分支）
-  S3  below + 贴边=左/右 + 候选框置顶      → 仍 topmost（不重叠不插序，v1.3 教训）
+  S3  below + 贴边=左/右 + 候选框置顶 → 保持 topmost（不重叠不插序 = v1.3 教训）；
+      v2.0-N4 起补一句：若此刻**被候选框压住**则夺回顶部（保上分支），未被压时
+      仍是 0 次 SetWindowPos（纯副作用禁令保留）
   S4  above（默认）全场景                  → 始终 topmost（v1.4 回归）
   S5  候选框销毁重建（GONE+SHOW 事件注入） → _event_tick 自愈重插到新候选框下
   S6  心跳漂移：below+center 被打乱后 _ensure_topmost_if_needed 只重插不拉顶；
@@ -307,9 +309,52 @@ def main():
         before = _covers(cand1.hwnd, top3)
         ov3._apply_layer(cand1.hwnd)
         after = _covers(cand1.hwnd, top3)
-        chk.check(after == before, 'side=left 时 apply_layer 不改动 z-order（纯副作用被禁止）',
+        # v2.0-N4 改写（旧前提被真机数据推翻）：本段旧断言把「above/侧贴边时
+        # _apply_layer 不动 z-order」当成不变量 —— 但 N4 的「保上」分支恰恰要求在
+        # **图片窗被候选框压住**时夺回顶部（t9 真机：小狼毫每次合成都新建候选框窗口，
+        # 天然落在 z-order 顶部）。改写为两条条件式（强度更高，不是放宽）：
+        #   ① 被压 → 必须夺回顶部；② 未被压 → 一次 SetWindowPos 都不发（纯副作用禁令保留）。
+        chk.check(before and not after,
+                  'side=left 被压时 apply_layer 夺回顶部（N4 保上分支，不再等 200ms 心跳）',
                   f'covers before={before} after={after}')
         chk.check(_is_topmost(top3), 'left 贴边 apply 后仍 topmost')
+        # ② 未被压时：z-order 不动 **且** 0 次 SetWindowPos（纯副作用仍被禁止）
+        _real_swp = m.user32.SetWindowPos
+        _swp_calls = []
+
+        def _spy_swp(hwnd, after_i, x, y, cx, cy, flags):
+            try:
+                _swp_calls.append((int(hwnd or 0), int(after_i or 0), int(flags)))
+            except Exception:
+                _swp_calls.append((0, 0, 0))
+            return _real_swp(hwnd, after_i, x, y, cx, cy, flags)
+        m.user32.SetWindowPos = _spy_swp
+        try:
+            for _i in range(10):
+                ov3._apply_layer(cand1.hwnd)
+        finally:
+            m.user32.SetWindowPos = _real_swp
+        chk.check(not _swp_calls,
+                  'side=left 未被压时 apply_layer 0 次 SetWindowPos（纯副作用仍被禁止）',
+                  f'调用={_swp_calls}')
+        # 判别力：把「保上」分支 monkeypatch 掉（回 N4 前行为）→ 上面①必须不成立
+        _real_apply = m.FollowOverlay._apply_layer
+
+        def _no_reclaim(self, cand_hwnd, *_a, **_k):
+            if not (self.layer == 'below' and self.cfg.get('side', 'right') == 'center'):
+                return None            # above/侧贴边：N4 之前就是「什么都不做」
+            return _real_apply(self, cand_hwnd, *_a, **_k)
+        cand1.make_topmost()
+        try:
+            m.FollowOverlay._apply_layer = _no_reclaim
+            blocked0 = _covers(cand1.hwnd, top3)
+            ov3._apply_layer(cand1.hwnd)
+            still = _covers(cand1.hwnd, top3)
+        finally:
+            m.FollowOverlay._apply_layer = _real_apply
+        chk.check(blocked0 and still,
+                  '判别力：保上分支被 monkeypatch 掉后「被压不再夺回」（①非恒真）',
+                  f'blocked={blocked0} still={still}')
         cfg3['side'] = 'right'
         ov3.layer = 'below'
         _attach(ov3, cand1)
@@ -321,7 +366,9 @@ def main():
         cand1.make_topmost()
         before = _covers(cand1.hwnd, top3)
         ov3._apply_layer(cand1.hwnd)
-        chk.check(_covers(cand1.hwnd, top3) == before, 'side=right 时 apply_layer 不改动 z-order')
+        chk.check(before and not _covers(cand1.hwnd, top3),
+                  'side=right 被压时 apply_layer 夺回顶部（N4 保上分支）',
+                  f'covers before={before} after={_covers(cand1.hwnd, top3)}')
         chk.check(_is_topmost(top3), 'right 贴边 apply 后仍 topmost')
         _kill_overlay(ov3)
         overlays.remove(ov3)

@@ -8258,7 +8258,8 @@ class FollowOverlay:
                             # R14：窗口没动，但本帧可能换了内容（布局变、尺寸不变）→ 仍要上屏
                             self._flush_tk_geometry()
                             self._push_render_frame_if_composed()
-                            self._apply_layer(self._cached_hwnd)  # 成功定位后同步图层（事件驱动，频率低）
+                            # 成功定位后同步图层（事件驱动，频率低）；N4：死区也要夺回顶部
+                            self._apply_layer(self._cached_hwnd, 'deadzone')
                             return True
                         moved = self._move_to(x, y, w, h)
                         self._pos_dirty = False
@@ -8272,7 +8273,8 @@ class FollowOverlay:
                         if PERF_LOG_ENABLED and moved:
                             _perf_log(f'  ├ SetWindowPos -> ({x},{y})')
                         self._push_render_frame()  # 移动/首显后重推位图（compat 无操作）
-                        self._apply_layer(self._cached_hwnd)  # 移动/首显后同步图层（above=无操作）
+                        # 移动/首显后同步图层；N4：被新候选窗压住时同 tick 夺回顶部
+                        self._apply_layer(self._cached_hwnd, 'move')
                         return True
                     # 矩形异常（非候选框尺寸）→ 缓存失效
                     self._cached_hwnd = 0
@@ -8307,8 +8309,9 @@ class FollowOverlay:
             _write_log(f'[候选框] SHOW 直挂 hwnd=0x{hwnd:X} {_describe_window(hwnd)}')
             self._position_once()
             # SHOW 直挂后补一次图层插序：候选框重建自愈（v1.4 相对 v1.2 的关键优势）
+            # N4：新候选窗天然在 z-order 顶部 ⇒ 这一步也要把图片窗夺回顶部
             if self.visible:
-                self._apply_layer(hwnd)
+                self._apply_layer(hwnd, 'show')
             return True
         except Exception:
             return False
@@ -8343,34 +8346,70 @@ class FollowOverlay:
         return True
 
     # ---------- 图层（v1.5：自 v1.2 恢复，事件驱动下候选框重建可自愈）----------
-    def _apply_layer(self, cand_hwnd):
-        """图层层级（事件驱动调用，频率低，不再每拍无条件执行）：
-        above：移动路径已自带 HWND_TOPMOST = 天然在候选框上方，不做任何额外动作；
-        below：仅在 贴边=中间（图片与候选框重叠）时有意义（v1.3 教训）：
-          - 候选框是置顶(WS_EX_TOPMOST) → 把图片窗插到其正下方（已紧贴则不重插）；
-          - 候选框非置顶 → below 不可用，保持图片窗 topmost 保底可见（节流记日志）。
-        左/右贴边（与候选框不重叠）时执行任何插序都是纯副作用 → 保持 topmost。"""
+    def _is_covered_by_candidate(self, top, cand_hwnd, limit=24):
+        """图片窗是否被候选框压在下面（向 z-order 上方走 ≤limit 层找它）。
+
+        与心跳 `_ensure_topmost_if_needed` **同一个判据**（两处共用，避免口径漂移）：
+        N4 的「not too hot」就靠它 —— 没被压时一次 SetWindowPos 都不发。
+        """
         try:
-            if self.layer != 'below':
-                return  # above：回归 v1.4，无任何额外 z-order 操作
-            if self.cfg.get('side', 'right') != 'center':
-                return  # 侧贴边不重叠：below 无意义，保持 topmost
-            if not cand_hwnd or not self.visible:
-                return
+            if not top or not cand_hwnd:
+                return False
+            w = user32.GetWindow(top, GW_HWNDPREV)   # 向 z-order 上方走
+            steps = 0
+            while w and steps < limit:
+                if w == cand_hwnd:
+                    return True
+                w = user32.GetWindow(w, GW_HWNDPREV)
+                steps += 1
+        except Exception:
+            pass
+        return False
+
+    def _apply_layer(self, cand_hwnd, trigger='move'):
+        """图层层级（事件驱动调用，频率低，不再每拍无条件执行）。
+
+        v2.0-N4：**按 layer 分派** —— above / 侧贴边也走这里。原因（t9 真机 + 静态双证据）：
+        小狼毫每次合成都**新建**候选框窗口（23 次 SHOW / 24 个不同 hwnd、类名 `ATL:…`、
+        高恒 83px），新窗口天然落在 z-order 顶部 ⇒ 图片窗被压到下面；而旧实现里 above 在
+        5 个调用点全空转，只能等 **200ms 心跳**兜底 ⇒ 重叠区肉眼可见一次「让开」。
+        现在同一 tick 内就地夺回顶部，并把每次补置顶写进 `[zorder]` 日志。
+
+        分支（below + 中间 的插序语义原样保留）：
+        · above / 侧贴边 → 「保上」：**仅当确实被压**（_is_covered_by_candidate）才补一次
+          HWND_TOPMOST；没被压就一次系统调用都不发（not too hot）。
+        · below + 中间 → 插到候选框正下方；候选框非置顶时保持图片窗 topmost 保底（节流提示）。
+
+        trigger 只用于观测日志（move / deadzone / show / sync / below-hb）。
+        """
+        try:
             top = self._top_hwnd()
-            if not top:
+            if not top or not self.visible:
                 return
-            # 探测候选框是否置顶（GWL_EXSTYLE & WS_EX_TOPMOST）
-            ex = user32.GetWindowLongPtrW(cand_hwnd, GWL_EXSTYLE)
-            if not (ex & WS_EX_TOPMOST):
-                # 候选框非置顶：插序无法稳定生效且会让图片被活动窗口盖住 → 保底置顶
-                self._log_below_unavailable(cand_hwnd)
+            if self.layer == 'below' and self.cfg.get('side', 'right') == 'center':
+                if not cand_hwnd:
+                    return
+                # 探测候选框是否置顶（GWL_EXSTYLE & WS_EX_TOPMOST）
+                ex = user32.GetWindowLongPtrW(cand_hwnd, GWL_EXSTYLE)
+                if not (ex & WS_EX_TOPMOST):
+                    # 候选框非置顶：插序无法稳定生效且会让图片被活动窗口盖住 → 保底置顶
+                    self._log_below_unavailable(cand_hwnd)
+                    return
+                # 已紧贴候选框正下方（图片窗上方第一窗 == 候选框）→ 无需重复插序
+                if user32.GetWindow(top, GW_HWNDPREV) == cand_hwnd:
+                    return
+                user32.SetWindowPos(top, cand_hwnd, 0, 0, 0, 0,
+                                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                _log_zorder('below-insert', cand_hwnd, top)
                 return
-            # 已紧贴候选框正下方（图片窗上方第一窗 == 候选框）→ 无需重复插序
-            if user32.GetWindow(top, GW_HWNDPREV) == cand_hwnd:
+            # above / 侧贴边：保上（N4 新增分支）
+            if not cand_hwnd:
                 return
-            user32.SetWindowPos(top, cand_hwnd, 0, 0, 0, 0,
+            if not self._is_covered_by_candidate(top, cand_hwnd):
+                return                      # 没被压 → 什么都不做（not too hot）
+            user32.SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0,
                                 SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+            _log_zorder(trigger, cand_hwnd, top)
         except Exception:
             pass
 
@@ -8391,14 +8430,15 @@ class FollowOverlay:
         """切皮肤/手动拖拽/热重载后的图层补同步：候选框在场且图片可见才重插层级。"""
         try:
             if self.visible and self._cached_hwnd_ok():
-                self._apply_layer(self._cached_hwnd)
+                self._apply_layer(self._cached_hwnd, 'sync')
         except Exception:
             pass
 
     def _ensure_topmost_if_needed(self):
         """低频 z-order 兜底（心跳调用，不做任何枚举）：
-        · layer=above 或 侧贴边：维持 v1.4 语义 —— 仅当被候选框压住
-          （GetWindow 向上找 24 层内出现缓存句柄）才补一次 HWND_TOPMOST；
+        · layer=above 或 侧贴边：仅当被候选框压住才补一次 HWND_TOPMOST ——
+          N4 起与 `_apply_layer` 共用 `_is_covered_by_candidate` 判据（口径不漂移），
+          补上时同样写 `[zorder] trigger=heartbeat`（真机日志里能区分是心跳救的还是同 tick 抢的）；
         · layer=below 且 贴边=中间：改检「图片窗是否仍紧贴候选框正下方」，
           漂了才由 _apply_layer 重插，绝不补 topmost（否则破坏 below 插序）。"""
         try:
@@ -8409,17 +8449,13 @@ class FollowOverlay:
                 return
             if self.layer == 'below' and self.cfg.get('side', 'right') == 'center':
                 # below+center：只维护「紧贴候选框下方」，不把图片拉回 topmost
-                self._apply_layer(self._cached_hwnd)
+                self._apply_layer(self._cached_hwnd, 'below-hb')
                 return
-            w = user32.GetWindow(top, GW_HWNDPREV)  # 向 z-order 上方走
-            steps = 0
-            while w and steps < 24:
-                if w == self._cached_hwnd:
-                    user32.SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0,
-                                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
-                    return
-                w = user32.GetWindow(w, GW_HWNDPREV)
-                steps += 1
+            if not self._is_covered_by_candidate(top, self._cached_hwnd):
+                return
+            user32.SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+            _log_zorder('heartbeat', self._cached_hwnd, top)
         except Exception:
             pass
 
@@ -8571,6 +8607,26 @@ def _write_log(msg):
             pass
         with open(path, 'a', encoding='utf-8') as f:
             f.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] {msg}\n')
+    except Exception:
+        pass
+
+
+def _log_zorder(trigger, cand_hwnd, top, covered=True):
+    """N4 观测日志：把「图片窗被候选框压住 → 补置顶」变成**可数事实**。
+
+    只在**确实补了置顶**时由调用方写出，所以真机打字后 error.log 里 `[zorder]` 的
+    行数 == 「让开」发生次数、行间时间差 == 间隔。统计示例（PowerShell）：
+        Select-String '\\[zorder\\]' error.log
+        Select-String '\\[zorder\\]' error.log | Group-Object { ($_ -split 'trigger=')[1].Split(' ')[0] }
+
+    字段：trigger=触发点（move / deadzone / show / sync / heartbeat / below-insert）·
+    covered=调用时是否确实被压 · cand/top=候选框与图片窗句柄 · t=毫秒级时刻。
+    走既有的 `_write_log`（error.log，不新建文件），并带上它自己的秒级时间戳前缀。
+    """
+    try:
+        _write_log(f'[zorder] trigger={trigger} covered={1 if covered else 0} '
+                   f'cand=0x{int(cand_hwnd or 0):X} top=0x{int(top or 0):X} '
+                   f't={time.strftime("%H:%M:%S")}.{int(time.time() * 1000) % 1000:03d}')
     except Exception:
         pass
 
