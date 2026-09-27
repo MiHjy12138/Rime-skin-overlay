@@ -1216,10 +1216,682 @@ def section_C3():
         close_wizard(wiz)
 
 
+# ==========================================================================
+# K 段 · N4（t14 独立复算）：图片窗被新建候选框压住后能不能夺回顶部
+# ==========================================================================
+# 口径与设计（与实现者 B_test_n4_zorder.py 不同源）：
+#   · 两臂 = **两份真实的 rime_char_overlay.py 文件**：legacy 臂 = `git show b743052:…`
+#     （N4 修前的提交），current 臂 = 工作区 HEAD 的同源副本；差别只在被导入的产品文件
+#     本身，不做「内联复制旧实现 + monkeypatch」。
+#   · 夹具自建（原生窗口 + 图片窗替身），复算「被压帧数 / 最长毫秒 / 恢复时刻」；
+#     采样 10ms、驱动节拍 16ms tick + 200ms 心跳（与真机同口径）。
+#   · 整段在**子进程**里跑：原生窗口不进主进程，既避免与 A~C 段 Tk 生命周期互相干扰
+#     （HANDOFF 记录过「销毁 Tk root 后再 CreateWindowExW 会崩」），也避免残留 TOPMOST
+#     窗口遮挡后续判据。
+#   · 两条实测踩出来的坑（写在这里给下一轮）：
+#     ① 做 z-order 实验的窗口**必须创建时即带 WS_EX_TOPMOST** —— 事后
+#        SetWindowPos(HWND_TOPMOST) 只把窗口抬到「非置顶窗之上」，在 TOPMOST 组内保持
+#        原相对位置 ⇒ 落进组底，压不住图片窗，量出来的数字会假；
+#     ② 产品 `user32 = ctypes.windll.user32` **没有**给 DefWindowProcW 设原型，
+#        回调返回值被截断成 c_int，WM_NCCREATE 阶段返回 0 会让 CreateWindowExW 直接
+#        失败（返回 NULL、GetLastError=0）—— 必须自己补 argtypes/restype。
+N4_BEFORE_COMMIT = 'b743052'
+N4_GEOM = {'cand': (140, 180, 430, 83), 'img': (640, 180, 210, 320)}
+
+
+def _sha_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest().upper()
+
+
+def n4_worker_main(out_path):
+    """子进程入口：纯 Win32 夹具，两臂复算，结果写 JSON 文件。"""
+    import ctypes
+    import ctypes.wintypes as wt
+    import hashlib
+    import inspect
+    import re as _re
+    import time as _time
+
+    HWND_TOPMOST, HWND_NOTOPMOST, HWND_TOP = -1, -2, 0
+    SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+    GW_HWNDPREV, GWL_EXSTYLE = 3, -20
+    WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x8, 0x80, 0x08000000
+    WS_POPUP, WS_VISIBLE = 0x80000000, 0x10000000
+    ZRE = _re.compile(r'\[zorder\]\s+trigger=(\S+)\s+covered=(\d)\s+cand=0x([0-9A-Fa-f]+)\s+'
+                      r'top=0x([0-9A-Fa-f]+)\s+t=(\d{2}:\d{2}:\d{2}\.\d{3})')
+    out = {'ok': False}
+
+    def _mod(commit, name):
+        sub = os.path.join(TMP, 'n4_src_%s' % name)
+        path = extract_commit_file(commit, 'rime_char_overlay.py', sub)
+        m = load_module(path, 'rime_char_overlay_%s' % name)
+        with open(path, 'rb') as f:
+            raw = f.read()
+        return m, {'path': path, 'bytes': len(raw),
+                   'sha256': hashlib.sha256(raw).hexdigest().upper()}
+
+    try:
+        cur = load_module(SRC, 'rime_char_overlay_b4_n4cur')
+        with open(SRC, 'rb') as f:
+            raw_cur = f.read()
+        cur_id = {'path': SRC, 'bytes': len(raw_cur),
+                  'sha256': hashlib.sha256(raw_cur).hexdigest().upper()}
+        leg, leg_id = _mod(N4_BEFORE_COMMIT, 'b4_n4leg')
+        out['id'] = {'current': cur_id, 'legacy': leg_id}
+        out['sig'] = {'current': str(inspect.signature(cur.FollowOverlay._apply_layer)),
+                      'legacy': str(inspect.signature(leg.FollowOverlay._apply_layer))}
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+        k32.GetModuleHandleW.restype = wt.HMODULE
+
+        class _Kit(object):
+            """一个臂的夹具：窗口 + 替身 + 判据原语"""
+
+            def __init__(self, mod, tag):
+                self.mod = mod
+                self.tag = tag
+                self.u = mod.user32
+                self.k = k32
+                self.seq = 0
+                self.cands = []
+                self.procs = []
+                self.u.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+                self.u.DefWindowProcW.restype = ctypes.c_longlong
+                self.u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+                                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                                   ctypes.c_int, wt.HWND, wt.HMENU,
+                                                   wt.HINSTANCE, wt.LPVOID]
+                self.u.CreateWindowExW.restype = wt.HWND
+                self.u.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_int, wt.UINT]
+                self.u.SetWindowPos.restype = wt.BOOL
+                self.u.GetWindow.argtypes = [wt.HWND, wt.UINT]
+                self.u.GetWindow.restype = wt.HWND
+                self.u.GetWindowLongPtrW.argtypes = [wt.HWND, ctypes.c_int]
+                self.u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+
+            def _mkw(self, cls, title, x, y, w, h, extra_ex):
+                WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, wt.HWND, wt.UINT,
+                                             wt.WPARAM, wt.LPARAM)
+
+                def _proc(hwnd, msg, wp, lp):
+                    try:
+                        return self.u.DefWindowProcW(hwnd, msg, wp, lp)
+                    except Exception:
+                        return 0
+                proc = WNDPROC(_proc)
+                self.procs.append(proc)
+
+                class WC(ctypes.Structure):
+                    _fields_ = [('cbSize', wt.UINT), ('style', wt.UINT),
+                                ('lpfnWndProc', WNDPROC), ('cbClsExtra', ctypes.c_int),
+                                ('cbWndExtra', ctypes.c_int), ('hInstance', wt.HINSTANCE),
+                                ('hIcon', wt.HICON), ('hCursor', wt.HANDLE),
+                                ('hbrBackground', wt.HBRUSH), ('lpszMenuName', wt.LPCWSTR),
+                                ('lpszClassName', wt.LPCWSTR), ('hIconSm', wt.HICON)]
+                wc = WC()
+                wc.cbSize = ctypes.sizeof(WC)
+                wc.lpfnWndProc = proc
+                wc.hInstance = k32.GetModuleHandleW(None)
+                wc.lpszClassName = cls
+                # 类名必须**全局唯一**（两臂共用一个 user32/进程：重名注册会失败）
+                self.u.RegisterClassExW.argtypes = [ctypes.POINTER(WC)]
+                self.u.RegisterClassExW.restype = wt.ATOM
+                if not self.u.RegisterClassExW(ctypes.byref(wc)):
+                    raise RuntimeError('RegisterClassExW ' + cls)
+                hwnd = self.u.CreateWindowExW(extra_ex | WS_EX_TOPMOST, cls, title,
+                                              WS_POPUP | WS_VISIBLE, x, y, w, h, 0, 0,
+                                              wc.hInstance, None)
+                if not hwnd:
+                    raise RuntimeError('CreateWindowExW ' + cls)
+                self.u.SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+                                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                return int(hwnd)
+
+            def cand(self, x=None, y=None, w=None, h=None):
+                x = N4_GEOM['cand'][0] if x is None else x
+                y = N4_GEOM['cand'][1] if y is None else y
+                w = N4_GEOM['cand'][2] if w is None else w
+                h = N4_GEOM['cand'][3] if h is None else h
+                for c in self.cands:      # 旧的降级为非置顶（24 层判据的距离控制）
+                    self.u.SetWindowPos(c, HWND_NOTOPMOST, 0, 0, 0, 0,
+                                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+                self.seq += 1
+                hwnd = self._mkw('ATL:B4N4%sCand%d' % (self.tag, self.seq), 'b4n4-cand',
+                                 x, y, w, h, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+                self.cands.append(hwnd)
+                return hwnd
+
+            def img(self, layer='above', side='right'):
+                self.seq += 1
+                hwnd = self._mkw('B4N4%sImg%d' % (self.tag, self.seq), 'b4n4-img',
+                                 *N4_GEOM['img'], WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+                st = _StandIn(self, hwnd, layer, side)
+                return st
+
+            def prev(self, hwnd):
+                try:
+                    return int(self.u.GetWindow(hwnd, GW_HWNDPREV) or 0)
+                except Exception:
+                    return 0
+
+            def steps(self, cand, hwnd, limit=400):
+                w = self.prev(hwnd)
+                n = 0
+                while w and n < limit:
+                    if w == int(cand):
+                        return n + 1
+                    w = self.prev(w)
+                    n += 1
+                return None
+
+            def covered(self, cand, hwnd, limit=24):
+                s = self.steps(cand, hwnd, limit)
+                return bool(s)
+
+            def visible(self, hwnd):
+                try:
+                    return bool(self.u.IsWindowVisible(hwnd))
+                except Exception:
+                    return False
+
+        class _StandIn(object):
+            def __init__(self, kit, hwnd, layer, side):
+                self.kit = kit
+                self.M = kit.mod
+                self.hwnd = hwnd
+                self.layer = layer
+                self.cfg = {'side': side}
+                self.visible = True
+                self._cached_hwnd = 0
+                self._below_log_ts = 0.0
+                self._below_log_calls = []
+
+            def _top_hwnd(self):
+                return int(self.hwnd)
+
+            def _is_covered_by_candidate(self, top, cand_hwnd, limit=24):
+                fn = getattr(self.M.FollowOverlay, '_is_covered_by_candidate', None)
+                if fn is None:
+                    return self.kit.covered(cand_hwnd, top, limit)
+                return fn(self, top, cand_hwnd, limit)
+
+            def _log_below_unavailable(self, cand_hwnd):
+                self._below_log_calls.append(int(cand_hwnd or 0))
+                now = _time.monotonic()
+                if now - self._below_log_ts < 5.0:
+                    return
+                self._below_log_ts = now
+                try:
+                    self.M._write_log('[layer] below 不可用：候选框非置顶（batch4 K 段夹具）')
+                except Exception:
+                    pass
+
+            def raise_top(self):
+                self.kit.u.SetWindowPos(self.hwnd, HWND_TOP, 0, 0, 0, 0,
+                                        SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+
+        def has_trigger(m):
+            try:
+                return len(inspect.signature(m.FollowOverlay._apply_layer).parameters) >= 3
+            except Exception:
+                return False
+
+        def call_apply(kit, st, cand, trigger):
+            m = kit.mod
+            if has_trigger(m):
+                return m.FollowOverlay._apply_layer(st, cand, trigger)
+            return m.FollowOverlay._apply_layer(st, cand)
+
+        def call_hb(kit, st):
+            return kit.mod.FollowOverlay._ensure_topmost_if_needed(st)
+
+        def logsize(m):
+            p = os.path.join(m.HERE, 'error.log')
+            return os.path.getsize(p) if os.path.exists(p) else 0
+
+        def logtail(m, off):
+            p = os.path.join(m.HERE, 'error.log')
+            if not os.path.exists(p):
+                return ''
+            with open(p, 'r', encoding='utf-8', errors='replace') as f:
+                f.seek(off)
+                return f.read()
+
+        def quantify(kit, label, trigger, sample_s=0.8, tick_ms=16, hb_ms=200):
+            st = kit.img('above', 'right')
+            kit.cand()                                   # 旧候选窗
+            st.raise_top()
+            t0 = _time.perf_counter()
+            new = kit.cand()                             # 新建 ⇒ 天然压住图片窗
+            st._cached_hwnd = new
+            frames, longest, run_start, first_free = 0, 0.0, None, None
+            samples = []
+            last_tick = last_hb = 0.0
+            while True:
+                now = _time.perf_counter()
+                el = (now - t0) * 1000.0
+                if el >= sample_s * 1000.0:
+                    break
+                cov = kit.covered(new, st.hwnd)
+                samples.append([round(el, 1), int(cov), kit.prev(st.hwnd)])
+                if cov:
+                    frames += 1
+                    if run_start is None:
+                        run_start = now
+                    longest = max(longest, (now - run_start) * 1000.0)
+                else:
+                    if run_start is not None and first_free is None:
+                        first_free = el
+                    run_start = None
+                if el - last_tick >= tick_ms:
+                    last_tick = el
+                    call_apply(kit, st, new, trigger)
+                if el - last_hb >= hb_ms:
+                    last_hb = el
+                    call_hb(kit, st)
+                _time.sleep(0.010)
+            return {'label': label, 'trigger': trigger, 'frames': frames,
+                    'longest_ms': round(longest, 1),
+                    'first_free_ms': None if first_free is None else round(first_free, 1),
+                    'img_alive': kit.visible(st.hwnd), 'samples_head': samples[:10],
+                    'n_samples': len(samples)}
+
+        class Spy(object):
+            def __init__(self, real):
+                self.real = real
+                self.calls = []
+                self.rets = []
+
+            def __call__(self, hwnd, after, x, y, cx, cy, flags):
+                try:
+                    self.calls.append((int(hwnd or 0), int(after or 0), int(flags)))
+                except Exception:
+                    self.calls.append((0, 0, 0))
+                r = self.real(hwnd, after, x, y, cx, cy, flags)
+                try:
+                    self.rets.append(int(bool(r)))
+                except Exception:
+                    self.rets.append(-1)
+                return r
+
+            def reset(self):
+                self.calls = []
+                self.rets = []
+
+            def mine(self, hwnd):
+                return [c for c in self.calls if c[0] == int(hwnd)]
+
+        def not_too_hot(kit, spy):
+            r = {}
+            st = kit.img('above', 'right')
+            c1 = kit.cand()
+            st.raise_top()
+            r['pre_covered'] = kit.covered(c1, st.hwnd)
+            spy.reset()
+            for _ in range(30):
+                call_apply(kit, st, c1, 'move')
+            r['uncovered30'] = len(spy.mine(st.hwnd))
+            c2 = kit.cand()
+            spy.reset()
+            call_apply(kit, st, c2, 'deadzone')
+            mine = spy.mine(st.hwnd)
+            r['covered_once'] = mine
+            r['covered_once_n'] = len(mine)
+            r['covered_once_anchors'] = [a for (_h, a, _f) in mine]
+            r['still_covered'] = kit.covered(c2, st.hwnd)
+            spy.reset()
+            for _ in range(10):
+                call_apply(kit, st, c2, 'move')
+            r['after10'] = len(spy.mine(st.hwnd))
+            spy.reset()
+            call_hb(kit, st)
+            r['after_hb'] = len(spy.mine(st.hwnd))
+            return r
+
+        def below(kit, spy):
+            r = {}
+            st = kit.img('below', 'center')
+            c = kit.cand()
+            st.raise_top()
+            r['pre_direct'] = (kit.prev(st.hwnd) == c)
+            r['cand_topmost'] = int(bool(kit.u.GetWindowLongPtrW(c, GWL_EXSTYLE)
+                                         & WS_EX_TOPMOST))
+            spy.reset()
+            call_apply(kit, st, c, 'sync')
+            r['calls'] = list(spy.calls)
+            r['anchors'] = [a for (_h, a, _f) in spy.calls]
+            r['rets'] = list(spy.rets)
+            # z-order 是**桌面共享状态**：单次读取会被别的进程的窗口活动扰动（本段实测见过
+            # 一次偶发 prev≠cand）。改成有界重采样（≤4 次 × 30ms）—— 不是放宽阈值，
+            # 判别力另由 K09b（把 below 插序打桩掉 → 同款判据必须 FAIL）保证。
+            r['img'] = int(st.hwnd)
+            r['cand'] = int(c)
+            r['img_topmost'] = int(bool(kit.u.GetWindowLongPtrW(st.hwnd, GWL_EXSTYLE)
+                                        & WS_EX_TOPMOST))
+            samples = []
+            for _i in range(4):
+                samples.append(kit.prev(st.hwnd) == c)
+                if samples[-1]:
+                    break
+                _time.sleep(0.03)
+            r['direct_samples'] = samples
+            r['prev_after'] = kit.prev(st.hwnd)
+            r['direct_after'] = any(samples)
+            spy.reset()
+            call_hb(kit, st)
+            r['hb_calls'] = list(spy.calls)
+            r['hb_topmost'] = [c2 for c2 in spy.calls if c2[1] == HWND_TOPMOST]
+            st2 = kit.img('below', 'right')
+            spy.reset()
+            call_apply(kit, st2, c, 'sync')
+            r['side_calls'] = list(spy.calls)
+            st3 = kit.img('below', 'center')
+            c3 = kit.cand()
+            kit.u.SetWindowPos(c3, HWND_NOTOPMOST, 0, 0, 0, 0,
+                               SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+            r['c3_topmost'] = int(bool(kit.u.GetWindowLongPtrW(c3, GWL_EXSTYLE)
+                                       & WS_EX_TOPMOST))
+            spy.reset()
+            call_apply(kit, st3, c3, 'sync')
+            r['notop_calls'] = list(spy.calls)
+            r['notop_topmost_on_img'] = [x for x in spy.calls
+                                         if x[1] == HWND_TOPMOST and x[0] == st3.hwnd]
+            r['notop_log_calls'] = list(st3._below_log_calls)
+            return r
+
+        def logseg(kit, spy):
+            r = {}
+            m = kit.mod
+            base = logsize(m)
+            st = kit.img('above', 'right')
+            c = kit.cand()
+            st.raise_top()
+            spy.reset()
+            for _ in range(5):
+                call_apply(kit, st, c, 'deadzone')
+            r['uncovered_swp'] = len(spy.mine(st.hwnd))
+            _time.sleep(0.05)
+            r['uncovered_zorder_lines'] = [l.strip() for l in logtail(m, base).splitlines()
+                                           if '[zorder]' in l]
+            mark = logsize(m)
+            spy.reset()
+            seq = []
+            for trig in ('move', 'deadzone', 'show'):
+                c2 = kit.cand()
+                call_apply(kit, st, c2, trig)
+                seq.append([trig, kit.covered(c2, st.hwnd)])
+            _time.sleep(0.05)
+            lines = [l.strip() for l in logtail(m, mark).splitlines() if '[zorder]' in l]
+            parsed, bad = [], []
+            for l in lines:
+                mm = ZRE.search(l)
+                if mm:
+                    parsed.append({'trigger': mm.group(1), 'covered': mm.group(2)})
+                else:
+                    bad.append(l)
+            r['seq'] = seq
+            r['lines'] = lines
+            r['parsed'] = parsed
+            r['bad'] = bad
+            r['swp_topmost_on_img'] = len([x for x in spy.mine(st.hwnd)
+                                           if x[1] == HWND_TOPMOST])
+            r['has_log_zorder'] = hasattr(m, '_log_zorder')
+            return r
+
+        def discriminate(cur_mod, kit_cls):
+            """判别力：把保上分支的**判据**打桩恒 False → 「被压就补一次」必须不成立"""
+            st = None
+            spy2 = Spy(kit_cls.u.SetWindowPos)
+            real_cov = cur_mod.FollowOverlay._is_covered_by_candidate
+            kit_cls.u.SetWindowPos = spy2
+            try:
+                cur_mod.FollowOverlay._is_covered_by_candidate = \
+                    lambda self, top, cand_hwnd, limit=24: False
+                st = kit_cls.img('above', 'right')
+                c = kit_cls.cand()
+                spy2.reset()
+                call_apply(kit_cls, st, c, 'deadzone')
+                n = len(spy2.mine(st.hwnd))
+                return {'covered_at_entry': kit_cls.covered(c, st.hwnd),
+                        'swp_on_img': n, 'calls': list(spy2.calls),
+                        'log_lines': [l for l in logtail(cur_mod, 0).splitlines()
+                                      if '[zorder]' in l][-3:]}
+            finally:
+                cur_mod.FollowOverlay._is_covered_by_candidate = real_cov
+                kit_cls.u.SetWindowPos = spy2.real
+
+        def discriminate_below(cur_mod, kit):
+            """判别力（below）：把 below+center 的**插序动作**打桩掉（= 该语义坏掉）
+            → K09 同款判据必须不成立。"""
+            spy2 = Spy(kit.u.SetWindowPos)
+            real_swp = kit.u.SetWindowPos
+            real_apply = cur_mod.FollowOverlay._apply_layer
+
+            def _below_no_insert(self, cand_hwnd, *a, **k):
+                top = self._top_hwnd()
+                if not top or not self.visible or not cand_hwnd:
+                    return None
+                ex = kit.u.GetWindowLongPtrW(cand_hwnd, GWL_EXSTYLE)
+                if not (ex & WS_EX_TOPMOST):
+                    return None
+                return None                     # 故意不插序（模拟 below 语义被改坏）
+            kit.u.SetWindowPos = spy2
+            cur_mod.FollowOverlay._apply_layer = _below_no_insert
+            try:
+                st = kit.img('below', 'center')
+                c = kit.cand()
+                st.raise_top()
+                pre = (kit.prev(st.hwnd) == c)
+                spy2.reset()
+                call_apply(kit, st, c, 'sync')
+                after = (kit.prev(st.hwnd) == c)
+                return {'pre_direct': pre, 'direct_after': after,
+                        'calls': list(spy2.calls),
+                        'anchors': [x[1] for x in spy2.calls]}
+            finally:
+                kit.u.SetWindowPos = real_swp
+                cur_mod.FollowOverlay._apply_layer = real_apply
+
+        cur_mod, leg_mod = cur, leg
+        cur_mod.HERE = os.path.join(TMP, 'n4_cur')
+        leg_mod.HERE = os.path.join(TMP, 'n4_leg')
+        for p in (cur_mod.HERE, leg_mod.HERE):
+            os.makedirs(p, exist_ok=True)
+
+        kit_cur = _Kit(cur_mod, 'cur')
+        kit_leg = _Kit(leg_mod, 'leg')
+        spy = Spy(kit_cur.u.SetWindowPos)
+        kit_cur.u.SetWindowPos = spy          # 同一个 user32 对象，只在一个臂上装表
+        try:
+            out['quant_cur_deadzone'] = quantify(kit_cur, 'current/deadzone', 'deadzone')
+            out['quant_leg_deadzone'] = quantify(kit_leg, 'legacy/deadzone', 'deadzone')
+            out['quant_cur_move'] = quantify(kit_cur, 'current/move', 'move')
+            out['quant_leg_move'] = quantify(kit_leg, 'legacy/move', 'move')
+            out['n2h_cur'] = not_too_hot(kit_cur, spy)
+            out['n2h_leg'] = not_too_hot(kit_leg, spy)
+            out['below_cur'] = below(kit_cur, spy)
+            out['below_leg'] = below(kit_leg, spy)
+            out['log_cur'] = logseg(kit_cur, spy)
+            out['log_leg'] = logseg(kit_leg, spy)
+            out['disc'] = discriminate(cur_mod, kit_cur)
+            out['disc_below'] = discriminate_below(cur_mod, kit_cur)
+        finally:
+            kit_cur.u.SetWindowPos = spy.real
+        out['ok'] = True
+    except Exception:
+        import traceback
+        out['tb'] = traceback.format_exc()
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(out, f, ensure_ascii=False, indent=1)
+    return 0
+
+
+def section_K():
+    print('\n--- K. N4：图片窗被新建候选框压住后夺回顶部（t14 独立复算，子进程夹具）---')
+    out_path = os.path.join(TMP, 'n4_worker.json')
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), '--n4-worker', out_path],
+                       cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    txt = p.stdout.decode('utf-8', 'replace')
+    for l in txt.splitlines()[-14:]:
+        print('     [worker] ' + l)
+    if not os.path.exists(out_path):
+        chk('K00 子进程夹具跑完并产出 JSON', False, 'rc=%s' % p.returncode)
+        return
+    with open(out_path, 'r', encoding='utf-8') as f:
+        d = json.load(f)
+    if not d.get('ok'):
+        chk('K00 子进程夹具跑完（无异常）', False, str(d.get('tb', ''))[-400:])
+        return
+    chk('K00 子进程夹具跑完（无异常）', True,
+        'current=%s B / legacy=%s B' % (d['id']['current']['bytes'], d['id']['legacy']['bytes']))
+    print('     两臂身份：current %s (sha256 %s) ｜ legacy %s (%s)'
+          % (d['id']['current']['bytes'], d['id']['current']['sha256'][:16],
+             d['id']['legacy']['bytes'], d['id']['legacy']['sha256'][:16]))
+    print('     _apply_layer 签名：%s ｜ %s' % (d['sig']['current'], d['sig']['legacy']))
+    _h_ws = _sha_file(SRC)
+    chk('K00b current 臂 sha256 == 工作区 rime_char_overlay.py（臂身份可核）',
+        d['id']['current']['sha256'] == _h_ws,
+        '%s vs %s' % (d['id']['current']['sha256'][:16], _h_ws[:16]))
+
+    qc = d['quant_cur_deadzone']
+    ql = d['quant_leg_deadzone']
+    qcm = d['quant_cur_move']
+    qlm = d['quant_leg_move']
+    for tag, q in (('current/deadzone', qc), ('legacy/deadzone', ql),
+                   ('current/move', qcm), ('legacy/move', qlm)):
+        print('     [量化] %s：被压 %d 帧 / 最长 %.1fms / 恢复于 %s ms（%d 个采样，img 可见=%s）'
+              % (tag, q['frames'], q['longest_ms'], q['first_free_ms'], q['n_samples'],
+                 q['img_alive']))
+        print('            前 10 采样 (t_ms, covered, prev)：%s' % (q['samples_head'],))
+    ratio = (ql['longest_ms'] / qc['longest_ms']) if qc['longest_ms'] else 999.0
+    chk('K01 修前（legacy 臂）能复现「让开」：被压帧数 ≥ 8 且最长 ≥ 100ms',
+        ql['frames'] >= 8 and ql['longest_ms'] >= 100.0,
+        'legacy %d 帧 / %.1fms' % (ql['frames'], ql['longest_ms']))
+    chk('K02 ★修后（current 臂）让开窗口 ≤4 帧（10ms 采样）且最长 ≤25ms',
+        qc['frames'] <= 4 and qc['longest_ms'] <= 25.0,
+        'current %d 帧 / %.1fms' % (qc['frames'], qc['longest_ms']))
+    chk('K03 ★比 legacy 快 ≥5 倍', ratio >= 5.0,
+        '%.1fms / %.1fms = %.2f 倍' % (ql['longest_ms'], qc['longest_ms'], ratio))
+    chk('K04 恢复时机不同源：legacy ≥150ms（心跳处）、current ≤64ms（tick 处）',
+        (ql['first_free_ms'] is None or ql['first_free_ms'] >= 150.0)
+        and qc['first_free_ms'] is not None and qc['first_free_ms'] <= 64.0,
+        'legacy=%s current=%s' % (ql['first_free_ms'], qc['first_free_ms']))
+    chk('K04b 移动触发（trigger=move）同样 ≤4 帧 / ≤25ms，且 legacy 同样复现',
+        qcm['frames'] <= 4 and qcm['longest_ms'] <= 25.0
+        and qlm['frames'] >= 8 and qlm['longest_ms'] >= 100.0,
+        'current %d/%.1fms legacy %d/%.1fms'
+        % (qcm['frames'], qcm['longest_ms'], qlm['frames'], qlm['longest_ms']))
+    chk('K04c 两臂图片窗全程存活可见（「夺回」不是窗口消失造成的假象）',
+        qc['img_alive'] and ql['img_alive'], '%s / %s' % (qc['img_alive'], ql['img_alive']))
+
+    hc, hl = d['n2h_cur'], d['n2h_leg']
+    print('     [not-too-hot] current：未压 ×30 → %d 次；被压 → %d 次(锚点 %s)；夺回后 ×10 → %d 次；'
+          '心跳 ×1 → %d 次' % (hc['uncovered30'], hc['covered_once_n'],
+                              hc['covered_once_anchors'], hc['after10'], hc['after_hb']))
+    print('     [not-too-hot] legacy ：未压 ×30 → %d 次；被压 → %d 次；夺回后 ×10 → %d 次'
+          % (hl['uncovered30'], hl['covered_once_n'], hl['after10']))
+    chk('K05 ★未被压时连续驱动 ×30 → 图片窗上 0 次 SetWindowPos（无脑置顶=禁止）',
+        hc['uncovered30'] == 0, '调用 %d 次' % hc['uncovered30'])
+    chk('K06 ★被压时恰好补 1 次，且锚点 == HWND_TOPMOST(-1)',
+        hc['covered_once_n'] == 1 and hc['covered_once_anchors'] == [-1],
+        'n=%d anchors=%s' % (hc['covered_once_n'], hc['covered_once_anchors']))
+    chk('K07 ★夺回后再驱动 ×10 → 仍 0 次；心跳 ×1 → 0 次',
+        hc['after10'] == 0 and hc['after_hb'] == 0,
+        'after10=%d after_hb=%d' % (hc['after10'], hc['after_hb']))
+    chk('K08 对照：legacy 臂被压时 0 次补置顶（证明 K06 的量测不是恒真）',
+        hl['covered_once_n'] == 0 and hl['still_covered'],
+        'legacy n=%d still_covered=%s' % (hl['covered_once_n'], hl['still_covered']))
+
+    bc, bl = d['below_cur'], d['below_leg']
+    print('     [below] current：插序后 prev(img)==cand %s（prev=0x%X cand=0x%X img_topmost=%s '
+          'rets=%s）；锚点 %s；心跳 %s；侧贴边调用 %s；非置顶候选框调用 %s（节流提示 %s）'
+          % (bc['direct_after'], bc['prev_after'], bc['cand'], bc['img_topmost'], bc['rets'],
+             bc['anchors'], bc['hb_calls'], bc['side_calls'],
+             bc['notop_calls'], bc['notop_log_calls']))
+    print('     [below] legacy ：插序后 prev(img)==cand %s（prev=0x%X cand=0x%X img_topmost=%s '
+          'rets=%s）；锚点 %s；心跳 %s；侧贴边调用 %s；非置顶候选框调用 %s（节流提示 %s）'
+          % (bl['direct_after'], bl['prev_after'], bl['cand'], bl['img_topmost'], bl['rets'],
+             bl['anchors'], bl['hb_calls'], bl['side_calls'],
+             bl['notop_calls'], bl['notop_log_calls']))
+    chk('K09 ★below+中间：图片窗仍插到候选框正下方（前置 = 插序前不在其正下方；'
+        'z-order 为共享状态 → 有界重采样 ≤4×30ms，判别力见 K09b）',
+        (not bc['pre_direct']) and bc['cand_topmost'] == 1 and bc['img_topmost'] == 1
+        and bc['direct_after'] and bl['direct_after'] and all(bc['rets']) and all(bl['rets']),
+        'current pre=%s cand_topmost=%s after=%s samples=%s rets=%s ｜ legacy after=%s rets=%s'
+        % (bc['pre_direct'], bc['cand_topmost'], bc['direct_after'], bc['direct_samples'],
+           bc['rets'], bl['direct_after'], bl['rets']))
+    db = d['disc_below']
+    chk('K09b ★判别力（below）：把 below+中间 的插序动作打桩掉后，K09 同款判据必须 FAIL',
+        db['direct_after'] is False and not db['anchors'],
+        '打桩后 prev(img)==cand %s、SetWindowPos 调用 %s' % (db['direct_after'], db['calls']))
+    chk('K10 ★below+中间 的插入锚点 == 候选框句柄（不是 HWND_TOPMOST）',
+        bc['anchors'] and all(a > 0 for a in bc['anchors'])
+        and all(a == bc['anchors'][0] for a in bc['anchors'])
+        and not bc['hb_topmost'],
+        'anchors=%s hb_topmost=%s' % (bc['anchors'], bc['hb_topmost']))
+    chk('K11 ★below+中间：心跳兜底不把图片窗拉回 topmost（0 次 TOPMOST）',
+        not bc['hb_topmost'], 'hb_calls=%s' % (bc['hb_calls'],))
+    chk('K12 below+侧贴边（不重叠）→ 0 次 SetWindowPos（两臂一致）',
+        not bc['side_calls'] and not bl['side_calls'],
+        'current=%s legacy=%s' % (bc['side_calls'], bl['side_calls']))
+    chk('K13 ★候选框非置顶 → 不插序（0 次调用）且「不可用」节流提示确实被触发',
+        bc['c3_topmost'] == 0 and not bc['notop_calls'] and bool(bc['notop_log_calls'])
+        and not bl['notop_calls'] and bool(bl['notop_log_calls']),
+        'topmost_bit=%s calls=%s log=%s（legacy log=%s）'
+        % (bc['c3_topmost'], bc['notop_calls'], bc['notop_log_calls'], bl['notop_log_calls']))
+
+    gc, gl = d['log_cur'], d['log_leg']
+    print('     [日志] current：未压 ×5 → %d 行；被压三次 → %d 行 %s；'
+          '目标为图片窗的 TOPMOST 调用 %d 次；无 _log_zorder=%s'
+          % (len(gc['uncovered_zorder_lines']), len(gc['lines']),
+             [(p2['trigger'], p2['covered']) for p2 in gc['parsed']],
+             gc['swp_topmost_on_img'], not gc['has_log_zorder']))
+    print('     [日志] legacy ：未压 ×5 → %d 行；被压三次 → %d 行（无 _log_zorder=%s）'
+          % (len(gl['uncovered_zorder_lines']), len(gl['lines']), not gl['has_log_zorder']))
+    if gc['lines']:
+        print('     [日志] 原始行：%s' % (gc['lines'][:3],))
+    chk('K14 ★补置顶时写出 [zorder] 行，trigger 逐个正确（move/deadzone/show）、covered=1、'
+        '格式稳定可统计',
+        len(gc['lines']) == 3 and not gc['bad']
+        and sorted(p2['trigger'] for p2 in gc['parsed']) == ['deadzone', 'move', 'show']
+        and all(p2['covered'] == '1' for p2 in gc['parsed']),
+        'lines=%d parsed=%s bad=%s' % (len(gc['lines']), gc['parsed'], gc['bad']))
+    chk('K15 ★未被压时一行都不写（不刷屏）',
+        not gc['uncovered_zorder_lines'] and gc['uncovered_swp'] == 0,
+        '%d 行 / %d 次 SetWindowPos'
+        % (len(gc['uncovered_zorder_lines']), gc['uncovered_swp']))
+    chk('K16 ★三方一致：日志行数 == 实际补置顶次数（目标为图片窗的 TOPMOST 调用）',
+        len(gc['lines']) == gc['swp_topmost_on_img'] == 3,
+        'log=%d swp=%d' % (len(gc['lines']), gc['swp_topmost_on_img']))
+    chk('K17 对照：legacy 臂没有 [zorder]（该日志确由 N4 引入，不是别处写的）',
+        not gl['has_log_zorder'] and not gl['lines'],
+        'has=%s lines=%d' % (gl['has_log_zorder'], len(gl['lines'])))
+
+    dc = d['disc']
+    print('     [判别力] 把 _is_covered_by_candidate 打桩恒 False 后：被压=%s、'
+          '图片窗上 SetWindowPos %d 次、调用 %s'
+          % (dc['covered_at_entry'], dc['swp_on_img'], dc['calls']))
+    chk('K18 ★判别力：保上分支的判据被打桩成恒 False 后，「被压 → 恰好 1 次补置顶」'
+        '必须不成立（非恒真）',
+        dc['covered_at_entry'] and dc['swp_on_img'] == 0,
+        'covered=%s swp=%d（正臂为 1）' % (dc['covered_at_entry'], dc['swp_on_img']))
+
+
 def main():
-    which = [a.upper() for a in sys.argv[1:]] or ['A', 'B', 'C']
+    if '--n4-worker' in sys.argv:
+        i = sys.argv.index('--n4-worker')
+        return n4_worker_main(sys.argv[i + 1] if len(sys.argv) > i + 1 else '')
+    which = [a.upper() for a in sys.argv[1:]] or ['A', 'B', 'C', 'K']
     print('B_test_indep_batch4.py ｜ 第四轮独立探针 ｜ tempdir=%s' % TMP)
     print('被测源码: %s' % SRC)
+    if 'K' in which:
+        section_K()
     if 'A' in which:
         section_A()
     if 'B' in which:
