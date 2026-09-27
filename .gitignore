@@ -57,3 +57,7 @@ HANDOFF-*.md
 环境台账.md
 轻装版流程-*.md
 UPGRADE_IDEAS.md
+
+# 内部测试脚本与行为基线（本机留档，不入库；发布件只需四件，见 make_clean_release.py）
+B_test_*.py
+_baseline/
