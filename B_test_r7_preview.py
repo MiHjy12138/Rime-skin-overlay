@@ -453,19 +453,24 @@ def test_no_render_radio(tmp, saved):
         hit = [t for t in texts if '⑪' in t]
         live11 = _live_titles_11(wiz)
         chk0 = getattr(wiz, 'chk_alpha_feather', None)
-        # R18（第五轮追加 · 需求反转）：⑪ 从「必须不存在」变成「必须恰好存在一个」，
-        # 且载体就是 ⑩ 行末那个 Checkbutton。旧判据（not hit）保留为**记账信息**打印，
-        # 不再作断言 —— 断言换成「唯一性 + 载体身份」两条，强度不降（见文件头 _live_titles_11）。
-        check('C02 ★版面上的「⑪ 编号标题」恰好 1 个，且就是 ⑩ 行末的「增强（真羽化）」开关'
-              '（R10 删的是单选组；第五轮把编号还给了这个开关 —— 需求反转）',
-              chk0 is not None and len(live11) == 1 and live11[0] is chk0,
+        lbl11 = getattr(wiz, 'lbl_alpha_feather', None)
+        # R18（第五轮追加 · 需求反转）：⑪ 从「必须不存在」变成「必须恰好存在一个」。
+        # 第六轮（R19）**再反转载体**：先生「按图把真羽化换个位置，和 ⑧⑨⑩ 同一列，
+        #   点选框放字后面」＋「下一行…方框（和 9、10 对齐）」⇒ ⑪ 从「⑩ 行末那个
+        #   Checkbutton」变成两件套（标题 Label 在上、方框在下），编号载体因此是
+        #   lbl_alpha_feather。唯一性口径不降：版面上恰好 1 个，且就是该载体。
+        check('C02 ★版面上的「⑪ 编号标题」恰好 1 个，且载体 = lbl_alpha_feather'
+              '（「⑪ 增强（真羽化）」标题行；R10 删的是单选组，R19 把编号放上标题）',
+              lbl11 is not None and len(live11) == 1 and live11[0] is lbl11,
               f'版面上 ⑪ 编号标题={len(live11)} 个；未进版面的 ⑪ 正文存放控件='
               f'{len(_titles_11(wiz)) - len(live11)} 个；全部含 ⑪ 文案={hit}')
         check('C03 判别力：扫描器仍能抓到别的单选组（② 候选框类型 ≥2 个，不是恒空）',
               len(rbs) >= 2, f'Radiobutton 总数={len(rbs)}')
         chk = getattr(wiz, 'chk_alpha_feather', None)
-        check('C04 ★⑩ 旁「增强（真羽化）」开关仍在且可点（唯一入口）',
-              chk is not None and '增强' in str(chk.cget('text'))
+        # R19：方框自己的文案与 ⑨⑩ 同形态（「启用」），「增强（真羽化）」这层语义
+        # 由它上一行的标题 Label 承载 —— 判据改成「方框仍在、可点、文案 = 启用」。
+        check('C04 ★⑪ 的方框仍在且可点（唯一入口；文案 = 「启用」，编号见其上方标题行）',
+              chk is not None and str(chk.cget('text')) == '启用'
               and str(chk.cget('state')) == 'normal',
               f'text={chk and chk.cget("text")!r} state={chk and chk.cget("state")!r}')
 

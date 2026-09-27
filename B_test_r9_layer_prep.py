@@ -228,9 +228,14 @@ def test_b_main_layer(tmp):
               and _norm(layers[0].get('image')) == _norm(outm),
               f"top={os.path.basename(str(w.cfg.get('image')))} "
               f"l0={os.path.basename(str(layers[0].get('image')))}")
-        check('B3 主层：① 图片文案 + 「（已预处理）」后缀',
-              'r9_out_main.png' in str(w.lbl_img.cget('text'))
-              and '已预处理' in str(w.lbl_img.cget('text')),
+        # 第六轮（R19）**需求反转**：先生原话「导入图片后绿字过长，会拉长窗口，
+        #   简短点：已导入、已预处理 等其他语句」⇒ ① 只报状态、不再回显文件名。
+        #   旧断言「文案含 r9_out_main.png **且**含已预处理」被推翻，改写为
+        #   「文案 == 已预处理 **且不含**文件名」。判别力：回退成长串 → 必 FAIL。
+        #   文件名本身仍有守护点：下面 B4 的图层列表第 1 项按原名核对。
+        check('B3 主层：① 文案只报状态（== 已预处理）且不含文件名',
+              str(w.lbl_img.cget('text')) == '已预处理'
+              and 'r9_out_main.png' not in str(w.lbl_img.cget('text')),
               repr(w.lbl_img.cget('text')))
         check('B4 ★主层：图层列表第 1 项文案同步（改前只有顶层 image 换了、列表还写旧名）',
               'r9_out_main.png' in str(w.layer_list.get(0)),

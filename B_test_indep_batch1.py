@@ -289,17 +289,33 @@ def section_A(tmp):
         wiz.var_feather.set(True)      # 兼容档：用户勾了「点阵羽化」
         wiz._update_preview()
 
-        # ---- A01/A02 控件存在且位置在 ⑩ 行内（用户要的「放后面的开关」）----
+        # ---- A01/A02 控件存在且落在 ⑩ 那张卡所在的列 ----
+        # 第六轮（R19）**需求反转**：先生「按图把真羽化换个位置，和 ⑧⑨⑩ 同一列，
+        #   点选框放字后面」＋「下一行…方框（和 9、10 对齐）」⇒ ⑪ 不再是「⑩ 行末
+        #   那个带 ⑪ 文案的开关」，而是「标题 Label 在上 + 方框在下」两件套、与
+        #   ⑧⑨⑩ 同处一个 adv 列卡片。判别力：把 ⑪ 挪回 ⑩ 控件行末 → A02 必 FAIL。
         w = getattr(wiz, 'chk_alpha_feather', None)
-        check('A01 ★⑩ 旁确有「增强（真羽化）」开关控件',
-              w is not None and '增强' in str(w.cget('text')), repr(w and w.cget('text')))
+        lbl11 = getattr(wiz, 'lbl_alpha_feather', None)
+        check('A01 ★⑪ 增强（真羽化）控件在（标题 Label + 方框，方框文案 = 「启用」）',
+              w is not None and lbl11 is not None
+              and '增强' in str(lbl11.cget('text')) and '真羽化' in str(lbl11.cget('text'))
+              and str(w.cget('text')) == '启用',
+              '%r + %r' % (str(lbl11.cget('text')) if lbl11 is not None else None,
+                           str(w.cget('text')) if w is not None else None))
         fe_parent = None
         try:
             fe_parent = str(wiz.chk_feather.master)
         except Exception:
             pass
-        check('A02 开关与「点阵羽化」同容器（= 排在 ⑩ 后面）',
-              w is not None and str(w.master) == fe_parent,
+        ok_parent = False
+        try:
+            ok_parent = (w is not None and lbl11 is not None
+                         and w.master.master is wiz.chk_feather.master.master
+                         and lbl11.master is wiz.chk_feather.master.master)
+        except Exception:
+            ok_parent = False
+        check('A02 与 ⑧⑨⑩ 同处一个列卡片（⑪ 标题行与 ⑩ 控件行同父）',
+              ok_parent,
               f'alpha.master={w and w.master} feather.master={fe_parent}')
 
         # ---- 预览像素：兼容档 ----

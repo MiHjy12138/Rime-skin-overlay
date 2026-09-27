@@ -380,16 +380,26 @@ def test_widget_inventory(tmp, cfg):
         for label, names in items:
             miss = [n for n in names if not hasattr(wiz, n)]
             check(f'C01 {label}：控件齐全（{len(names)} 个）', not miss, f'缺={miss}')
-        # C01b：⑪ 编号的载体身份（R18 需求反转后 ⑪ = ⑩ 行末那个开关，不再是已删的单选组）
+        # C01b：⑪ 编号的载体身份（R18 需求反转后 ⑪ = 那个增强开关；R19 再反转成两件套）：
+        #   先生「按图把真羽化换个位置，和 ⑧⑨⑩ 同一列，点选框放字后面」＋
+        #   「下一行…方框（和 9、10 对齐）」⇒ 编号落在标题 Label（⑪ 增强（真羽化）:），
+        #   方框是它下一行的 Checkbutton（文案「启用」，与 ⑨⑩ 同形态、仍绑 var_alpha_feather）。
+        #   判别力：编号从标题 Label 上撤走（或方框不再绑 var_alpha_feather）→ 必 FAIL。
         chk11 = getattr(wiz, 'chk_alpha_feather', None)
+        lbl11 = getattr(wiz, 'lbl_alpha_feather', None)
         try:
-            ok11 = (chk11 is not None and str(chk11.cget('text')).startswith('⑪')
+            ok11 = (chk11 is not None and lbl11 is not None
+                    and str(lbl11.cget('text')).startswith('⑪')
+                    and '增强' in str(lbl11.cget('text'))
+                    and '真羽化' in str(lbl11.cget('text'))
                     and str(chk11.cget('variable')) == str(wiz.var_alpha_feather)
                     and str(chk11.winfo_class()) == 'Checkbutton')
         except Exception:
             ok11 = False
-        check('C01b ★⑪ 编号的载体 = ⑩ 行末「增强（真羽化）」开关（文案以 ⑪ 开头、绑 var_alpha_feather）',
-              ok11, f'text={chk11 and chk11.cget("text")!r}')
+        check('C01b ★⑪ 编号的载体 = 「⑪ 增强（真羽化）」标题 Label + 其下一行的勾选框'
+              '（编号以 ⑪ 开头，方框绑 var_alpha_feather）',
+              ok11, f'label={lbl11 and lbl11.cget("text")!r} '
+                    f'chk={chk11 and chk11.cget("text")!r}')
         # 可操作：按钮类不被禁用（⑩ 的增强开关在兼容模式下可点、点阵勾选可编辑）
         for name, want_state in (('btn_img', 'normal'), ('layer_list', 'normal'),
                                  ('chk_feather', 'normal'), ('chk_alpha_feather', 'normal'),

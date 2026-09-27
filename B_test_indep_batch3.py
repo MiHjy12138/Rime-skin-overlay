@@ -511,17 +511,24 @@ def sec_B(tmp):
         hit_11 = [t for t in texts if '⑪' in t]
         live11 = live_titles_11(wiz)
         chk_b = getattr(wiz, 'chk_alpha_feather', None)
-        check('B02 ★⑪ 编号标题**恰好 1 个**且 == ⑩ 行末「增强（真羽化）」开关；说明正文引用 ⑪ '
-              '时指向「⑪ 增强（真羽化）」（第五轮追加：编号还给该开关 = 需求反转；'
-              'R10「文案不残留 ⑪」的前提作废）',
-              chk_b is not None and len(live11) == 1 and live11[0] is chk_b
+        lbl_b = getattr(wiz, 'lbl_alpha_feather', None)
+        # 第六轮（R19）**需求反转**：先生「按图把真羽化换个位置，和 ⑧⑨⑩ 同一列，
+        #   点选框放字后面」＋「下一行…方框（和 9、10 对齐）」⇒ ⑪ 从「⑩ 行末那个
+        #   Checkbutton」变成两件套，编号载体 = lbl_alpha_feather。
+        #   唯一性与「正文引用 ⑪ 只许指向该口径名」两条强度不降。
+        check('B02 ★⑪ 编号标题**恰好 1 个**且载体 = lbl_alpha_feather（「⑪ 增强（真羽化）」'
+              '标题行）；说明正文引用 ⑪ 时指向「⑪ 增强（真羽化）」（R18 编号还给该开关、'
+              'R19 再把编号放上标题 = 需求反转；R10「文案不残留 ⑪」的前提作废）',
+              lbl_b is not None and len(live11) == 1 and live11[0] is lbl_b
               and all(ref11_ok(t) for t in hit_11),
               f'版面上 ⑪ 编号标题={len(live11)} 个（未进版面的正文存放控件='
               f'{len(titles_11(wiz)) - len(live11)} 个）；含⑪文案={hit_11}')
 
         chk = getattr(wiz, 'chk_alpha_feather', None)
-        check('B03 ⑩ 旁「增强（真羽化）」开关仍在且可见', chk is not None and chk.winfo_ismapped(),
-              f'{class_text(chk) if chk is not None else None}')
+        check('B03 ⑪ 的方框仍在且可见（文案 = 「启用」，与 ⑨⑩ 同形态）',
+              chk is not None and bool(chk.winfo_ismapped())
+              and class_text(chk) == '启用',
+              repr(class_text(chk) if chk is not None else None))
 
         # 唯一入口 → 写回 render_mode（保存会关窗，故每轮用新向导）
         chk.invoke()

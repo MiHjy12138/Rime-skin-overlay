@@ -552,13 +552,16 @@ def section_E(tmp):
                           and str(x.cget('variable')) == str(w.var_flip)]
             side_in_card = bool(side_rb_w) and _in_container(side_rb_w[0].master, w.layer_list)
             flip_in_card = bool(flip_chk_w) and _in_container(flip_chk_w[0].master, w.layer_list)
-            chk11 = getattr(w, 'chk_alpha_feather', None)
+            # 第六轮（R19）**需求反转**：先生「按图把真羽化换个位置，和 ⑧⑨⑩ 同一列，
+            #   点选框放字后面」＋「下一行…方框（和 9、10 对齐）」⇒ ⑪ 从「⑩ 行末那个
+            #   Checkbutton」变成两件套，编号载体 = lbl_alpha_feather。
+            lbl11 = getattr(w, 'lbl_alpha_feather', None)
             check('E08 ★③ 与翻转按**变量绑定 / 控件层级**定位：③ = 绑 var_side 的恰 3 个单选、'
                   '翻转 = 绑 var_flip 的恰 1 个勾选框，且两者都在通用区（不在图层卡内 = 只一处）；'
-                  '⑪ 编号标题唯一（恰 1 个，== ⑩ 行末增强开关）；编号一个不少（⑩⑪⑫⑬⑭ 齐全）',
+                  '⑪ 编号标题唯一（恰 1 个，= ⑪ 的标题 Label）；编号一个不少（⑩⑪⑫⑬⑭ 齐全）',
                   len(side_rb_w) == 3 and len(flip_chk_w) == 1
                   and not side_in_card and not flip_in_card
-                  and len(live11) == 1 and live11[0] is chk11 and not miss_nums,
+                  and len(live11) == 1 and live11[0] is lbl11 and not miss_nums,
                   f'③单选={len(side_rb_w)} 翻转勾选={len(flip_chk_w)} '
                   f'③在图层卡内={side_in_card} 翻转在图层卡内={flip_in_card} '
                   f'版面⑪编号标题={len(live11)} 个 含⑪文案={has_11_left or "无"} 缺编号={miss_nums or "无"}')
@@ -740,17 +743,18 @@ def section_E(tmp):
                                 if x.winfo_class() in ('Label', 'Button', 'Checkbutton',
                                                        'Radiobutton', 'Labelframe')
                                 and _text11_of(x).startswith('⑪') and bool(x.winfo_manager())]
-                    chk11_2 = getattr(w2, 'chk_alpha_feather', None)
+                    # R19：⑪ 的载体是标题 Label（lbl_alpha_feather），不是开关本身。
+                    lbl11_2 = getattr(w2, 'lbl_alpha_feather', None)
                     s4.clear()
                     w2._save_and_start()
                     out = dict(s4)
                     drift = {k: (before[k], out.get(k)) for k in before if out.get(k) != before[k]}
                     check('E12 ★端到端（release/config.json）：重排后预览与 ②~⑭ 齐全'
-                          '（⑪ 编号唯一 = ⑩ 行末增强开关）、③/翻转按变量绑定仍在通用区、保存零漂移、'
+                          '（⑪ 编号唯一 = ⑪ 的标题 Label）、③/翻转按变量绑定仍在通用区、保存零漂移、'
                           '窗口 ≤ 工作区',
                           has_img and not miss_nums2 and ctrl2_ok and not drift
                           and 0 < h2 <= workh2
-                          and len(live11_2) == 1 and live11_2[0] is chk11_2,
+                          and len(live11_2) == 1 and live11_2[0] is lbl11_2,
                           f'需求={w2r}x{h2} 预览={"有" if has_img else "无"} '
                           f'缺编号={miss_nums2 or "无"} 控件={ctrl2_ok} '
                           f'漂移={drift or "无"} 工作区={workh2} '
@@ -1390,12 +1394,14 @@ def section_H(tmp):
                         if x.winfo_class() in ('Label', 'Button', 'Checkbutton',
                                                'Radiobutton', 'Labelframe')
                         and _text11_of(x).startswith('⑪') and bool(x.winfo_manager())]
+            # R19（本轮需求反转）：⑪ 的编号载体是标题 Label（两件套），方框另在它下一行。
+            lbl11_h = getattr(w, 'lbl_alpha_feather', None)
             chk11_h = getattr(w, 'chk_alpha_feather', None)
-            has_alpha_chk = chk11_h is not None
-            check('H05 ★强制 1 列（最窄屏退路）：②~⑭ 标题齐全（含 ⑪，编号唯一 = ⑩ 行末增强开关）'
-                  '，⑩ 旁增强开关仍在',
+            has_alpha_chk = chk11_h is not None and str(chk11_h.cget('text')) == '启用'
+            check('H05 ★强制 1 列（最窄屏退路）：②~⑭ 标题齐全（含 ⑪，编号唯一 = ⑪ 的标题 Label）'
+                  '，⑪ 的方框仍在',
                   not missing and len(list(getattr(w, 'adv_cols', []))) == 1
-                  and len(live11_h) == 1 and live11_h[0] is chk11_h and has_alpha_chk,
+                  and len(live11_h) == 1 and live11_h[0] is lbl11_h and has_alpha_chk,
                   f'缺={missing or "无"} 列数={len(list(getattr(w, "adv_cols", [])))} '
                   f'版面⑪编号标题={len(live11_h)} 个 含⑪文案={left_11 or "无"} '
                   f'增强开关={has_alpha_chk}')

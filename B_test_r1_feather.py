@@ -288,18 +288,36 @@ def test_wizard_widgets(tmp, saved):
             check('F05 新开关可见且带勾选能力', False, '新开关未实现')
             check('F06 文案含「增强」与「真羽化」', False, '新开关未实现')
             return
-        same = getattr(wiz.chk_alpha_feather, 'master', None) is \
-            getattr(wiz.chk_feather, 'master', None)
-        check('F03 ★与⑩点阵羽化同区（同父容器）', same)
-        check('F04 ★在⑩点阵羽化之后（放后面的开关）',
-              wiz.chk_alpha_feather.winfo_rootx() > wiz.chk_feather.winfo_rootx(),
-              f'x={wiz.chk_feather.winfo_rootx()} → {wiz.chk_alpha_feather.winfo_rootx()}')
+        # 第六轮（R19）**需求反转**：先生原话「按图把真羽化换个位置，和 ⑧⑨⑩ 同一列，
+        #   点选框放字后面」＋「下一行…方框（和 9、10 对齐）后面跟 11 的说明」
+        #   ⇒ 旧前提「与 ⑩ 点阵羽化同父容器、且 x 在它右侧」被推翻，改写为两条：
+        #     ① 与 ⑧⑨⑩ 同处一个列卡片（⑪ 控件行与 ⑩ 控件行**同父**）；
+        #     ② 落在 ⑩ 控件行**下方**，且方框左边缘与 ⑩ 的方框对齐（≤2px）。
+        #   判别力：把 ⑪ 挪回 ⑩ 控件行末（老版型）→ F04 必 FAIL（rooty 相同、Δx 巨大）；
+        #           把 ⑪ 挪到别的列 → F03 必 FAIL。
+        par10 = getattr(wiz.chk_feather, 'master', None)
+        par11 = getattr(wiz.chk_alpha_feather, 'master', None)
+        same = (par10 is not None and par11 is not None
+                and getattr(par10, 'master', None) is getattr(par11, 'master', None))
+        check('F03 ★与 ⑧⑨⑩ 同处一个列卡片（同一 adv 列）', same)
+        dx = abs(int(wiz.chk_alpha_feather.winfo_rootx())
+                 - int(wiz.chk_feather.winfo_rootx()))
+        check('F04 ★落在 ⑩ 控件行下方 + 方框与 ⑩ 的方框左对齐',
+              wiz.chk_alpha_feather.winfo_rooty() > wiz.chk_feather.winfo_rooty()
+              and dx <= 2,
+              f'y={wiz.chk_feather.winfo_rooty()} → {wiz.chk_alpha_feather.winfo_rooty()}, '
+              f'Δx={dx}')
         check('F05 新开关可见且带勾选能力',
               bool(wiz.chk_alpha_feather.winfo_ismapped())
               and 'checkbutton' in str(wiz.chk_alpha_feather.winfo_class()).lower(),
               str(wiz.chk_alpha_feather.winfo_class()))
+        # 第六轮：文案搬到「标题 Label 在上、方框在下」两件套 —— 「⑪ 增强（真羽化）」是
+        # 标题载体 lbl_alpha_feather 的文案，方框自己的文案与 ⑨⑩ 同形态（「启用」）。
         txt = str(wiz.chk_alpha_feather.cget('text'))
-        check('F06 文案含「增强」与「真羽化」', '增强' in txt and '真羽化' in txt, txt)
+        _lbl = getattr(wiz, 'lbl_alpha_feather', None)
+        head = str(_lbl.cget('text')) if _lbl is not None else ''
+        check('F06 ★标题载体文案含「增强」与「真羽化」（方框 = 「启用」）',
+              '增强' in head and '真羽化' in head and txt == '启用', f'{head!r} + {txt!r}')
         check('F07 初始（兼容）时新开关未勾选',
               not bool(wiz.var_alpha_feather.get()), str(wiz.var_alpha_feather.get()))
     finally:
