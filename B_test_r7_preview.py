@@ -505,21 +505,28 @@ def test_no_render_radio(tmp, saved):
         # 先生原话：「点阵羽化的说明太长，可以做个说明按钮，单击或者鼠标放上去出说明。」
         # 判据：入口在版面上且可点 → Enter 出（Toplevel、overrideredirect、非模态、正文同源）
         #      → Leave 收（销毁，不留孤儿） → 单击出/再点收 → 全程不弹 messagebox（非模态硬要求）。
+        # ---- 第六轮（R19-4）**需求反转**：⑩ 的说明已经常驻在标题行右侧（先生原话
+        #      「点阵羽化，有了后面的解释，前面的说明就可以不要了。」）⇒ 「? 说明」按钮
+        #      **撤版面**。判据随之反转两条：① 按钮不再可见（C10）；
+        #      ② 但**弹窗通路必须仍在**（C11/C12/C13 改为直接调 _show / _hide /
+        #      _toggle_feather_tip —— 不再依赖按钮可见），否则将来想再加入口就得重写一遍。
+        #      判别力：把 self.btn_feather_help.pack(...) 那一行放回去 → C10 必 FAIL。
         btnh = getattr(wiz, 'btn_feather_help', None)
         tip0 = getattr(wiz, '_feather_tip', None)
-        check('C10 ★⑩ 行末有「? 说明」入口按钮且可见可点（R16：说明不再常驻版面）',
-              btnh is not None and int(btnh.winfo_ismapped()) == 1
-              and str(btnh.cget('state')) == 'normal'
+        check('C10 ★「? 说明」按钮已撤版面（说明已常驻版面，R19-4 需求反转）',
+              btnh is not None and int(btnh.winfo_ismapped()) == 0
+              and not bool(btnh.winfo_manager())
               and not _on_layout(getattr(wiz, 'lbl_feather_hint', None)),
               f'btn_feather_help={btnh is not None} '
               f'mapped={int(btnh.winfo_ismapped()) if btnh is not None else "?"} '
+              f'manager={btnh.winfo_manager() if btnh is not None else "?"} '
               f'lbl_feather_hint 在版面上='
               f'{_on_layout(getattr(wiz, "lbl_feather_hint", None))}')
         msgs = []
         _real_info = R.messagebox.showinfo
         R.messagebox.showinfo = lambda *a, **k: msgs.append(a)
         try:
-            btnh.event_generate('<Enter>')
+            wiz._show_feather_tip()
             wiz.root.update_idletasks()
             tip = getattr(wiz, '_feather_tip', None)
             alive = tip is not None and int(tip.winfo_exists()) == 1
@@ -529,24 +536,24 @@ def test_no_render_radio(tmp, saved):
                 body = str(wiz._feather_tip_lbl.cget('text'))
             except Exception:
                 pass
-            check('C11 ★鼠标悬停（<Enter>）出说明：Toplevel + overrideredirect + 正文 == _feather_help_text()',
+            check('C11 ★直接调 _show_feather_tip() 仍出说明：Toplevel + overrideredirect + 正文 == _feather_help_text()',
                   alive and over is True and body == wiz._feather_help_text(),
                   f'弹窗存在={alive} overrideredirect={over} 正文={body[:34]!r}')
-            btnh.event_generate('<Leave>')
+            wiz._hide_feather_tip()
             wiz.root.update_idletasks()
             tip2 = getattr(wiz, '_feather_tip', None)
             gone = tip2 is None or int(tip2.winfo_exists()) == 0
-            check('C12 ★鼠标离开（<Leave>）收起并销毁提示窗（不留孤儿 Toplevel）', gone,
+            check('C12 ★_hide_feather_tip() 收起并销毁提示窗（不留孤儿 Toplevel）', gone,
                   f'_feather_tip={tip2!r}')
-            btnh.invoke()
+            wiz._toggle_feather_tip()
             wiz.root.update_idletasks()
             tip3 = getattr(wiz, '_feather_tip', None)
             on1 = tip3 is not None and int(tip3.winfo_exists()) == 1
-            btnh.invoke()
+            wiz._toggle_feather_tip()
             wiz.root.update_idletasks()
             tip4 = getattr(wiz, '_feather_tip', None)
             off1 = tip4 is None or int(tip4.winfo_exists()) == 0
-            check('C13 ★单击出说明 / 再单击收起（真实 UI 通路：按钮 command）', on1 and off1,
+            check('C13 ★_toggle_feather_tip() 两次 = 出说明 / 再收起（单击通路仍在）', on1 and off1,
                   f'第一次点击后存在={on1} 第二次点击后收起={off1}')
             check('C14 ★全程不弹 messagebox（非模态；弹窗不打断配置流程）', not msgs,
                   f'showinfo 调用={len(msgs)} 次')

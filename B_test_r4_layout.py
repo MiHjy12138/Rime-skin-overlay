@@ -153,7 +153,9 @@ def _btn_row_info(wiz):
             t = str(b.cget('text'))
         except Exception:
             continue
-        if t in ('保存并启动', '取消', '🧹 清理垃圾…'):
+        # 第六轮（R19-4）：按钮文案由「🧹 清理垃圾…」改为「🧹 根目录杂项清理…」（先生定调
+        # 「清理垃圾按钮说法改一下，根目录杂项清理？或者其他的」）——按钮行识别跟着改。
+        if t in ('保存并启动', '取消', '🧹 根目录杂项清理…'):
             btns[t] = (b.winfo_rooty(), b.winfo_height(), b.winfo_ismapped())
     return {'row_top': target.winfo_rooty(), 'row_h': target.winfo_height(),
             'row_bottom': target.winfo_rooty() + target.winfo_height(), 'btns': btns}

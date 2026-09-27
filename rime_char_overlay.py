@@ -3495,7 +3495,7 @@ def cleanup_junk_files(extra_keep=(), parent=None, confirm=True, folder=None):
     items = collect_junk_files(folder, extra_keep=extra_keep)
     if not items:
         if confirm:
-            messagebox.showinfo('清理垃圾', '程序目录很干净，没有可清理的文件。', parent=parent)
+            messagebox.showinfo('根目录杂项清理', '程序目录很干净，没有可清理的文件。', parent=parent)
         return 0, 0
     total = sum(s for _p, s in items)
     # 删除前处理「配置指向的冗余副本」：把 config 指向改到 skins/ 里的同一张图
@@ -3522,7 +3522,7 @@ def cleanup_junk_files(extra_keep=(), parent=None, confirm=True, folder=None):
             total = sum(s for _p, s in items)
             if not items:
                 if confirm:
-                    messagebox.showinfo('清理垃圾', '没有可安全清理的文件（冗余副本改指向失败）。',
+                    messagebox.showinfo('根目录杂项清理', '没有可安全清理的文件（冗余副本改指向失败）。',
                                         parent=parent)
                 return 0, 0
     if confirm:
@@ -3532,7 +3532,7 @@ def cleanup_junk_files(extra_keep=(), parent=None, confirm=True, folder=None):
         extra = ('\n其中「配置正在使用的副本」在皮肤档案里有同一张图，清理后会自动改指向皮肤，不影响使用。'
                  if repoint else '')
         ok = messagebox.askyesno(
-            '清理垃圾',
+            '根目录杂项清理',
             f'将清理程序目录下的 {len(items)} 个文件（共 {_human_size(total)}）：\n\n{names}\n\n'
             f'skins/、config、error.log、README、CHANGELOG、LICENSE、正在使用的图片都不会动；\n'
             f'删除进回收站，可还原。{extra}', parent=parent)
@@ -3548,9 +3548,9 @@ def cleanup_junk_files(extra_keep=(), parent=None, confirm=True, folder=None):
                 n += 1
             except OSError:
                 pass
-    _write_log(f'[清理] 清理垃圾文件 {n}/{len(items)} 个（共 {_human_size(total)}）')
+    _write_log(f'[清理] 根目录杂项清理 {n}/{len(items)} 个（共 {_human_size(total)}）')
     if confirm:
-        messagebox.showinfo('清理垃圾',
+        messagebox.showinfo('根目录杂项清理',
                             f'已清理 {n} 个文件（{_human_size(total)}），可在回收站还原。',
                             parent=parent)
     return n, total
@@ -4598,7 +4598,7 @@ class ConfigWizard:
         """布局（v2.0-t15 重排）：
           顶部固定区（提示 + ① 图片）
           可滚动主体（② ~ ⑭：左栏普通设置 + 右栏高级设置）← 内容高时在这里滚
-          底部固定按钮行（保存并启动 / 取消 / 清理垃圾…）← 永远贴着窗口底、任何分辨率都可见
+          底部固定按钮行（保存并启动 / 取消 / 根目录杂项清理…）← 永远贴着窗口底、任何分辨率都可见
 
         重排动机：⑫ 图层区加控件后窗口需求高度 1107px > 1080p 工作区 1040px，
         按钮行被推到屏外（bottom=1128）→ 用户点不到保存。现在按钮行用 side='bottom'
@@ -4637,7 +4637,11 @@ class ConfigWizard:
                   bg='#4CAF50', fg='white', font=('Microsoft YaHei', 10, 'bold')).pack(side='left', padx=4)
         tk.Button(self.btn_row, text='取消', command=self._on_cancel,
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
-        tk.Button(self.btn_row, text='🧹 清理垃圾…', command=self._cleanup_junk,
+        # 第六轮（R19-4）· 先生原话：「清理垃圾按钮说法改一下，根目录杂项清理？或者其他的。」
+        #   ⇒ 文案改成「根目录杂项清理…」：它清的就是**程序所在目录**里不属于程序的散落文件
+        #   （cfg_image_*.png / preprocessed_*.png / _rv_*.py 这类），「垃圾」这词太笼统。
+        #   函数名与判定逻辑一字未动（_cleanup_junk / collect_junk_files / cleanup_junk_files）。
+        tk.Button(self.btn_row, text='🧹 根目录杂项清理…', command=self._cleanup_junk,
                   font=('Microsoft YaHei', 10)).pack(side='left', padx=4)
         tk.Label(self.btn_row, text='💡 保存后启动；下次双击可重新配置',
                  fg='#e67e22', font=('Microsoft YaHei', 11, 'bold')).pack(side='right')
@@ -4843,7 +4847,13 @@ class ConfigWizard:
         self.btn_feather_help = tk.Button(row_fe_head, text='? 说明', font=('Microsoft YaHei', 8),
                                           relief='groove', bd=1, padx=6, pady=0,
                                           cursor='hand2', command=self._toggle_feather_tip)
-        self.btn_feather_help.pack(side='left', padx=(6, 0))
+        # 第六轮（R19-4）· 先生原话：「点阵羽化，有了后面的解释，前面的说明就可以不要了。」
+        #   ⇒ 「? 说明」按钮**撤版面**（原来这行是 self.btn_feather_help.pack(side='left', padx=(6, 0))）。
+        #   做法与 R16 撤 lbl_feather_hint、T5 撤 lbl_layer_hint2 完全同一套：
+        #   **对象与弹窗方法全部保留**（按属性名读它的脚本照旧查得到；_show / _hide /
+        #   _toggle_feather_tip 与 _feather_help_text 一字未改，测试改为**直接调方法**验通路），
+        #   只是不再出现在版面上 —— 说明本体已经常驻在 ⑩ 标题行右侧与 ⑪ 的方框后面。
+        #   判别力：把 pack 那一行放回去 → B_test_r7_preview C10 与 probe_after_r16 C01 必 FAIL。
         self.btn_feather_help.bind('<Enter>', lambda _e: self._show_feather_tip())
         self.btn_feather_help.bind('<Leave>', lambda _e: self._hide_feather_tip())
         row_fe = tk.Frame(adv)
@@ -7396,7 +7406,7 @@ class TrayIcon:
                 pystray.MenuItem('皮肤选择', pystray.Menu(self._skin_items)),
                 pystray.MenuItem('开机自启', self._toggle_autostart,
                                  checked=lambda item: autostart_installed()),
-                pystray.MenuItem('清理垃圾文件…', self._cleanup_junk),
+                pystray.MenuItem('根目录杂项清理…', self._cleanup_junk),
                 pystray.MenuItem('退出 (Ctrl+Alt+Q)', self._quit),
             )
             self.icon = pystray.Icon('RimeSkinOverlay', img, 'Rime 皮肤外挂', menu)
