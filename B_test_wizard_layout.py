@@ -451,6 +451,32 @@ def test_slider_reuse(tmp):
         check('S26 随宽度比例写入当前层 40%',
               abs(float(wiz.cfg['layers'][1].get('follow_width_ratio', 0)) - 0.4) < 1e-9,
               repr(wiz.cfg['layers'][1].get('follow_width_ratio')))
+        # v2.0-R18-1（先生原话：「仅限于贴边方向为中间时使用」）——**新增需求**的判据：
+        # 控件随当前选中层可用/置灰（灰着不藏），小字写明「仅「中间」时可用」；字段与取值范围
+        # 一字未动（老档案原样读得进、存得下 ⇒ S26 仍然成立）。
+        # 夹具：第 2 层 anchor=right_edge、第 3 层 anchor=center ⇒ 正好覆盖「灰 / 亮」两态。
+        def _follow_state():
+            return (str(getattr(wiz, 'chk_lay_follow', None).cget('state'))
+                    if getattr(wiz, 'chk_lay_follow', None) is not None else None,
+                    str(getattr(wiz, 'scl_lay_follow', None).cget('state'))
+                    if getattr(wiz, 'scl_lay_follow', None) is not None else None)
+        _sel_anchor = wiz._layer_anchor_at(1)
+        _st_nc = _follow_state()
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(2)
+        wiz._on_layer_select()
+        _st_c = _follow_state()
+        _hint = str(getattr(wiz, 'lbl_follow_hint', None).cget('text')) \
+            if getattr(wiz, 'lbl_follow_hint', None) is not None else ''
+        check('S27 ★R18：非 center 层「居中时离框中心」控件置灰、center 层可用，'
+              '且小字写明「仅「中间」时可用」',
+              _st_nc == ('disabled', 'disabled') and _st_c == ('normal', 'normal')
+              and '仅「中间」时可用' in _hint,
+              f'第 2 层（anchor={_sel_anchor}）={_st_nc}；第 3 层（anchor=center）={_st_c}；'
+              f'小字={_hint!r}')
+        wiz.layer_list.selection_clear(0, 'end')
+        wiz.layer_list.selection_set(1)
+        wiz._on_layer_select()
     except Exception as e:
         import traceback
         traceback.print_exc()

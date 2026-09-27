@@ -55,7 +55,8 @@ PASS, FAIL, SKIPPED = [], [], []
 # ---- K 段阈值：N3 改前实测基线（96 DPI, 1080p）----
 BASE_COLLAPSED_H = 607      # 折叠态窗口需求高
 BASE_EXPANDED_H = 930       # 展开态窗口需求高
-BASE_TOP_BLOCK_H = 419      # 通用区（含 ③ 那一行）需求高
+BASE_TOP_BLOCK_H = 419      # 通用区（含 ③ 那一行）需求高 —— v2.0-R16 后单量此块口径已变，见 K04
+BASE_TOP_WHOLE_H = 507      # v2.0-R16 起 K04 改量「top_area + top_block」合计（改前 88 + 419）
 
 
 def check(name, cond, detail=''):
@@ -275,9 +276,21 @@ def test_structure(tmp, saved):
         in_general = bool(flip_ws) and any(_descendant(w, wiz.top_block) for w in flip_ws)
         check('A03 ★水平翻转只出现一处（通用区勾选框），未被换成下拉框',
               len(flip_ws) == 1 and in_general, f'勾选框={len(flip_ws)} 在通用区={in_general}')
-        y2, y3, y4 = _first_y(wiz, '②'), _first_y(wiz, '③'), _first_y(wiz, '④')
-        check('A04 ★③ 仍在通用区原位（② 候选框类型 与 ④ 缩放 之间）',
-              None not in (y2, y3, y4) and y2 < y3 < y4, f'y2={y2} y3={y3} y4={y4}')
+        # v2.0-R16 **前提过期改写**（证据见 _evidence_r16/T2_adapt/premise_expired.md）：
+        # 旧判据「② < ③ < ④」的前提是「④⑤⑥ 竖排挤在 ①②③ 下面」。R16 把 ④⑤⑥ 挪到
+        # ①②③ **右侧成两列三行**（先生原话「④⑤⑥可以分别放在①②③右侧并竖向对齐」）⇒
+        # ④ 与 ① 同行、y4 < y2 是**既定版型**，不再意味着「③ 被搬出通用区」。
+        # 新口径（同义且更严）：③ 仍在通用区**左列第 3 行**（② 的正下方），并与右列第 3 行
+        # 逐行对齐 —— 同时把三对行（①≈④ / ②≈⑤ / ③≈⑥）的对齐一起钉住。
+        ys = {k: _first_y(wiz, k) for k in '①②③④⑤⑥'}
+        y1, y2, y3 = ys['①'], ys['②'], ys['③']
+        y4, y5, y6 = ys['④'], ys['⑤'], ys['⑥']
+        rows_ok = (None not in (y1, y2, y3, y4, y5, y6)
+                   and abs(y1 - y4) <= 3 and abs(y2 - y5) <= 3 and abs(y3 - y6) <= 3)
+        check('A04 ★③ 仍在通用区左列第 3 行（② 的正下方），且两列三行逐行对齐'
+              '（R16：①≈④ / ②≈⑤ / ③≈⑥；旧「②<③<④」前提作废）',
+              rows_ok and y1 < y2 < y3,
+              f'y1..y6={y1},{y2},{y3},{y4},{y5},{y6} 行对齐={rows_ok}')
         side_titles = _texts_like(wiz, '③ 贴边方向')
         check('A05 ★③ 标题标出作用对象 = 当前层（含「第 N 层」，不再写「所有图层」）',
               any(('第' in t and '层) ' in t) or ('第' in t and '层）' in t) for t in side_titles)
@@ -825,24 +838,35 @@ def test_heights(tmp, saved):
         wiz = _probe(None, None, cfg)
         col = int(wiz.root.winfo_reqheight())          # N1 后默认折叠
         top_col = int(wiz.top_block.winfo_reqheight())
+        ta_col = int(wiz.top_area.winfo_reqheight())
         ok = _toggle(wiz, False)
         exp = int(wiz.root.winfo_reqheight())
         top_exp = int(wiz.top_block.winfo_reqheight())
+        ta_exp = int(wiz.top_area.winfo_reqheight())
         _toggle(wiz, True)
         col2 = int(wiz.root.winfo_reqheight())
         print(f'    1080p 折叠={col}px（基线 {BASE_COLLAPSED_H}） 展开={exp}px'
               f'（基线 {BASE_EXPANDED_H}） 往返后折叠={col2}px')
         print(f'    通用区 top_block：折叠={top_col}px 展开={top_exp}px'
-              f'（基线 {BASE_TOP_BLOCK_H}）')
+              f'（基线 {BASE_TOP_BLOCK_H}）｜顶部区 top_area：折叠={ta_col} 展开={ta_exp}')
+        print(f'    顶上两块合计（同口径量）：折叠={ta_col + top_col} 展开={ta_exp + top_exp}'
+              f'（改前基线 {BASE_TOP_WHOLE_H} = 88 + 419）')
         check('K01 ★折叠态窗口需求高不退化（≤ 改前基线 607px）', col <= BASE_COLLAPSED_H,
               f'{col} ≤ {BASE_COLLAPSED_H}')
         check('K02 ★展开态窗口需求高不退化（≤ 改前基线 930px）', ok and exp <= BASE_EXPANDED_H,
               f'{exp} ≤ {BASE_EXPANDED_H}')
         check('K03 ★折叠↔展开往返后折叠态回收（±2px 内回到初值）',
               abs(col2 - col) <= 2, f'{col} → {col2}')
-        check('K04 ★③ 所在的通用区块高度不增（≤ 改前基线 419px，两态都算）',
-              top_col <= BASE_TOP_BLOCK_H and top_exp <= BASE_TOP_BLOCK_H,
-              f'折叠={top_col} 展开={top_exp} ≤ {BASE_TOP_BLOCK_H}')
+        # v2.0-R16 前提过期改写（**不是放宽**）：旧判据只量 `top_block ≤ 419`，前提是
+        # 「③ 所在的通用块 = ①②③④⑤⑥ 那一块，① 图片行在**顶部固定区**里（不属这一块）」。
+        # R16 把 ① 图片行从顶部固定区搬进 ④ 那一格（左列第 1 行）⇒ 单量 top_block 的口径变了
+        # （419 → 421，+2px）。
+        # 改成**同口径**量「顶上两块合计 = top_area + top_block」：改前 88+419=507，改后 49+421=470。
+        # 这比旧判据覆盖面更大（顶部固定区的高度也一起管住了），方向仍是「不增」。
+        check('K04 ★③ 所在的通用区 + 其上的顶部区「合计」高度不增（≤ 改前基线 507px，两态都算）',
+              ta_col + top_col <= BASE_TOP_WHOLE_H and ta_exp + top_exp <= BASE_TOP_WHOLE_H,
+              f'折叠 top_area+top_block={ta_col + top_col} 展开={ta_exp + top_exp} '
+              f'≤ {BASE_TOP_WHOLE_H}（改前 88+419）')
     except Exception as e:
         import traceback
         traceback.print_exc()

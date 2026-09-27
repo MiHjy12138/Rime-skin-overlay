@@ -55,6 +55,16 @@ R12_COLLAPSED_WIN_H = 590  # R12 折叠态窗口需求高
 MIN_BTN_H = 30            # N1 验收：按钮高度 ≥ 30px
 MIN_BTN_GAIN = 1.40       # N1 验收：面积相对 R12 基线 +40%
 
+# v2.0-R16/R17（第五轮）**前提过期**登记（证据见 _evidence_r16/T2_adapt/premise_expired.md）：
+#   · R17 先生原话「按钮部分太长…按钮覆盖到字末即可」⇒ 判据从「宽度只能变大」反向成
+#     「宽度收在文案里（≈ 自身需求宽、只占标题行少部分）」——G03 改写（不是放宽：它现在会在
+#     `fill='x', expand=True` 复活时立刻变红）。
+#   · R16 把 ⑩ 下面的两段常驻小字撤出版面（改由「? 说明」弹提示）⇒ 展开态列子控件里有两个
+#     Label 永不 mapped。判据从「全部 mapped」改成「未 map 的只能是这两段撤版说明存放 Label
+#     白名单，其余一律 mapped」+「这两段仍是活体（内容随模式切换而变）」——E05/E05b。
+#     （t5 会把 ⑫ 里那行重复说明也撤版面 ⇒ 白名单先按实现给出的最终集合写全。）
+HINT_LABEL_ATTRS = ('lbl_feather_hint', 'lbl_render_hint', 'lbl_layer_hint2')
+
 
 def check(name, cond, detail=''):
     if cond:
@@ -293,6 +303,19 @@ def test_structure(tmp, saved):
               and str(btn.cget('state')) == 'normal',
               f'mapped={int(btn.winfo_ismapped()) if btn is not None else "?"} '
               f'state={str(btn.cget("state")) if btn is not None else "?"}')
+        # A10（R17，先生第五轮原话）：「图片右边的小字没必要」⇒ lbl_adv_hint
+        #（「（折叠只是收起来，设置不会丢）」）连同那句文案一起从向导里删掉。
+        stray = []
+        for w in _all_widgets(wiz.root):
+            try:
+                t = str(w.cget('text'))
+            except Exception:
+                continue
+            if '折叠只是收起来' in t:
+                stray.append(t)
+        check('A10 ★图片右侧那句小字已删（R17）：lbl_adv_hint 不存在，且控件树里找不到那句文案',
+              not hasattr(wiz, 'lbl_adv_hint') and not stray,
+              f'hasattr(lbl_adv_hint)={hasattr(wiz, "lbl_adv_hint")} 残留文案={stray or "无"}')
         _toggle(wiz, False)
     finally:
         _restore(real)
@@ -494,11 +517,41 @@ def test_expanded_inventory(tmp, saved):
         check('E04 折叠按钮可点（state=normal）', st == 'normal', st)
         # N1 新增：展开后 ⑧~⑭ 的控件必须**真的可见**（不是「存在但收着」）
         cols = list(getattr(wiz, 'adv_cols', []) or [])
-        mapped = [sum(1 for ch in c.winfo_children() if int(ch.winfo_ismapped())) for c in cols]
-        total = sum(len(c.winfo_children()) for c in cols)
-        check('E05 ★展开后各列子控件全部可见（winfo_ismapped=1）',
-              total > 0 and sum(mapped) == total,
-              f'可见/总数={sum(mapped)}/{total} 分列={mapped}')
+        kids = [ch for c in cols for ch in c.winfo_children()]
+        unmapped = [ch for ch in kids if int(ch.winfo_ismapped()) == 0]
+        wl = {getattr(wiz, n, None) for n in HINT_LABEL_ATTRS}
+        wl.discard(None)
+        bad = [ch for ch in unmapped if ch not in wl]
+        hit = sorted(n for n in HINT_LABEL_ATTRS if getattr(wiz, n, None) in unmapped)
+        # R16 前提过期改写（**不是放宽**）：旧判据「各列子控件全部 mapped」的前提是
+        # 「⑩ 的两段说明常驻版面」。R16 明确要求它们撤版面（改「? 说明」弹提示）⇒
+        # 未 map 的控件必须**只能是**那几段撤版说明存放 Label（按属性名精确列出，不看文案），
+        # 其它任何一个控件没 map 依然立刻变红。
+        check('E05 ★展开后各列子控件除「撤版说明存放 Label」外全部可见（winfo_ismapped=1）',
+              bool(kids) and not bad,
+              f'可见/总数={len(kids) - len(unmapped)}/{len(kids)}；'
+              f'未 map 且不在白名单={[str(x) for x in bad] or "无"}；白名单命中={hit}')
+        # E05b：撤版 ≠ 弃用 —— 这两段仍是**活的正文存放点**（弹窗读的就是它们）
+        h_f = getattr(wiz, 'lbl_feather_hint', None)
+        h_r = getattr(wiz, 'lbl_render_hint', None)
+        wiz.var_render.set('compat')
+        wiz._update_render_hint()
+        t_c = (str(h_f.cget('text')) if h_f is not None else None,
+               str(h_r.cget('text')) if h_r is not None else None)
+        wiz.var_render.set('alpha')
+        wiz._update_render_hint()
+        t_a = (str(h_f.cget('text')) if h_f is not None else None,
+               str(h_r.cget('text')) if h_r is not None else None)
+        check('E05b ★撤版后说明仍是活的正文存放点：随模式切换而变、两处同句、'
+              '且 == _feather_help_text()（拆掉它们或不再更新 → 红）',
+              h_f is not None and h_r is not None
+              and t_c[0] != t_a[0] and t_c[1] != t_a[1] and t_a[0] == t_a[1]
+              == wiz._feather_help_text()
+              and not _packed(h_f) and not _packed(h_r),
+              f'compat={str(t_c[0])[:16]!r} → alpha={str(t_a[0])[:16]!r}；'
+              f'两处同句={t_a[0] == t_a[1]}；packed={_packed(h_f)}/{_packed(h_r)}')
+        wiz.var_render.set('compat')
+        wiz._update_render_hint()
         # 折叠 → 展开后控件仍可操作（列表可选中、滑条可写）
         ok = _toggle(wiz, True)
         ok2 = _toggle(wiz, False)
@@ -569,10 +622,12 @@ def test_button_size(tmp, saved):
         wiz.root.update_idletasks()
         wiz.root.update()
         w_e, h_e = _btn_box(wiz)
+        req_e = (int(btn.winfo_reqwidth()), int(btn.winfo_reqheight()))
         _toggle(wiz, True)
         wiz.root.update_idletasks()
         wiz.root.update()
         w_c, h_c = _btn_box(wiz)
+        req_c = (int(btn.winfo_reqwidth()), int(btn.winfo_reqheight()))
         area_e, area_c = w_e * h_e, w_c * h_c
         gain = area_e / float(max(1, R12_BTN_AREA))
         print(f'    R12 基线：{R12_BTN_W}×{R12_BTN_H}px = {R12_BTN_AREA} px²'
@@ -584,8 +639,23 @@ def test_button_size(tmp, saved):
               f'展开 {h_e}px / 折叠 {h_c}px，阈值 {MIN_BTN_H}px')
         check('G02 ★按钮面积相对 R12 基线 ≥ +40%', gain >= MIN_BTN_GAIN,
               f'{area_e} px² vs 基线 {R12_BTN_AREA} px² = {gain:.2f}×（阈值 {MIN_BTN_GAIN}×）')
-        check('G03 按钮宽度不小于 R12 基线（变大不缩水）', w_e >= R12_BTN_W and w_c >= 219,
-              f'展开 {w_e}px（R12 {R12_BTN_W}）/ 折叠 {w_c}px（R12 219）')
+        row_w = 0
+        try:
+            row_w = int(btn.master.winfo_width())
+            if row_w <= 1:
+                row_w = int(btn.master.winfo_reqwidth())
+        except Exception:
+            pass
+        print(f'    标题行实际宽={row_w}px（按钮占 {100.0 * w_e / max(1, row_w):.0f}%）')
+        # R17（先生第五轮原话「按钮部分太长…按钮覆盖到字末即可」）—— **反向前提改写**：
+        # 旧判据「宽度不小于 R12 基线（变大不缩水）」的前提是 N1 的「按钮做大点」。
+        # 现在改成**双向**的两条：① 宽度贴近自身需求宽（收在文案里，±4px）；
+        # ② 只占标题行的少部分（≤60%，把 `fill='x', expand=True` 复活立刻打红）。
+        check('G03 ★按钮宽度收在文案里（R17 反向前提）：≈ 自身需求宽且 ≤ 标题行 60%',
+              abs(w_e - req_e[0]) <= 4 and abs(w_c - req_c[0]) <= 4
+              and bool(row_w) and w_e <= row_w * 0.6 and w_c <= row_w * 0.6,
+              f'展开 {w_e}px（需求 {req_e[0]}）/ 折叠 {w_c}px（需求 {req_c[0]}）；'
+              f'标题行={row_w}px（展开占 {100.0 * w_e / max(1, row_w):.0f}%）')
         check('G04 ★折叠态按钮可见且可点（mapped=1 / state=normal）',
               int(btn.winfo_ismapped()) == 1 and str(btn.cget('state')) == 'normal',
               f'mapped={int(btn.winfo_ismapped())} state={str(btn.cget("state"))}')
@@ -614,7 +684,7 @@ def main():
     R.set_autostart = lambda *a, **k: (True, '（测试打桩）')
     try:
         if not gui_ok:
-            for t, cnt in (('A', 10), ('B', 5), ('C', 6), ('D', 7), ('E', 8), ('F', 1), ('G', 4)):
+            for t, cnt in (('A', 11), ('B', 5), ('C', 6), ('D', 7), ('E', 9), ('F', 1), ('G', 4)):
                 for i in range(1, cnt + 1):
                     SKIPPED.append(f'{t}{i:02d}')
                     print(f'  [SKIP] {t}{i:02d}  (无桌面环境（GUI 不可用）)')

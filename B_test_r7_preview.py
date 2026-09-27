@@ -379,10 +379,61 @@ def _radiobuttons(w):
     return out
 
 
+# ---- R18/第五轮追加（**需求反转**，登记在 _evidence_r16/T2_adapt/premise_expired.md）----
+# R10 的判据「窗口里再没有 ⑪ 编号标题」的前提是「⑪ 这个编号项按需求删掉了」。第五轮先生问
+# 「⑪ 去哪了」后定调：**把 ⑪ 编号还给 ⑩ 行末的「增强（真羽化）」开关**，让向导编号
+# ⑩⑪⑫⑬⑭ 重新连续。⇒ ⑪ 从「必须不存在」变成「必须恰好存在一个」，载体是新开关本身。
+# 判别力口径（captain 裁决）：① 绑 var_render 的 Radiobutton 仍然必须为 0（单选组的删除成立）；
+# ② 版面上的「⑪ 编号标题」恰好 1 个且 == chk_alpha_feather；③ 说明**正文**允许且应当引用 ⑪，
+# 但只许指向「⑪ 增强（真羽化）」。
+_NUM_TITLE_CLASSES = ('Label', 'Button', 'Checkbutton', 'Radiobutton', 'Labelframe')
+
+
+def _on_layout(w):
+    """控件是否被几何管理器接管（= 属于版面的控件）。
+
+    用 `winfo_manager()` 而**不是** `winfo_ismapped()`：向导默认折叠时 ⑩ 那一行整块不 map，
+    但控件本身仍归 pack 管；而 R16 撤版的 `lbl_feather_hint` / `lbl_render_hint` 连 pack 都
+    没调（只作弹窗正文的存放点）⇒ manager 为空。用它区分「编号标题」与「正文存放点」，
+    不靠文案白名单，也不受折叠态影响。
+    """
+    try:
+        return bool(w.winfo_manager())
+    except Exception:
+        return False
+
+
+def _titles_11(wiz):
+    """控件树里以「⑪」开头的标题类控件（含未进版面的正文存放 Label）"""
+    out = []
+    for c in _walk(wiz.root):
+        try:
+            if c.winfo_class() not in _NUM_TITLE_CLASSES:
+                continue
+            if str(c.cget('text')).startswith('⑪'):
+                out.append(c)
+        except Exception:
+            pass
+    return out
+
+
+def _live_titles_11(wiz):
+    return [c for c in _titles_11(wiz) if _on_layout(c)]
+
+
 def test_no_render_radio(tmp, saved):
     section('C. ⑪ 渲染模式单选已删：增强开关成唯一入口，cfg 口径不变')
     img = _make_png(os.path.join(tmp, 'r10.png'))
     wiz = _make_wiz({'image': img}, saved)
+    # R16/R17 取样前提（沿用第四轮 N1 的规矩）：向导默认折叠 ⇒ ⑩ 那一行（含「? 说明」入口）
+    # 在 adv_body 里不 map。C10~C13 量的是**版面**上的入口，故先显式展开；C01~C09 是属性/文案
+    # 判据，展开不影响它们的判别力。判别力证据：注释掉下面三行 → C10 必 FAIL。
+    try:
+        wiz._toggle_adv_collapse(False)
+        wiz.root.update_idletasks()
+        wiz.root.update()
+    except Exception:
+        pass
     try:
         rbs = _radiobuttons(wiz.root)
         # 注意：tkinter 的 cget('variable') 回的是 Tcl 变量名（PY_VARn），
@@ -400,7 +451,16 @@ def test_no_render_radio(tmp, saved):
             if isinstance(t, str) and t:
                 texts.append(t)
         hit = [t for t in texts if '⑪' in t]
-        check('C02 ★窗口里再没有「⑪」编号标题', not hit, f'命中={hit}')
+        live11 = _live_titles_11(wiz)
+        chk0 = getattr(wiz, 'chk_alpha_feather', None)
+        # R18（第五轮追加 · 需求反转）：⑪ 从「必须不存在」变成「必须恰好存在一个」，
+        # 且载体就是 ⑩ 行末那个 Checkbutton。旧判据（not hit）保留为**记账信息**打印，
+        # 不再作断言 —— 断言换成「唯一性 + 载体身份」两条，强度不降（见文件头 _live_titles_11）。
+        check('C02 ★版面上的「⑪ 编号标题」恰好 1 个，且就是 ⑩ 行末的「增强（真羽化）」开关'
+              '（R10 删的是单选组；第五轮把编号还给了这个开关 —— 需求反转）',
+              chk0 is not None and len(live11) == 1 and live11[0] is chk0,
+              f'版面上 ⑪ 编号标题={len(live11)} 个；未进版面的 ⑪ 正文存放控件='
+              f'{len(_titles_11(wiz)) - len(live11)} 个；全部含 ⑪ 文案={hit}')
         check('C03 判别力：扫描器仍能抓到别的单选组（② 候选框类型 ≥2 个，不是恒空）',
               len(rbs) >= 2, f'Radiobutton 总数={len(rbs)}')
         chk = getattr(wiz, 'chk_alpha_feather', None)
@@ -420,15 +480,79 @@ def test_no_render_radio(tmp, saved):
               wiz.var_render.get() == 'compat', f'var_render={wiz.var_render.get()!r}')
 
         t_cmp = str(wiz.lbl_render_hint.cget('text'))
-        check('C07 ★提示文案不再引用「⑪」', '⑪' not in t_cmp, repr(t_cmp[:40]))
+        # R18（第五轮追加 · 需求反转）：旧判据「提示文案不再引用 ⑪」的前提是「⑪ 编号项已删」。
+        # 现在 ⑪ 是**活的编号**（⑩ 行末开关），正文引用它正是「口径统一」的要求 ⇒ 反转为：
+        # 引用 ⑪ 必须指向「⑪ 增强（真羽化）」，且不得再指向已删的单选组「⑪ 渲染模式」。
+        _ref_ok = lambda t: ('⑪ 渲染模式' not in t
+                             and (('⑪' not in t) or ('⑪ 增强（真羽化）' in t)))
+        check('C07 ★提示/说明正文引用 ⑪ 时**必须**指向「⑪ 增强（真羽化）」（不得指向已删的单选组）',
+              _ref_ok(t_cmp), repr(t_cmp[:60]))
         check('C08 ★提示文案仍讲清「点阵羽化是兼容模式近似」',
               '点阵' in t_cmp and '近似' in t_cmp, repr(t_cmp[:60]))
         wiz.var_alpha_feather.set(True)
         wiz._on_alpha_feather_toggle()
         t_alp = str(wiz.lbl_render_hint.cget('text'))
-        check('C09 增强态文案仍讲清真半透明与点击穿透（不退化）',
-              '半透明' in t_alp and '穿透' in t_alp and '⑪' not in t_alp,
+        check('C09 增强态文案仍讲清真半透明与点击穿透（不退化），且 ⑪ 引用口径同上',
+              '半透明' in t_alp and '穿透' in t_alp and _ref_ok(t_alp),
               repr(t_alp[:60]))
+
+        # ---- R16（第五轮）：⑩ 说明入口 —— 常驻小字撤版面，改「? 说明」单击/悬停弹提示 ----
+        # 先生原话：「点阵羽化的说明太长，可以做个说明按钮，单击或者鼠标放上去出说明。」
+        # 判据：入口在版面上且可点 → Enter 出（Toplevel、overrideredirect、非模态、正文同源）
+        #      → Leave 收（销毁，不留孤儿） → 单击出/再点收 → 全程不弹 messagebox（非模态硬要求）。
+        btnh = getattr(wiz, 'btn_feather_help', None)
+        tip0 = getattr(wiz, '_feather_tip', None)
+        check('C10 ★⑩ 行末有「? 说明」入口按钮且可见可点（R16：说明不再常驻版面）',
+              btnh is not None and int(btnh.winfo_ismapped()) == 1
+              and str(btnh.cget('state')) == 'normal'
+              and not _on_layout(getattr(wiz, 'lbl_feather_hint', None)),
+              f'btn_feather_help={btnh is not None} '
+              f'mapped={int(btnh.winfo_ismapped()) if btnh is not None else "?"} '
+              f'lbl_feather_hint 在版面上='
+              f'{_on_layout(getattr(wiz, "lbl_feather_hint", None))}')
+        msgs = []
+        _real_info = R.messagebox.showinfo
+        R.messagebox.showinfo = lambda *a, **k: msgs.append(a)
+        try:
+            btnh.event_generate('<Enter>')
+            wiz.root.update_idletasks()
+            tip = getattr(wiz, '_feather_tip', None)
+            alive = tip is not None and int(tip.winfo_exists()) == 1
+            over = bool(tip.overrideredirect()) if alive else None
+            body = ''
+            try:
+                body = str(wiz._feather_tip_lbl.cget('text'))
+            except Exception:
+                pass
+            check('C11 ★鼠标悬停（<Enter>）出说明：Toplevel + overrideredirect + 正文 == _feather_help_text()',
+                  alive and over is True and body == wiz._feather_help_text(),
+                  f'弹窗存在={alive} overrideredirect={over} 正文={body[:34]!r}')
+            btnh.event_generate('<Leave>')
+            wiz.root.update_idletasks()
+            tip2 = getattr(wiz, '_feather_tip', None)
+            gone = tip2 is None or int(tip2.winfo_exists()) == 0
+            check('C12 ★鼠标离开（<Leave>）收起并销毁提示窗（不留孤儿 Toplevel）', gone,
+                  f'_feather_tip={tip2!r}')
+            btnh.invoke()
+            wiz.root.update_idletasks()
+            tip3 = getattr(wiz, '_feather_tip', None)
+            on1 = tip3 is not None and int(tip3.winfo_exists()) == 1
+            btnh.invoke()
+            wiz.root.update_idletasks()
+            tip4 = getattr(wiz, '_feather_tip', None)
+            off1 = tip4 is None or int(tip4.winfo_exists()) == 0
+            check('C13 ★单击出说明 / 再单击收起（真实 UI 通路：按钮 command）', on1 and off1,
+                  f'第一次点击后存在={on1} 第二次点击后收起={off1}')
+            check('C14 ★全程不弹 messagebox（非模态；弹窗不打断配置流程）', not msgs,
+                  f'showinfo 调用={len(msgs)} 次')
+            check('C15 前置：本段开始时没有残留提示窗（否则 C11/C12 无判别力）', tip0 is None,
+                  f'起始 _feather_tip={tip0!r}')
+        finally:
+            R.messagebox.showinfo = _real_info
+            try:
+                wiz._hide_feather_tip()
+            except Exception:
+                pass
     finally:
         _kill(wiz)
 

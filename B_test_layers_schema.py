@@ -513,24 +513,50 @@ def test_anchor_layout():
           (wx2 - wx1, wy2 - wy1) == (137, -55) and (ww2, wh2) == (ww1, wh1) and pl2 == pl1,
           f'dxy=({wx2 - wx1},{wy2 - wy1})')
 
-    # follow_width_ratio
+    # ---- follow_width_ratio：v2.0-R18-1 语义收口（**前提过期改写**，见
+    #      _evidence_r16/T2_adapt/premise_expired.md）----
+    # 旧前提（R4 建立 C13/C14 时）：left_edge / right_edge 也吃这个比例 —— 右层按框宽
+    #   额外外推 cw*ratio、左层反向；默认 0 只跟边缘。
+    # 新前提（先生第五轮定调「仅限于贴边方向为中间时使用，固定在待选框的某个百分比距离」）：
+    #   **只有 anchor == 'center' 的层用它**，基准 = 离框中心；left/right 一律忽略（等价 0）。
+    #   字段名与取值范围（−1.0~1.0，UI 0~60%）未变、schema 未动 ⇒ 老档案原样读得进、存得下。
+    # 改写口径：旧判据只查「右层是否按比例外推」，改写后查**更严的三条**——
+    #   ① left/right：ratio=0.5 与 ratio=0 的**整条计划值逐位相同**（不只是 x）；
+    #   ② center：比例**生效**且基准 = 框中心（精确公式）；
+    #   ③ center ratio=0：逐位等于居中公式（老档案 ratio=0 行为不变）。
     layr = _layers_for(1, 'right_edge', follow_width_ratio=0.5)
     layl = _layers_for(1, 'left_edge', follow_width_ratio=0.5)
-    _w0, _y0, _W0, _H0, _p0 = R.plan_layer_layout(layr, sizes, rect)
-    _w1, _y1, _W1, _H1, _p1 = R.plan_layer_layout(layr, sizes, wide)
-    d_w = (_w1) - (_w0)
-    check('C13 follow_width_ratio=0.5：右层随宽度额外外推一半', d_w == (1100 - 900) // 2 + (1100 - 900),
-          f'delta={d_w}')
-    _w2, _y2, _W2, _H2, _p2 = R.plan_layer_layout(layl, sizes, wide)
-    _w3, _y3, _W3, _H3, _p3 = R.plan_layer_layout(layl, sizes, rect)
-    dcw = (wide.right - wide.left) - (rect.right - rect.left)
-    check('C14 follow_width_ratio 对左层反向（向左外推）', _w2 - _w3 == -(dcw // 2),
-          f'delta={_w2 - _w3} exp={-(dcw // 2)}')
+    layr0 = _layers_for(1, 'right_edge', follow_width_ratio=0.0)
+    layl0 = _layers_for(1, 'left_edge', follow_width_ratio=0.0)
+    p_r = R.plan_layer_layout(layr, sizes, wide)
+    p_r0 = R.plan_layer_layout(layr0, sizes, wide)
+    check('C13 ★右贴边忽略 follow_width_ratio：ratio=0.5 与 ratio=0 **整条计划值逐位相同**'
+          '（R18 语义收口；旧判据「右层随宽度额外外推一半」的前提作废）',
+          p_r == p_r0 and (p_r[0] - R.plan_layer_layout(layr0, sizes, rect)[0])
+          == (1100 - 900),
+          f'ratio0.5={p_r}  ratio0={p_r0}')
+    p_l = R.plan_layer_layout(layl, sizes, wide)
+    p_l0 = R.plan_layer_layout(layl0, sizes, wide)
+    check('C14 ★左贴边忽略 follow_width_ratio：ratio=0.5 与 ratio=0 **整条计划值逐位相同**'
+          '（旧判据「左层反向额外外推」的前提作废）',
+          p_l == p_l0, f'ratio0.5={p_l}  ratio0={p_l0}')
     lay0 = _layers_for(1, 'right_edge', follow_width_ratio=0.0)
     _w4, _y4, _W4, _H4, _p4 = R.plan_layer_layout(lay0, sizes, wide)
     _w5, _y5, _W5, _H5, _p5 = R.plan_layer_layout(lay0, sizes, rect)
     check('C15 follow_width_ratio=0（默认）不额外分摊，只跟边缘', _w4 - _w5 == (1100 - 900),
           f'delta={_w4 - _w5}')
+    # center：比例**生效**，基准 = 离框中心（R18 新语义的正向判据）
+    layc = _layers_for(1, 'center', follow_width_ratio=0.5)
+    layc0 = _layers_for(1, 'center', follow_width_ratio=0.0)
+    p_c = R.plan_layer_layout(layc, sizes, rect)
+    p_c0 = R.plan_layer_layout(layc0, sizes, rect)
+    cw_ = rect.right - rect.left
+    exp_c = 500 + (cw_ - 80) // 2 + int(round(cw_ * 0.5))
+    check('C15b ★center 层：ratio=0.5 → 窗口 x = 居中位 + 框宽×0.5（比例只对 center 生效）',
+          p_c[0] == exp_c and p_c[0] != p_c0[0],
+          f'ratio0.5={p_c[0]} 期望={exp_c}；ratio0={p_c0[0]}')
+    check('C15c ★center 层 ratio=0 → 逐位等于居中公式（老档案 ratio=0 行为不变，兼容硬要求）',
+          p_c0[0] == 500 + (cw_ - 80) // 2, f'ratio0={p_c0[0]}')
 
     # offset 微调
     layo = _layers_for(1, 'right_edge', offset_x=17, offset_y=-9)

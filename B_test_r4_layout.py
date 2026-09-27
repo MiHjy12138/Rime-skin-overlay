@@ -366,7 +366,11 @@ def test_widget_inventory(tmp, cfg):
             ('⑨ 特效', ('var_corner', 'var_corner_r')),
             ('⑩ 点阵羽化 + 增强开关', ('var_feather', 'var_feather_r', 'chk_feather',
                                         'scl_feather', 'var_alpha_feather', 'chk_alpha_feather')),
-            ('⑪ 渲染模式', ('var_render', 'lbl_render_hint')),
+            # v2.0-R18（第五轮追加 · **需求反转**）：⑪ 编号**还给** ⑩ 行末的「增强（真羽化）」
+            # 开关（先生问「⑪ 去哪了」后定调；向导编号 ⑩⑪⑫⑬⑭ 重新连续）⇒ 本条映射由
+            # 「绑 var_render 的单选组」改指那个 Checkbutton。var_render / lbl_render_hint
+            # 仍在（内部状态 + 说明正文存放点），已在 ⑩ 那一条里覆盖，不重复登记。
+            ('⑪ 增强（真羽化）（⑩ 行末开关）', ('var_alpha_feather', 'chk_alpha_feather')),
             ('⑫ 图层列表', ('layer_list', 'btn_layer_add', 'btn_layer_del',
                              'var_lay_follow', 'var_lay_follow_r', 'lbl_layer_hint2')),
             ('⑬ 皮肤管理', ('skin_cb', 'btn_scheme', 'btn_scheme_restore',
@@ -376,6 +380,16 @@ def test_widget_inventory(tmp, cfg):
         for label, names in items:
             miss = [n for n in names if not hasattr(wiz, n)]
             check(f'C01 {label}：控件齐全（{len(names)} 个）', not miss, f'缺={miss}')
+        # C01b：⑪ 编号的载体身份（R18 需求反转后 ⑪ = ⑩ 行末那个开关，不再是已删的单选组）
+        chk11 = getattr(wiz, 'chk_alpha_feather', None)
+        try:
+            ok11 = (chk11 is not None and str(chk11.cget('text')).startswith('⑪')
+                    and str(chk11.cget('variable')) == str(wiz.var_alpha_feather)
+                    and str(chk11.winfo_class()) == 'Checkbutton')
+        except Exception:
+            ok11 = False
+        check('C01b ★⑪ 编号的载体 = ⑩ 行末「增强（真羽化）」开关（文案以 ⑪ 开头、绑 var_alpha_feather）',
+              ok11, f'text={chk11 and chk11.cget("text")!r}')
         # 可操作：按钮类不被禁用（⑩ 的增强开关在兼容模式下可点、点阵勾选可编辑）
         for name, want_state in (('btn_img', 'normal'), ('layer_list', 'normal'),
                                  ('chk_feather', 'normal'), ('chk_alpha_feather', 'normal'),

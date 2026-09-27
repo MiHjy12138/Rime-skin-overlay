@@ -211,9 +211,30 @@ def test_structure(tmp, saved):
         y3, y4 = _first_y(wiz, '③'), _first_y(wiz, '④')
         yf = int(ws[0].winfo_rooty()) if ws else None
         # 同一行的 Checkbutton 与 Label 基线差 1~2px（Tk 边框/padding），留 8px 容差
-        check('A02 ★翻转控件落在 ③ 与 ④ 之间（③ 那一行或紧随其后）',
-              None not in (y3, y4, yf) and (y3 - 8) <= yf < y4,
-              f'y3={y3} y_flip={yf} y4={y4}')
+        # v2.0-R16 **前提过期改写**（证据见 _evidence_r16/T2_adapt/premise_expired.md）：
+        #   旧判据「(y3 − 8) ≤ y_flip < y4」用「③ 与 ④ 的相对位置」表达「翻转在 ③ 那一行」，
+        #   前提是 ④⑤⑥ 横排在 ①②③ **下面**（改前实测 ③ 行 204 < ④ 行 241）。
+        #   R16 把 ④⑤⑥ 挪到 ①②③ 右侧（④ 与 ① 同行：实测 ①=④=170 / ②=⑤=206 / ③=⑥=242）
+        #   ⇒「< y4」这一半必然不成立。
+        #   另外：旧判据里的 y3 取自「全窗以 ③ 开头的控件的最小 y」，而折叠态下 `lbl_side_target`
+        #   （⑫ 那张卡里的行内提示，也以 ③ 开头）不 map、`winfo_rooty()` 返回 0 ⇒ 实测 y3=0，
+        #   旧判据实际只有「y_flip < y4」半条在生效。
+        #   新口径直接钉**同一行**（先生/R16 明确要求「③ 与水平翻转仍同一行」）：
+        #   ① 结构：翻转勾选框与 ③ 标题在**同一个单元格**（cell_l2）；
+        #   ② 几何：行内 y 差 ≤ 8px；③ 仍在通用区 top_block 里（A01/A03 已覆盖）。
+        _cell_y = None
+        for _nm in ('lbl_side_title',):
+            _w = getattr(wiz, _nm, None)
+            _cell_y = int(_w.winfo_rooty()) if _w is not None else None
+        same_cell = bool(ws) and getattr(wiz, 'lbl_side_title', None) is not None \
+            and ws[0].master is wiz.lbl_side_title.master
+        check('A02 ★翻转控件仍在 ③ 那一行（同一单元格 + 行内 y 差 ≤8px）'
+              '（R16：④ 已搬到 ① 行，旧「在 ③ 与 ④ 之间」前提作废）',
+              bool(ws) and same_cell and None not in (_cell_y, yf)
+              and abs(yf - _cell_y) <= 8
+              and _descendant(ws[0], wiz.top_block),
+              f'同一单元格={same_cell} y(③标题)={_cell_y} y_flip={yf} '
+              f'（参考：全窗 ③ 前缀最小 y={y3}、④={y4}）')
         check('A03 翻转控件在通用区 top_block 里（不是又留在图层区）',
               bool(ws) and _descendant(ws[0], wiz.top_block), '')
         check('A04 ★翻转文案标出作用对象 = 当前层（第 N 层，不再写「所有图层」）',

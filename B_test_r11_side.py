@@ -254,10 +254,17 @@ def test_structure(tmp, saved):
         check('A04 ★③ 标题标出作用对象 = 当前层（第 N 层，不再写「所有图层」）',
               any('第' in t and '层' in t for t in titles)
               and not any('所有图层' in t for t in titles), repr(titles))
-        y2, y3, y4 = _first_y(wiz, '②'), _first_y(wiz, '③'), _first_y(wiz, '④')
-        check('A05 ★③ 行在 ② 候选框类型 与 ④ 缩放 之间',
-              None not in (y2, y3, y4) and y2 < y3 < y4,
-              f'y2={y2} y3={y3} y4={y4}')
+        # v2.0-R16 前提过期改写（同 n3 A04）：④⑤⑥ 由「竖排在下」改成「挪到 ①②③ 右侧」⇒
+        # 「②<③<④」不再成立。新口径：③ 在通用区左列第 3 行（② 正下方）+ 两列三行逐行对齐。
+        ys = {k: _first_y(wiz, k) for k in '①②③④⑤⑥'}
+        y1, y2, y3 = ys['①'], ys['②'], ys['③']
+        y4, y5, y6 = ys['④'], ys['⑤'], ys['⑥']
+        rows_ok = (None not in (y1, y2, y3, y4, y5, y6)
+                   and abs(y1 - y4) <= 3 and abs(y2 - y5) <= 3 and abs(y3 - y6) <= 3)
+        check('A05 ★③ 行仍在通用区原位（左列第 3 行 = ② 正下方），且两列三行逐行对齐'
+              '（R16：①≈④ / ②≈⑤ / ③≈⑥；旧「②<③<④」前提作废）',
+              rows_ok and y1 < y2 < y3,
+              f'y1..y6={y1},{y2},{y3},{y4},{y5},{y6} 行对齐={rows_ok}')
         check('A06 选项文案讲清贴哪边（右/左/中）',
               all(k in ''.join(side_r) for k in ('右', '左', '中')), repr(side_r))
         check('A07 通用区 ④⑤⑥ 仍在（只搬 ③，不误删）',
@@ -279,10 +286,20 @@ def test_structure(tmp, saved):
               and after_flip == [False, True, False],
               f"在通用区={in_general} flip {before_flip} → {after_flip}")
         # N3 需求回退：旧 A09「说明行讲清统一口径」→ 讲清「在通用区、按当前层调」
-        side_hints = _texts_like(wiz, '贴边')
-        check('A09 图层区说明行讲清「贴边在通用区、按当前层调」',
-              any(('通用区' in t or '切层自动切值' in t) for t in side_hints),
-              repr(side_hints))
+        # v2.0-R16 前提过期改写：旧判据在**全窗文案**里找「通用区 / 切层自动切值」关键词，
+        # 前提是「⑫ 图层区那行小字写着这两句」。R16 把四条小字改写成大白话短句
+        # （「这层跟着候选框走：贴边、翻转看 ③ 那一行…」「③ 贴边（第 2 层）= 贴左，切层自动变」），
+        # 关键词一换就假红。改按**属性名**定位两处说明，分别钉住两件事：
+        #   · lbl_side_target（③ 那一行的行内提示）：带「第 N 层」+「切层」（= 按当前层调、切层自动变）
+        #   · lbl_layer_hint2（图层区那行说明）：把用户指回 ③ 那一行 / 通用区
+        side_hint = str(getattr(wiz, 'lbl_side_target', None).cget('text')) \
+            if getattr(wiz, 'lbl_side_target', None) is not None else ''
+        lay_hint = str(getattr(wiz, 'lbl_layer_hint2', None).cget('text')) \
+            if getattr(wiz, 'lbl_layer_hint2', None) is not None else ''
+        check('A09 ★两处说明讲清「贴边在通用区（③ 那一行）、按当前层调、切层自动变」',
+              ('第' in side_hint and '层' in side_hint and '切层' in side_hint)
+              and ('③' in lay_hint or '通用区' in lay_hint),
+              f'③ 行内提示={side_hint!r}　图层区说明={lay_hint!r}')
     finally:
         _kill(wiz)
 

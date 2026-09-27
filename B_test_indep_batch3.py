@@ -170,6 +170,46 @@ def radios_of(wiz, var):
     return out
 
 
+# ---- R18（第五轮追加 · **需求反转**；登记见 _evidence_r16/T2_adapt/premise_expired.md）----
+# R10 判据「界面文案不残留 ⑪」的前提是「⑪ 编号项按需求删掉了」。第五轮先生定调：把 ⑪ 编号
+# 还给 ⑩ 行末的「增强（真羽化）」开关（向导编号 ⑩⑪⑫⑬⑭ 重新连续）⇒ ⑪ 变成「必须恰好一个」。
+# 判别力口径（captain 裁决）：
+#   ① 绑 var_render 的 Radiobutton 仍必须为 0（单选组的删除成立）——B01/B07 原样保留；
+#   ② 版面上的「⑪ 编号标题」恰好 1 个，且 == chk_alpha_feather ——B02 新口径；
+#   ③ 说明**正文**允许引用 ⑪，但只许指向「⑪ 增强（真羽化）」。
+# 「属于版面的编号标题」用 winfo_manager() 判定（**不是** winfo_ismapped —— 向导默认折叠时
+# ⑩ 那一行整块不 map，但控件本身仍归 pack 管）；R16 把 lbl_feather_hint / lbl_render_hint
+# 撤出版面（不再 pack，只作弹窗正文存放点），它们仍含 ⑪ 字样但不是编号标题。
+NUM_TITLE_CLASSES = ('Label', 'Button', 'Checkbutton', 'Radiobutton', 'Labelframe')
+
+
+def on_layout(w):
+    try:
+        return bool(w.winfo_manager())
+    except Exception:
+        return False
+
+
+def titles_11(wiz):
+    out = []
+    for w in all_widgets(wiz.root):
+        try:
+            if w.winfo_class() in NUM_TITLE_CLASSES and class_text(w).startswith('⑪'):
+                out.append(w)
+        except Exception:
+            pass
+    return out
+
+
+def live_titles_11(wiz):
+    return [w for w in titles_11(wiz) if on_layout(w)]
+
+
+def ref11_ok(t):
+    """说明/提示正文引用 ⑪ 的口径：只许指向「⑪ 增强（真羽化）」"""
+    return ('⑪ 渲染模式' not in t) and (('⑪' not in t) or ('⑪ 增强（真羽化）' in t))
+
+
 def y_of_prefix(wiz, ch):
     """窗口里所有以 ch 开头的可点/带字控件的最小屏幕 y（判编号行上下顺序）"""
     ys = []
@@ -469,8 +509,15 @@ def sec_B(tmp):
               f'找到 {len(rb)} 个')
         texts = [class_text(w) for w in all_widgets(wiz.root)]
         hit_11 = [t for t in texts if '⑪' in t]
-        check('B02 界面文案不残留「⑪」引用（说明行也不指向已删的项）', len(hit_11) == 0
-              or all('prepared' in t for t in hit_11), f'含⑪文案={hit_11}')
+        live11 = live_titles_11(wiz)
+        chk_b = getattr(wiz, 'chk_alpha_feather', None)
+        check('B02 ★⑪ 编号标题**恰好 1 个**且 == ⑩ 行末「增强（真羽化）」开关；说明正文引用 ⑪ '
+              '时指向「⑪ 增强（真羽化）」（第五轮追加：编号还给该开关 = 需求反转；'
+              'R10「文案不残留 ⑪」的前提作废）',
+              chk_b is not None and len(live11) == 1 and live11[0] is chk_b
+              and all(ref11_ok(t) for t in hit_11),
+              f'版面上 ⑪ 编号标题={len(live11)} 个（未进版面的正文存放控件='
+              f'{len(titles_11(wiz)) - len(live11)} 个）；含⑪文案={hit_11}')
 
         chk = getattr(wiz, 'chk_alpha_feather', None)
         check('B03 ⑩ 旁「增强（真羽化）」开关仍在且可见', chk is not None and chk.winfo_ismapped(),
@@ -514,6 +561,17 @@ def sec_B(tmp):
             check('B07 ★判别力：注回绑 var_render 的单选后 B01 判据必须失败（非恒真）',
                   len(rb2) >= 1, f'注入后 {len(rb2)} 个')
             extra.destroy()
+            wizB3.root.update_idletasks()
+            # v2.0-R18 反向臂（captain 裁定第 3 条）：再注入**第二个 ⑪ 编号标题**（真实 pack 进版面）
+            # → B02 的「唯一性」那一半必须失败。用的是同一条表达式 live_titles_11()，不是另写判据。
+            n_before = len(live_titles_11(wizB3))
+            extra2 = tk.Label(wizB3.root, text='⑪ 第二个编号项（注入）')
+            extra2.pack()
+            wizB3.root.update_idletasks()
+            n_after = len(live_titles_11(wizB3))
+            check('B08 ★判别力：注入第二个 ⑪ 编号标题后 B02 的唯一性判据必须失败（非恒真）',
+                  n_before == 1 and n_after >= 2, f'注入前={n_before} 注入后={n_after}')
+            extra2.destroy()
         finally:
             kill_wiz(wizB3)
     finally:
@@ -530,10 +588,19 @@ def sec_C(tmp):
     cfg = layers_cfg(imgs, ['left_edge', 'center', 'right_edge'], flips=[False, True, False])
     wiz = make_wiz(cfg, tmp)
     try:
-        y2, y3, y4 = y_of_prefix(wiz, '②'), y_of_prefix(wiz, '③'), y_of_prefix(wiz, '④')
-        note(f'编号行屏幕 y：②={y2} ③={y3} ④={y4}')
-        check('C01 ★③ 在 ② 与 ④ 之间（②<③<④）',
-              None not in (y2, y3, y4) and y2 < y3 < y4, f'{y2} < {y3} < {y4}')
+        # v2.0-R16 前提过期改写：旧判据「②<③<④」的前提是「④⑤⑥ 竖排挤在 ①②③ 下面」。
+        # R16 把 ④⑤⑥ 挪到 ①②③ 右侧（先生原话「④⑤⑥可以分别放在①②③右侧并竖向对齐」）⇒
+        # ④ 与 ① 同行。新口径：③ 仍在通用区左列第 3 行（② 正下方）+ 两列三行逐行对齐。
+        ys = {k: y_of_prefix(wiz, k) for k in '①②③④⑤⑥'}
+        y1, y2, y3 = ys['①'], ys['②'], ys['③']
+        y4, y5, y6 = ys['④'], ys['⑤'], ys['⑥']
+        note(f'编号行屏幕 y：①={y1} ②={y2} ③={y3} ④={y4} ⑤={y5} ⑥={y6}')
+        rows_ok = (None not in (y1, y2, y3, y4, y5, y6)
+                   and abs(y1 - y4) <= 3 and abs(y2 - y5) <= 3 and abs(y3 - y6) <= 3)
+        check('C01 ★③ 仍在通用区左列第 3 行（② 的正下方），且两列三行逐行对齐'
+              '（R16：①≈④ / ②≈⑤ / ③≈⑥；旧「②<③<④」前提作废）',
+              rows_ok and y1 < y2 < y3,
+              f'y1..y6={y1},{y2},{y3},{y4},{y5},{y6} 行对齐={rows_ok}')
 
         side_rb = radios_of(wiz, wiz.var_side)
         tops = [int(w.winfo_rooty()) for w in side_rb]

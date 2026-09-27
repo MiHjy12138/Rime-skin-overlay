@@ -217,10 +217,18 @@ def test_ui_move(tmp, saved):
               f'var_side 单选={side_r}')
         check('A02 ★⑫ 图层区不再有「选中层贴哪儿」单选组（贴边只在通用区一处）',
               len(anc_r) == 0, f'var_layer_anchor 单选={anc_r}')
-        y2, y3, y4 = _first_y(wiz, '②'), _first_y(wiz, '③'), _first_y(wiz, '④')
-        check('A03 ★③ 编号回到通用区，且落在 ② 候选框类型 与 ④ 缩放 之间',
-              None not in (y2, y3, y4) and y2 < y3 < y4,
-              f'y2={y2} y3={y3} y4={y4}')
+        # v2.0-R16 前提过期改写：旧判据「②<③<④」的前提是「④⑤⑥ 竖排挤在 ①②③ 下面」。
+        # R16 把 ④⑤⑥ 挪到 ①②③ 右侧成两列三行 ⇒ ④ 与 ① 同行。新口径：③ 仍在通用区
+        # 左列第 3 行（② 的正下方）+ 两列三行逐行对齐（①≈④ / ②≈⑤ / ③≈⑥）。
+        ys = {k: _first_y(wiz, k) for k in '①②③④⑤⑥'}
+        y1, y2, y3 = ys['①'], ys['②'], ys['③']
+        y4, y5, y6 = ys['④'], ys['⑤'], ys['⑥']
+        rows_ok = (None not in (y1, y2, y3, y4, y5, y6)
+                   and abs(y1 - y4) <= 3 and abs(y2 - y5) <= 3 and abs(y3 - y6) <= 3)
+        check('A03 ★③ 编号仍在通用区左列第 3 行（② 的正下方），且两列三行逐行对齐'
+              '（R16：①≈④ / ②≈⑤ / ③≈⑥；旧「②<③<④」前提作废）',
+              rows_ok and y1 < y2 < y3,
+              f'y1..y6={y1},{y2},{y3},{y4},{y5},{y6} 行对齐={rows_ok}')
         check('A04 选项文案讲清贴哪边',
               all(k in ''.join(side_r) for k in ('右', '左', '中')), repr(side_r))
         check('A05 通用区 ④⑤⑥ 仍在（只搬 ③，不误删）',

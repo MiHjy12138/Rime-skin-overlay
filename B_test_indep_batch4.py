@@ -137,15 +137,29 @@ def find_bottom_row(wiz):
     return btn, btn.master
 
 
+# v2.0-R16/R17/R18（第五轮）「撤版面」的说明 Label 白名单（**对象保留为状态载体**：
+#   ⑩ 的两段说明 + ⑫ 的那行重复说明都由产品继续 config/更新，只是不再 pack 进版面）：
+#   · lbl_feather_hint / lbl_render_hint —— R16「说明太长，做个说明按钮」（改「? 说明」弹提示）
+#   · lbl_layer_hint2 —— t5「删掉 ⑫ 里那行重复说明」（③ 那一行的行内提示已覆盖同样信息）
+# 判据方向仍是「其余控件必须 mounted」；白名单里的控件未 map 是**既定版型**，不是坏控件。
+HINT_LABEL_ATTRS = ('lbl_feather_hint', 'lbl_render_hint', 'lbl_layer_hint2')
+
+
 def adv_body_children_mapped(wiz):
-    """展开态 ⑧~⑭ 区间：adv_body 下所有叶子控件的 map 统计。"""
+    """展开态 ⑧~⑭ 区间：adv_body 下所有叶子控件的 map 统计 + 未 map 的到底是哪些。
+
+    返回 dict：{'mapped': n, 'total': n, 'unmapped_bad': [...], 'unmapped_white': [...]}
+    （v2.0-R16 改造：原来只回 (mapped, total) 两个数，现在把「未 map 的是不是那几个撤版面
+      说明 Label」也一并量出来，判据才能真正钉住「其余必须可见」。）
+    """
     import tkinter as tk
     body = getattr(wiz, 'adv_body', None)
     if body is None:
-        return 0, 0
+        return {'mapped': 0, 'total': 0, 'unmapped_bad': ['<无 adv_body>'], 'unmapped_white': []}
     leaf_types = (tk.Label, tk.Button, tk.Checkbutton, tk.Radiobutton, tk.Scale,
                   tk.Listbox, tk.Entry, tk.Canvas, tk.Spinbox)
     total = mapped = 0
+    unmapped = []
 
     def walk(w):
         nonlocal total, mapped
@@ -155,12 +169,19 @@ def adv_body_children_mapped(wiz):
                     total += 1
                     if int(c.winfo_ismapped()) == 1:
                         mapped += 1
+                    else:
+                        unmapped.append(c)
                 else:
                     walk(c)
             except Exception:
                 pass
     walk(body)
-    return mapped, total
+    wl = {getattr(wiz, n, None) for n in HINT_LABEL_ATTRS}
+    wl.discard(None)
+    return {'mapped': mapped, 'total': total,
+            'unmapped_bad': [str(x) for x in unmapped if x not in wl],
+            'unmapped_white': sorted(n for n in HINT_LABEL_ATTRS
+                                     if getattr(wiz, n, None) in unmapped)}
 
 
 def scenario(wiz):
@@ -280,9 +301,17 @@ def section_A():
         bool(bvc) and bvc['mapped'] == 1 and bvc['btn_mapped'] == 1
         and bvc['row_bottom'] <= bvc['win_bottom'] + 2,
         json.dumps(bvc, ensure_ascii=False) if bvc else '未找到「保存并启动」按钮行')
-    m, t = cur['expanded']['adv_children']
-    chk('A09 ★展开后 ⑧~⑭ 子控件全部可见（winfo_ismapped=1 全中）',
-        t >= 10 and m == t, 'mapped %d / total %d' % (m, t))
+    ac = cur['expanded']['adv_children']
+    # v2.0-R16 前提过期改写（**不是放宽**）：旧判据「全部 mapped」的前提是「⑩ 下面两段说明
+    # 常驻版面 + ⑫ 那行小字常驻」。R16 要求这两段说明撤版面（改「? 说明」弹提示）、t5 又把 ⑫
+    # 那行重复说明也撤了 ⇒ 展开态必然有三个 Label 不 map。判据改成：**除那三个撤版面说明
+    # Label（按属性名精确列出）外，其余子控件一律 mapped** —— 任何一个真控件没 map 仍然立刻红。
+    chk('A09 ★展开后 ⑧~⑭ 子控件除「撤版面说明 Label」外全部可见（winfo_ismapped=1）',
+        ac['total'] >= 10 and ac['mapped'] == ac['total'] - len(ac['unmapped_white'])
+        and not ac['unmapped_bad'],
+        'mapped %d / total %d；撤版面白名单命中=%s；未 map 且不在白名单=%s'
+        % (ac['mapped'], ac['total'], ac['unmapped_white'] or '无',
+           ac['unmapped_bad'] or '无'))
     chk('A10 ★往返两轮后回初值：折叠态三量（按钮高/窗口高/状态位）±2px',
         abs(cur['recollapsed']['btn'][1] - cur_btn_col[1]) <= 2
         and abs(cur['recollapsed']['win']['req_h'] - cur_win_col) <= 2
@@ -1131,7 +1160,14 @@ def section_C3():
         row_side = rbs[0].master if rbs else None
         row_kinds = sorted({x.winfo_class() for x in c_walk(row_side)}) \
             if row_side is not None else []
-        y2, y3, y4 = c_y_prefix(wiz, '②'), c_y_prefix(wiz, '③'), c_y_prefix(wiz, '④')
+        # v2.0-R16 前提过期改写：旧判据「②<③<④」的前提是「④⑤⑥ 竖排挤在 ①②③ 下面」。
+        # R16 把 ④⑤⑥ 挪到 ①②③ 右侧成两列三行 ⇒ ④ 与 ① 同行。新口径：③ 仍在通用区
+        # 左列第 3 行（② 的正下方）+ 两列三行逐行对齐（①≈④ / ②≈⑤ / ③≈⑥）。
+        yrow = {k: c_y_prefix(wiz, k) for k in '①②③④⑤⑥'}
+        y1, y2, y3 = yrow['①'], yrow['②'], yrow['③']
+        y4, y5, y6 = yrow['④'], yrow['⑤'], yrow['⑥']
+        rows_ok = (None not in (y1, y2, y3, y4, y5, y6)
+                   and abs(y1 - y4) <= 3 and abs(y2 - y5) <= 3 and abs(y3 - y6) <= 3)
         t_side = str(wiz.lbl_side_title.cget('text'))
         t_flip = str(wiz.chk_flip.cget('text'))
         c_select(wiz, 1)
@@ -1139,18 +1175,22 @@ def section_C3():
         t_flip2 = str(wiz.chk_flip.cget('text'))
         c_select(wiz, 2)
         t_side3 = str(wiz.lbl_side_title.cget('text'))
-        print('      · ③ 单选=%d 个（图层区绑 var_layer_anchor 的单选=%d）；编号行 y：②=%s ③=%s ④=%s'
-              % (len(rbs), len(lay_rbs), y2, y3, y4))
+        print('      · ③ 单选=%d 个（图层区绑 var_layer_anchor 的单选=%d）；编号行 y：'
+              '①=%s ②=%s ③=%s ④=%s ⑤=%s ⑥=%s'
+              % (len(rbs), len(lay_rbs), y1, y2, y3, y4, y5, y6))
         print('      · 文案：主层 ③=%r 翻转=%r / 第 2 层 ③=%r 翻转=%r / 第 3 层 ③=%r'
               % (t_side, t_flip, t_side2, t_flip2, t_side3))
         chk('C11 ★控件形态：③ 只出现一处（绑 var_side 的恰 3 个单选；图层区无第二套 = 0 个）、'
-            '③ 在 ② 与 ④ 之间、形态仍是单选组 + 勾选框（③ 所在行内只有 Label/Radiobutton/'
+            '③ 在通用区左列第 3 行且两列三行逐行对齐（R16；旧「②<③<④」前提作废）、'
+            '形态仍是单选组 + 勾选框（③ 所在行内只有 Label/Radiobutton/'
             'Checkbutton/Frame，且无下拉框/组合框绑这两个变量）',
             len(rbs) == 3 and len(flip_chks) == 1 and len(lay_rbs) == 0 and not weird
             and set(row_kinds) <= {'Label', 'Radiobutton', 'Checkbutton', 'Frame'}
-            and None not in (y2, y3, y4) and y2 < y3 < y4,
-            '③单选=%d 翻转勾选=%d 图层区单选=%d 异常形态=%s ③行控件类=%s y(②<③<④)=%s<%s<%s'
-            % (len(rbs), len(flip_chks), len(lay_rbs), weird or '无', row_kinds, y2, y3, y4))
+            and rows_ok and y1 < y2 < y3,
+            '③单选=%d 翻转勾选=%d 图层区单选=%d 异常形态=%s ③行控件类=%s '
+            'y(①..⑥)=%s,%s,%s,%s,%s,%s 行对齐=%s'
+            % (len(rbs), len(flip_chks), len(lay_rbs), weird or '无', row_kinds,
+               y1, y2, y3, y4, y5, y6, rows_ok))
         chk('C11b ★两控件文案标出「第 N 层」并随选中层更新（主层/第 2 层/第 3 层各读一次），'
             '且都不含「所有图层」字样',
             ('第 1 层' in t_side and '第 2 层' in t_side2 and '第 3 层' in t_side3

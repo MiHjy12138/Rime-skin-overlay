@@ -7,6 +7,7 @@
 运行: python B_test_anim_live.py
 """
 import os
+import shutil
 import sys
 import time
 import tempfile
@@ -145,7 +146,13 @@ def test_wizard(gif):
 
 
 def main():
+    global LOG
     tmp = tempfile.mkdtemp(prefix='anim_live_')
+    # 测试卫生（HANDOFF-2.4 §8-⑦）：日志/临时产物只落临时目录，不给项目 error.log 增行。
+    # 产品 `_write_log` 是**调用时**取模块全局 HERE，但本模块的 LOG 常量是导入时算的
+    # ⇒ 必须在 main() 里把两者一起改道（t2 实测：改前跑一轮会往产品 HERE/error.log 写 2 行）。
+    R.HERE = tmp
+    LOG = os.path.join(tmp, 'error.log')
     gif = os.path.join(tmp, 'anim.gif')
     png = os.path.join(tmp, 'static.png')
     _make_gif(gif)
@@ -156,6 +163,7 @@ def main():
     test_wizard(gif)
     print('=' * 60)
     print(f'通过 {len(PASS)} 项 / 失败 {len(FAIL)} 项')
+    shutil.rmtree(tmp, ignore_errors=True)
     if FAIL:
         print('失败项: ' + ', '.join(FAIL))
         return 1

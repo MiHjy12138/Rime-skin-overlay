@@ -245,6 +245,15 @@ def _num_set(titles):
     return {c for t in ts for c in NUM_CHARS if c in t}
 
 
+def _text11_of(w):
+    """控件文案（无 text 选项的控件返回空串），给「⑪ 编号标题唯一性」用（v2.0-R18）"""
+    try:
+        v = w.cget('text')
+        return v if isinstance(v, str) else ''
+    except Exception:
+        return ''
+
+
 def _var_attr_map(wiz):
     """Tk 变量对象 → 向导属性名（如 var_scale）。PY_VARn 每次实例不同，不能拿来对照。"""
     import tkinter as tk
@@ -501,6 +510,8 @@ def section_E(tmp):
             check('E07 ★所有控件绑定的变量一份不少（同上，不看文案；无静默丢控件）',
                   not lost_binds_v, f'丢失={lost_binds_v or "无"}')
             has_alpha_chk = getattr(w, 'chk_alpha_feather', None) is not None
+            # v2.0-R18：⑪ 这个**编号**还给了这个开关（见 E08），但 R10 删掉的**单选组**没有回来
+            # —— 本条只认「绑 var_render 的 Radiobutton = 0 + 入口在」，所以原样成立、一个字不改。
             check('E06b ★R10 后 ⑪ 单选确已删除（绑 var_render 的 Radiobutton = 0），'
                   '且功能入口仍在（⑩ 旁「增强（真羽化）」开关）',
                   binds_v.get('var_render', 0) == 0
@@ -521,10 +532,18 @@ def section_E(tmp):
             has_11_left = [t for t in titles if '⑪' in t]
             pre_nums = _num_set(_titles_pre)
             head_nums = _num_set(titles)
-            # 需求主动删改登记（不是措辞白名单）：⑪ 按 R10 删除；③ 的文案被 R11→N3 两轮改写，
-            # 但编号仍在，故仍出现在 head_nums 里。
-            DELETED_BY_DEMAND = {'⑪'}
+            # v2.0-R18（第五轮追加 · **需求反转**）：R10 那次「⑪ 按需求删除」被先生第五轮的决定
+            # 覆盖 —— ⑪ 编号**还给** ⑩ 行末的「增强（真羽化）」开关（⑩⑪⑫⑬⑭ 重新连续）。
+            # ⇒ DELETED_BY_DEMAND 清空（⑪ 必须存在）；「编号一个不少」照旧，另加**唯一性**：
+            # 属于版面的「⑪ 编号标题」恰好 1 个且 == chk_alpha_feather（判别力臂见 E08c）。
+            # ③ 的文案被 R11→N3 两轮改写，但编号仍在，故仍出现在 head_nums 里。
+            DELETED_BY_DEMAND = set()
             miss_nums = sorted((pre_nums - DELETED_BY_DEMAND) - head_nums)
+            live11 = [x for x in _all_widgets(w.root)
+                      if x.winfo_class() in ('Label', 'Button', 'Checkbutton',
+                                             'Radiobutton', 'Labelframe')
+                      and _text11_of(x).startswith('⑪')
+                      and bool(x.winfo_manager())]
             side_rb_w = [x for x in _all_widgets(w.root)
                          if x.winfo_class() == 'Radiobutton'
                          and str(x.cget('variable')) == str(w.var_side)]
@@ -533,15 +552,16 @@ def section_E(tmp):
                           and str(x.cget('variable')) == str(w.var_flip)]
             side_in_card = bool(side_rb_w) and _in_container(side_rb_w[0].master, w.layer_list)
             flip_in_card = bool(flip_chk_w) and _in_container(flip_chk_w[0].master, w.layer_list)
+            chk11 = getattr(w, 'chk_alpha_feather', None)
             check('E08 ★③ 与翻转按**变量绑定 / 控件层级**定位：③ = 绑 var_side 的恰 3 个单选、'
                   '翻转 = 绑 var_flip 的恰 1 个勾选框，且两者都在通用区（不在图层卡内 = 只一处）；'
-                  '⑪ 字样不再出现；编号一个不少（除 R10 主动删的 ⑪）',
+                  '⑪ 编号标题唯一（恰 1 个，== ⑩ 行末增强开关）；编号一个不少（⑩⑪⑫⑬⑭ 齐全）',
                   len(side_rb_w) == 3 and len(flip_chk_w) == 1
                   and not side_in_card and not flip_in_card
-                  and not has_11_left and not miss_nums,
+                  and len(live11) == 1 and live11[0] is chk11 and not miss_nums,
                   f'③单选={len(side_rb_w)} 翻转勾选={len(flip_chk_w)} '
                   f'③在图层卡内={side_in_card} 翻转在图层卡内={flip_in_card} '
-                  f'⑪残留={has_11_left or "无"} 缺编号={miss_nums or "无"}')
+                  f'版面⑪编号标题={len(live11)} 个 含⑪文案={has_11_left or "无"} 缺编号={miss_nums or "无"}')
             # E08b 判别力（§6-13 + t11 契约第 5 条）：抹掉某个编号（⑤）的标题文案 = 模拟
             # 「某个编号整组从界面消失」→ 上面 E08 的**同一条**「编号一个不少」判据必须 FAIL。
             _victims = []
@@ -565,6 +585,25 @@ def section_E(tmp):
             check('E08b ★判别力：抹掉 ⑤ 编号标题后「编号一个不少」判据必须 FAIL（非恒真）',
                   bool(_victims) and bool(_miss_after),
                   f'被抹控件={len(_victims)} 抹后缺编号={_miss_after or "无"}')
+            # E08c 反向臂（v2.0-R18 需求反转配套，captain 裁定第 3 条）：注入**第二个 ⑪ 编号标题**
+            # （真实 pack 进版面）→ E08 的「⑪ 唯一性」那一半必须 FAIL。用同一条表达式判定。
+            try:
+                import tkinter as _tk
+                _n11_before = len(live11)
+                _inj = _tk.Label(w.root, text='⑪ 第二个编号项（注入）')
+                _inj.pack()
+                w.root.update_idletasks()
+                _n11_after = len([x for x in _all_widgets(w.root)
+                                  if x.winfo_class() in ('Label', 'Button', 'Checkbutton',
+                                                         'Radiobutton', 'Labelframe')
+                                  and _text11_of(x).startswith('⑪') and bool(x.winfo_manager())])
+                _inj.destroy()
+                check('E08c ★判别力：注入第二个 ⑪ 编号标题后 E08 的「⑪ 编号唯一」判据必须 FAIL'
+                      '（非恒真）',
+                      _n11_before == 1 and _n11_after >= 2,
+                      f'注入前={_n11_before} 注入后={_n11_after}')
+            except Exception as _e:
+                check('E08c 判别力段未抛异常', False, repr(_e))
             note(f'新增编号标题（R4/R11 引入的说明行，允许）：'
                  f'{ {k: v for k, v in titles.items() if k not in _titles_pre} or "无"}')
             # 列数 vs 工作区宽度（可注入）
@@ -580,13 +619,21 @@ def section_E(tmp):
                       got == exp == calc, f'实测={got} 期望={exp} 复算={calc}')
             finally:
                 R.screen_work_area_width = real_saw
-            # 除数 380 的正当性：最宽卡实测宽度 vs 800 宽下若按旧除数 330 得 2 列所需宽度
-            avail_800_2col = (800 - 60) // 2
-            old_div_cols = max(1, min(3, (800 - 60) // 330))
-            check('E10 ★除数 330→380 由实测支撑：最宽卡宽度 > 800 宽按 2 列分到的列宽',
-                  widest > avail_800_2col and old_div_cols == 2 and len(cols) >= 1,
-                  f'最宽卡={widest}px；旧除数在 800 宽下得 {old_div_cols} 列 → 每列仅 {avail_800_2col}px '
-                  f'< {widest}px（会挤/裁）')
+            # 除数 380 的正当性 —— v2.0-R18 前提过期改写（**不是放宽**）：
+            #   原判据（R4）：「最宽卡 385px > 800 宽按旧除数 330 得 2 列时的列宽 370px」
+            #     ⇒ 旧除数会把卡挤/裁，所以必须用 380。
+            #   第五轮实测：⑩ 卡片撤掉两段常驻说明后最宽卡 385 → **314**（见
+            #     _evidence_r16/T2_adapt/premise_probe.*），314 < 370 ⇒ 上面那条**证据**不再成立。
+            #   380 本身没动（产品口径不变，1080p 仍 3 列），所以判据改成**除数 380 的名义保证**：
+            #   任何工作区宽度档位下，每列宽度都 ≥ 380 ⇒ 必然 ≥ 最宽卡 + 边距。
+            #   这比原来只查「800 那一档」覆盖面更宽，且卡片再长到 378px 以上立刻变红（判别力仍在）。
+            gear_cols = {1920: 3, 1366: 3, 1024: 2, 900: 2, 800: 1, 640: 1}
+            gear_min_w = min((wk - 60) // n for wk, n in gear_cols.items())
+            check('E10 ★除数 380 的名义保证：所有宽度档位下每列 ≥ 最宽卡 + 2px'
+                  '（旧判据「最宽卡 385 > 370」的前提已过期：R16 撤版面后最宽卡 314）',
+                  widest + 2 <= gear_min_w and len(cols) >= 1,
+                  f'最宽卡={widest}px；{len(gear_cols)} 档位里最紧的列宽={gear_min_w}px'
+                  f'（各档列宽={sorted(((wk - 60) // n) for wk, n in gear_cols.items())}）')
             check('E11 每列列宽 ≥ 该列自己最宽卡（无裁切）',
                   all(cw + 2 >= cm for cw, cm in zip(col_w, col_child_max)),
                   f'列宽={col_w} 各列最宽卡={col_child_max}')
@@ -687,18 +734,27 @@ def section_E(tmp):
                           f'被抹控件={len(_victims2)} 抹后缺编号={_miss2b or "无"}')
                     workh2 = int(R.screen_work_area_height(w2.root) or 0)
                     left_11 = [t for t in titles2 if '⑪' in t]
+                    # v2.0-R18（需求反转）：⑪ 编号已还给 ⑩ 行末开关 ⇒ 端到端这一段也改判
+                    # 「⑪ 编号标题唯一且就是那个开关」，不再要求「⑪ 不出现」。
+                    live11_2 = [x for x in _all_widgets(w2.root)
+                                if x.winfo_class() in ('Label', 'Button', 'Checkbutton',
+                                                       'Radiobutton', 'Labelframe')
+                                and _text11_of(x).startswith('⑪') and bool(x.winfo_manager())]
+                    chk11_2 = getattr(w2, 'chk_alpha_feather', None)
                     s4.clear()
                     w2._save_and_start()
                     out = dict(s4)
                     drift = {k: (before[k], out.get(k)) for k in before if out.get(k) != before[k]}
                     check('E12 ★端到端（release/config.json）：重排后预览与 ②~⑭ 齐全'
-                          '（⑪ 已按 R10 删除）、③/翻转按变量绑定仍在通用区、保存零漂移、'
+                          '（⑪ 编号唯一 = ⑩ 行末增强开关）、③/翻转按变量绑定仍在通用区、保存零漂移、'
                           '窗口 ≤ 工作区',
                           has_img and not miss_nums2 and ctrl2_ok and not drift
-                          and 0 < h2 <= workh2 and not left_11,
+                          and 0 < h2 <= workh2
+                          and len(live11_2) == 1 and live11_2[0] is chk11_2,
                           f'需求={w2r}x{h2} 预览={"有" if has_img else "无"} '
                           f'缺编号={miss_nums2 or "无"} 控件={ctrl2_ok} '
-                          f'漂移={drift or "无"} 工作区={workh2} ⑪残留={left_11 or "无"}')
+                          f'漂移={drift or "无"} 工作区={workh2} '
+                          f'版面⑪编号标题={len(live11_2)} 个 含⑪文案={left_11 or "无"}')
                 finally:
                     if w2 is not None:
                         kill_wiz(w2)
@@ -1322,20 +1378,27 @@ def section_H(tmp):
             R.ConfigWizard._adv_column_count = lambda self: 1
             w = make_wiz(R, cfg, saved, skins, tmp)
             inter, binds, titles = inventory(w)
-            # v2.0-R10：⑪ 渲染模式单选组按需求删除 → 编号 ⑪ 不再作为「必须存在的标题」；
-            # 但功能入口（⑩ 旁「增强（真羽化）」开关）必须在，且 ⑪ 字样不许再出现（两条都能抓红）。
+            # v2.0-R18（第五轮追加 · **需求反转**）：⑪ 编号已还给 ⑩ 行末的「增强（真羽化）」开关
+            # （先生问「⑪ 去哪了」后的决定），所以这一条不再要求「⑪ 不出现」，改为
+            # 「绑 var_render 的 Radiobutton 仍为 0（单选组删除成立）+ 功能入口在」。
             need = set()
-            for c in '②③④⑤⑥⑦⑧⑨⑩⑫⑬⑭':
+            for c in '②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭':
                 need.add(c)
             missing = [c for c in need if not any(c in t for t in titles)]
             left_11 = [t for t in titles if '⑪' in t]
-            has_alpha_chk = getattr(w, 'chk_alpha_feather', None) is not None
-            check('H05 ★强制 1 列（最窄屏退路）：②~⑭ 标题齐全（⑪ 已按 R10 删除）'
+            live11_h = [x for x in _all_widgets(w.root)
+                        if x.winfo_class() in ('Label', 'Button', 'Checkbutton',
+                                               'Radiobutton', 'Labelframe')
+                        and _text11_of(x).startswith('⑪') and bool(x.winfo_manager())]
+            chk11_h = getattr(w, 'chk_alpha_feather', None)
+            has_alpha_chk = chk11_h is not None
+            check('H05 ★强制 1 列（最窄屏退路）：②~⑭ 标题齐全（含 ⑪，编号唯一 = ⑩ 行末增强开关）'
                   '，⑩ 旁增强开关仍在',
                   not missing and len(list(getattr(w, 'adv_cols', []))) == 1
-                  and not left_11 and has_alpha_chk,
+                  and len(live11_h) == 1 and live11_h[0] is chk11_h and has_alpha_chk,
                   f'缺={missing or "无"} 列数={len(list(getattr(w, "adv_cols", [])))} '
-                  f'⑪残留={left_11 or "无"} 增强开关={has_alpha_chk}')
+                  f'版面⑪编号标题={len(live11_h)} 个 含⑪文案={left_11 or "无"} '
+                  f'增强开关={has_alpha_chk}')
         finally:
             if w is not None:
                 kill_wiz(w)
