@@ -392,6 +392,129 @@
 - **纯净包**：`python make_clean_release.py verify "E:\桌面\RimeSkinOverlay-v2.0.zip"` → 退出码 **0**；
   解压根目录**平铺恰好 4 项、递归 0 目录**（`RimeSkinOverlay.exe` / `README.md` / `CHANGELOG.md` / `LICENSE`）。
 
+### 🩹 修复（2026-09-27 · 第五批：用户第四轮实测 4 条 N1~N4）
+
+> 用户 2026-09-26 晚间实测报的 4 条（原文见 `HANDOFF-2.2.md` §0.1）。逐条给「原话 → 改法 → 前/后数字」，
+> **沙箱已证实**与**需真人确认**分开写（后者一律标注「未验证」）。包与哈希指纹见 `HANDOFF-2.3.md`
+> 的「交付身份」一节；自测表见 `README.md`「第四轮修复怎么验（N1-N4）」。
+
+#### N1 · ⚙ 高级设置的折叠按钮太小 + 默认展开 → 按钮做大 + 默认折叠（`29162ac`）
+
+- **改法**（`rime_char_overlay.py:4977-5004`，仅 2 处）：标题字条 9pt / 无内边距 → **11pt bold +
+  padx=14 / pady=6 + relief=groove + `fill='x', expand=True`** 整行大按钮；`_adv_collapsed` 初值
+  `False → True`（向导打开即折叠态）。R12 那次的 `590/919 px` 三态数字随之更新。
+- **前/后数字**（前 = R12 `80762e7`，后 = `29162ac`；同一量测脚本
+  `_evidence_r15/N1_btn/B_test_indep_r15_n1_btn.py`）：
+
+  | 量 | 前 | 后 |
+  |---|---|---|
+  | 展开态折叠按钮可点区域 | 271×26 px（7,046 px²） | **819×43 px（35,217 px²）= +399.8%（5.00×）** |
+  | 折叠态按钮可点区域 | 219×26 px（5,694 px²） | **627×43 px（26,961 px²）= +373.5%** |
+  | 创建态（不点任何东西） | `_adv_collapsed=False`、adv_body mapped | **`True`、未 pack 未 map** |
+  | 创建态窗口需求高 | 919 px | **607 px** |
+  | 折叠态窗口需求高 | 590 px | **607 px**（+17 = 按钮自身增高 43−26；判据 607 ≤ 590+17） |
+  | 展开态窗口需求高 | 919 px（同实现改动前后 913） | **930 px**（+17，同一原因） |
+  | 小屏 1366×768（工作区 728） | 创建态需滚动 | **创建态 `_scroll_needed` True→False、滚动条 mapped 1→0** |
+  | 两向往返各 2 次 | — | 三态 (795,930,366) ⇄ (472,607,43) 逐位回初值（±0px） |
+
+- **红→绿**：gate `python B_test_r12_collapse.py` 改前 **35 通过 / 6 失败 exit=1** → 改后 **41 / 0 exit=0**。
+  独立验证（t3）另用不同口径复算：展开后 ⑧~⑭ 叶子控件 **34/34 mapped**；臂 P1（把默认折叠改回 False）→
+  A01/A02/A03 FAIL 而按钮尺寸判据仍 PASS（互不粘连）。
+- ⚠️ **需真人确认（未验证）**：折叠按钮在 **125% / 150% DPI** 下的排版是否仍宽松；点标题折叠/展开的
+  手感与折叠后的窗口观感。
+
+#### N2 · 预览里带透明区的图把候选框盖住 → 预览**显示端**装回 alpha 掩膜（`2b135b5`）
+
+- **改法**（1 file / **+41 −4**，5 个 hunk 全在预览显示路径）：新增
+  `ConfigWizard._preview_display_img()`（`_preview_compose(img)` 出 RGB → `.convert('RGBA')` →
+  `putalpha(渲染模式对齐后的 alpha)`：兼容档二值化 / 增强档逐像素），两个 `PhotoImage(...)` 调用点
+  （多图层 `:6720` / 单图层 `:6782`）改用它。**合成口径 `_preview_compose()` 本身一字未改** ——
+  r7 **B06** / batch3 **A10** 那种「把 `_preview_compose` 换成棋盘格 → 显示端必须跟着变」的判别力保住。
+- **前/后数字**：gate `_evidence_r15/N2_repro/B_test_indep_r15_n2.py` **E1 = 47 点不一致 → 0**（4 组有效成对）；
+  自建 A/B（屏幕坐标标定 (dx,dy)=(−1,−1) 后 0/6400 不一致）：
+
+  | 用例 | α=0 像素被盖 前→后 | α=255 像素屏上相同 | 显示图 RGB |
+  |---|---|---|---|
+  | single_f1_center_clean | 5852 → **0（100%→0%）** | 6156/6156 | 逐位相同 |
+  | single_f3_center_clean（原生透明 PNG） | 5933 → **0（100%→0%）** | 1711/1711 | 逐位相同 |
+  | single_f2_center_clean（半透明渐变） | 7643 → **0（100%→0%）** | 4365/4365 | 逐位相同 |
+  | multi_f1f3_center_clean（多图层） | 7140 → **0（100%→0%）** | 7560/7560 | 逐位相同 |
+  | single_f1_center_feather_alpha（增强档） | 5548 → **0** | 3969/3969 | 逐位相同 |
+  | single_f3_center_feather_alpha（增强档） | 5807 → **0** | — | 逐位相同 |
+
+  独立验证（t8，量测代码与 gate、与实现者都不同源）另用**自己的窗口 DC（PrintWindow，不吃遮挡）**复算：
+  候选框区域被显示位图覆盖的像素数 f1 14720→**7296**、f3 7808→**1295**（每例都降到「交叠面积 − α==0 档像素数」）；
+  框色穿透 0 → 3242/3727/3010/597/479；`*_below` 孪生两臂不变（证明量测本身有效）；
+  反向校验：显示位图 `rgb_sha_whole` 与 `rgb_sha_on_255` **跨臂逐位相同** ⇒ 掩膜只改 alpha，不动 RGB。
+- **增强档（真羽化）羽化带的 ΔRGB 挂账**（半透明处会与下层混合 —— 运行时本来就是这样，分层窗逐像素 alpha）：
+  f1 下面=纯底色 n=1593 **Δmax=41 / Δmean=5.32**；f1 下面=内容 n=898 **Δmax=254 / Δmean=31.90**；
+  f3 下面=纯底色 n=1038 **Δmax=51 / Δmean=16.25**；f3 下面=内容 n=799 **Δmax=252 / Δmean=32.77**。
+  样例 α=65：(255,190,255)→(247,230,247)，under=(245,245,245)（按 0.255×合成色+0.745×底色 逐位吻合）。
+- ⚠️ **需真人确认（未验证）**：增强档羽化带**在纯色底上的肉眼观感**是否可接受
+  （对比图：`_evidence_r15/N2_fix/ab_before/` 与 `ab_after/` 里的 `single_f3_center_feather_alpha_above.png`）。
+
+#### N3 · ③ 贴边方向只留一处 → 改为**按当前选中层分别调**（`c38adff`）
+
+- **改法**：`_layer_set_params(i, …, anchor=None)` 新增 `anchor` 参数（第 0 层写 `cfg['side']` + 层内同步＝主层权威，
+  其余层只写 `layers[i]['anchor']`；flip 同款）；`_on_side_change` / `_on_flip_change` 重写为**只写当前层**；
+  新增 `_layer_anchor_at(i)` 与 `_sync_side_widget_titles(i)`；`_sync_side_to_all_layers` /
+  `_sync_flip_to_all_layers` 降级为「主层保底归一」（非 force 只信 `cfg`，绝不读 Tk 变量）；
+  **撤销 5 个统一写回点**（存皮肤 / 保存 / 切皮肤各 2 处 + 顶层键显式取主层值）。**运行时侧零改动** ——
+  `plan_layer_layout`（:678/:684-693）与 `_layer_raw_frame`（:8033/:8035）本来就是逐层读。
+- **前/后数字**：改**第 2 层** ③ → `['right_edge','left_edge','center']` 变 **`['right_edge','center','center']`**
+  （层 0/2 不动）；改**第 2 层**水平翻转 → `[False,True,False]` 变 **`[False,False,False]`**（`cfg['flip_h']` 仍 False）；
+  选中第 2 层保存 → 顶层键 `side='right'` / `flip_h=False`，**第 2 层保住 center/True**；
+  切层回显 3 轮 × 3 层**逐项一致**；窗口高：折叠 **607→607**、展开 **930→918（−12px）**、top_block 419→419。
+- **旧档案**（各层 anchor/flip 都不同）：打开 + 连刷 3 次预览 → **逐层一个没改**（「打开即归一」那套语义已撤）。
+- ⚠️ **需真人确认（未验证）**：用旧皮肤档案（各层值不一致）切过来时的外观变化；
+  「同一行 ③ 贴边方向与 水平翻转**都按层**」在真机上的操作手感。
+
+#### N4 · compat + 单图 + 无羽化下打字仍闪烁 → 图片窗**同 tick 夺回顶部** + `[zorder]` 观测日志（`56d65e6`）
+
+- **改法**：`_apply_layer(cand_hwnd, trigger='move')` 按 layer 分派 —— above / 侧贴边走「保上」分支
+  （共用判据 `_is_covered_by_candidate` 判**确实被压**才补一次
+  `SetWindowPos(top, HWND_TOPMOST, 0,0,0,0, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE)`）；below + 中间层的
+  插序语义原样保留；新增模块级 `_log_zorder()`，被压且夺回时写一行 `[zorder] …`（**未被压时不写**）。
+- **前/后数字**（10 ms 采样 `GetWindow(top, GW_HWNDPREV)`，两臂唯一差别 = `_apply_layer` 实现）：
+
+  | 臂 | 被压帧数 | 最长让开 | 恢复时机 |
+  |---|---|---|---|
+  | legacy（修前） | 20 帧 | **198 ms** | 220 ms（心跳处） |
+  | 当前（修后） | **3 帧** | **21 ms** | 36 ms（tick 处） |
+
+  ⇒ **9.4 倍**改善。**not too hot**：未被压时连驱 ×30 → **0 次** SetWindowPos；被压 → **恰好 1 次**
+  `HWND_TOPMOST`；夺回后再驱 ×10 → **仍 0 次**。below 四态 = 两臂一致（插序锚点 == 候选框、心跳不拉回 topmost、
+  侧贴边 0 次调用、候选框非置顶不插序 + 节流提示）。
+- ⚠️ **诚实边界（不许写成「闪烁已修复」）**：本轮**已消除一处最长 ~200 ms 的让开窗口**；
+  **真机是否还闪，需真人用本包实测** —— t9 已证 v1.6 该段代码逐行相同，这个机制不能解释「v1.6 不闪」。
+- ⚠️ **需真人确认（未验证）**：真机打字 20 秒 + 数 `error.log` 里的 `[zorder]` 行数 + 给体感分类
+  （怎么数、怎么读见 `README.md`「第四轮修复怎么验（N1-N4）」第 1 条）。
+
+#### 🧹 测试卫生（第四轮收尾 t15）
+
+- **越界写入**：9 条测试脚本没设 `R.HERE` ⇒ 每跑一次把 `[配置] 保存 …` / `[渲染]` / `[退出]` 追加进项目
+  `error.log`，`B_test_fixes.py` / `B_test_extras.py` 还会在项目目录留 `preprocessed_*.png`。
+  已按 §8.5 口径逐条改道 tempdir（`main()` 的 `mkdtemp()` 之后 `R.HERE = tmp`）：renderer **+1461 B** /
+  r7_preview **+1172** / r14_flicker **+915** / layered_alpha **+873** / extras **+628（+1 png）** /
+  r3_follow_perf **+555** / r13_flip **+229** / follow_sim **+183** / fixes **+195（+2 png）**
+  = 一次全档 **+6,211 B / +3 张 png → 0 B / 0 张**（**判据表达式一字不动**，改前/改后 9 条脚本
+  **303 项 verdict 零差异**）。
+- **历史堆积**：`error.log` **224,847 B** + 6 张 `preprocessed_*.png`（14,326 B）按 §8.5 **送回收站**
+  （用程序自带的 `_send_to_recycle_bin`，不直删）→ 处理后项目目录四种残留全 **0**。
+- **纪律**：新脚本一律设 `R.HERE` 指向 tempdir（§8.5）。
+
+#### ✅ 收尾回归与交付物（t16）
+
+- **全档 29**（打包前跑，串行单进程）：**29/29 exit=0**，**243.9 秒**；跑前跑后
+  `git hash-object rime_char_overlay.py` == `git rev-parse HEAD:rime_char_overlay.py` == `33de1f55…`，
+  `error.log` 增量 **0 B**、`preprocessed_*.png` / `_rv_*.py` / `cfg_image_*.png` / `error.log.1` 全 **0**。
+- **exe 重建**（仓库 `dist_v2/` 里那份是 **09-26 15:04 的陈旧构建，本轮零改动**）：
+  PyInstaller **6.21.0**，`--workpath %TEMP%\build --distpath %TEMP%\dist` →
+  **31,342,477 B / sha256 `CD54138D8F0CDFC87CB4433CC4369547251A366E01C07DBB0527B77C4668E47A`**，
+  mtime **2026-09-27 11:29:02**（**晚于** `rime_char_overlay.py` 的 10:21:55，差 67.1 分钟）。
+- **纯净包**：zip 的字节数 / sha256 / mtime 与解压结构（4 项平铺、递归 0 目录）、
+  `make_clean_release.py verify` 退出码，见 `HANDOFF-2.3.md`「交付身份」一节。
+
 ### ⚠️ 已知遗留（不阻塞，留给 2.0.1）
 
 > 前四条**原文照录、本轮均未修**（不要当成已修复）；本批新增三条接在后面。
@@ -410,6 +533,24 @@
   （右栏控件不受影响，全部可滚到、可点；1080p 不触发）。
 - **测试卫生**：`B_test_fixes.py`（以及验证者的 `B_test_indep_batch3.py` 部分用例）未设 `R.HERE`，
   每跑一次会在项目目录留几个 `preprocessed_*.png`（本轮已清理，**未改脚本** —— 新脚本一律设 `R.HERE` 指 tempdir）。
+
+**本批（第四轮收尾）新增遗留 / 状态更新，均为非阻断**：
+
+- ✅ **已闭环**：上一条「测试卫生」在第四轮收尾（t15）彻底解决 —— 9 条越界脚本补 `R.HERE` 指 tempdir、
+  图片残留一并改道；`B_test_fixes.py` / `B_test_extras.py` 不再往项目目录写 `preprocessed_*.png`，
+  全档跑完项目目录残留为 0（改前一次全档 +6,211 B / +3 张 png）。
+- **增强档羽化带的半透明混合（观感挂账）**：N2 修好后，预览里 0<α<255 的像素会与下层（画布底色 / 候选框自身内容）
+  混合 —— 运行时本来就是这样（分层窗逐像素 alpha）。数值已给（N2 一节），**肉眼观感待真人确认**。
+- **环境 / 负载敏感判据（≠ 产品回归）**：`B_test_layer_sim.py` 置顶判据 · `B_test_layered_alpha.py` S9a
+  （抓屏固定坐标）· `B_test_fixes.py` 3b（可见窗口）· `B_test_r8_prep_layout.py` D3（配对耗时）在**并发跑批**或
+  桌面被别的窗口遮挡时会偶发翻红，处置口径 = **空载单跑复核**，不要写成产品回归。
+  另：**复跑提示（系统门禁）可能与链上下一个任务重叠**（本轮实例：packager t15 首轮全档 + verifier4 的 t14 门禁重跑），
+  复跑前先看链上有没有人声明「正在跑，他人勿并发」。
+- **N4 真机归属未定论**：让开窗口已量化改善 **9.4 倍**（20 帧/198 ms → 3 帧/21 ms），
+  但「真机是否还闪」必须由真机打字判定（见 README「第四轮修复怎么验（N1-N4）」第 1 条）。
+- **仓库里的非交付残余（未入库、本轮未动）**：`release/` 目录留着 1.6/2.0 时代的旧 exe、
+  `RimeSkinOverlay.exe.bak-v1.5`、`error.log`(+`.1`)、`cfg_image_*.png`；`dist/`、`dist_v2/`、`build_v2/`
+  是历史构建产物。**都不入包**（纯净包白名单只放 4 项），若日后清理请按 §8.5 送回收站。
 
 ## 1.6 (2026-09-10)
 
