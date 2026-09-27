@@ -7,8 +7,16 @@
   · R.HERE 指向 tempdir，产物不进项目目录；控制台 utf-8。
   · 唯一测试运行者；跑前跑后验 `git hash-object rime_char_overlay.py` == `HEAD:rime_char_overlay.py`。
 
-用法：python B_test_indep_batch4.py [A]
+用法：python B_test_indep_batch4.py [A] [B]
       A = N1（折叠按钮做大 + 向导默认折叠）
+      B = N2（预览里带 alpha 的图不再盖住模拟候选框；t8 独立验证并入）
+
+B 段口径（与 gate/_evidence_r15 下的实现者量测都不同源）：
+  · 量「候选框区域被显示位图遮盖的像素数」——按**源 alpha**分档（α==0 档必须 0 遮盖；
+    α>0 档必须 100% 遮盖 = 不误伤图体）；掩膜用产品自己的 _preview_render_mode_img()。
+  · 反向断言：显示位图 RGB 与 _preview_compose() 的 RGB **逐位**相同（掩膜只改 alpha）。
+  · 全程不抓屏（窗口 DC / ImageGrab 都不用）⇒ 不会被别的窗口遮挡成假红（t7 的教训）。
+  · B07 是**就地负控**：把显示端那一步 monkeypatch 回「不装掩膜」，同一批判据必须翻红。
 """
 import json
 import os
@@ -347,12 +355,252 @@ def section_A():
     return cur, r12, arms
 
 
+# ==========================================================================
+# B 段：N2 —— 预览里带 alpha 的图不再盖住模拟候选框（t8 独立验证并入）
+# ==========================================================================
+import hashlib                                                       # noqa: E402
+
+
+def _sha_rgb(im):
+    return hashlib.sha256(im.convert('RGB').tobytes()).hexdigest()[:16]
+
+
+def make_b_fixtures():
+    """我自造的夹具（三份，尺寸互不相同；含全透明边 / 半透明块 / 不透明核）。"""
+    from PIL import Image, ImageDraw                                 # 延迟导入：别把 PIL 变成全脚本前置
+    specs = [('b1_alpha_ring.png', 128, 128), ('b2_tall_cutout.png', 86, 234),
+             ('b3_wide_soft_band.png', 301, 96)]
+    out = []
+    for name, w, h in specs:
+        im = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(im)
+        d.ellipse([int(w * 0.16), int(h * 0.16), int(w * 0.84), int(h * 0.84)],
+                  fill=(255, 64, 32, 255))                            # 不透明核
+        d.rectangle([int(w * 0.30), int(h * 0.30), int(w * 0.70), int(h * 0.70)],
+                    fill=(16, 128, 255, 150))                         # 半透明块
+        p = os.path.join(TMP, name)
+        im.save(p)
+        out.append((name, p, (w, h)))
+    return out
+
+
+def b_case(mod, fixture, cfg_over, flatten_arm=False):
+    """建真向导 → 真 _update_preview() → 返回候选框矩形 + 各图片 item 的显示位图/掩膜。
+
+    flatten_arm=True 时把显示端那一步 monkeypatch 成「不装掩膜」（只用于 B07 负控）。
+    """
+    rec = []
+    disp_name = '_preview_display_img'
+    has_disp = hasattr(mod.ConfigWizard, disp_name)
+    orig = getattr(mod.ConfigWizard, disp_name, None)
+
+    if flatten_arm or not has_disp:
+        def _flat(self, img):
+            r = self._preview_compose(img)          # ← 退回修前行为：纯 RGB、无 alpha
+            rec.append((img, r))
+            return r
+        setattr(mod.ConfigWizard, disp_name, _flat)
+    else:
+        def _wrap(self, img):
+            r = orig(self, img)
+            rec.append((img, r))
+            return r
+        setattr(mod.ConfigWizard, disp_name, _wrap)
+
+    wiz = None
+    try:
+        wiz = build_wizard(mod)
+        wiz.cfg.update(cfg_over)
+        for k, v in (('layout', 'var_layout'), ('side', 'var_side'), ('layer', 'var_layer'),
+                     ('scale', 'var_scale'), ('offset_x', 'var_offx'), ('offset_y', 'var_offy')):
+            if k in cfg_over:
+                getattr(wiz, v).set(cfg_over[k])
+        wiz.cfg['image'] = fixture
+        wiz._update_preview()
+        wiz.root.update_idletasks()
+        wiz.root.update()
+        cv = wiz.canvas
+        items = list(cv.find_all())
+        cand, cand_idx, imgs = None, None, []
+        for it in items:
+            kind = cv.type(it)
+            co = [int(v) for v in cv.coords(it)]
+            if kind == 'rectangle':
+                fill = str(cv.itemcget(it, 'fill') or '').lower()
+                outline = str(cv.itemcget(it, 'outline') or '')
+                dash = str(cv.itemcget(it, 'dash') or '')
+                if fill == '#f5f5f5' and outline and not dash and (co[2] - co[0]) > 100:
+                    cand, cand_idx = co[:4], items.index(it)
+            elif kind == 'image':
+                nm = str(cv.itemcget(it, 'image'))
+                iw = int(cv.tk.call('image', 'width', nm))
+                ih = int(cv.tk.call('image', 'height', nm))
+                x, y = co[0], co[1]
+                anchor = str(cv.itemcget(it, 'anchor') or 'center')
+                if anchor == 'nw':                      # ← 预览图片项用的就是 nw
+                    rect = [x, y, x + iw, y + ih]
+                elif anchor == 'center':
+                    rect = [x - iw // 2, y - ih // 2, x - iw // 2 + iw, y - ih // 2 + ih]
+                elif anchor == 'ne':
+                    rect = [x - iw, y, x, y + ih]
+                elif anchor == 'sw':
+                    rect = [x, y - ih, x + iw, y]
+                elif anchor == 'se':
+                    rect = [x - iw, y - ih, x, y]
+                else:
+                    chk('B00 未支持的画布锚点（量测会错位，必须先补）', False, repr(anchor))
+                    continue
+                imgs.append({'zidx': items.index(it), 'anchor': anchor, 'rect': rect,
+                             'size': (iw, ih)})
+        disp = [d for d in rec if d[1] is not None]
+        for im in imgs:
+            m = None
+            for k, (arg, out) in enumerate(disp):
+                if (int(out.width), int(out.height)) == im['size']:
+                    m = disp.pop(k)
+                    break
+            if m is None and disp:
+                m = disp.pop(0)
+            if m is None:
+                continue
+            arg, out = m
+            alpha = wiz._preview_render_mode_img(arg)              # 产品自带掩膜口径
+            im['out'] = out
+            im['alpha'] = alpha.convert('RGBA').split()[3] if alpha.mode == 'RGBA' \
+                else alpha.convert('L')
+            im['disp_has_alpha'] = ('A' in out.mode) or ('transparency' in out.info)
+            comp = wiz._preview_compose(arg)
+            im['comp_has_alpha'] = ('A' in comp.mode) or ('transparency' in comp.info)
+            im['sha_disp'] = _sha_rgb(out)
+            im['sha_comp'] = _sha_rgb(comp)
+        return {'cand': cand, 'cand_idx': cand_idx, 'imgs': imgs, 'has_disp_fn': has_disp}
+    finally:
+        if orig is not None:
+            setattr(mod.ConfigWizard, disp_name, orig)
+        elif hasattr(mod.ConfigWizard, disp_name):
+            delattr(mod.ConfigWizard, disp_name)
+        close_wizard(wiz)
+
+
+def b_counts(im, cand):
+    """候选框 ∩ 该图片矩形（且图片在框之上）里：遮盖像素数 + 按源 alpha 分档。"""
+    out, alpha = im['out'], im['alpha']
+    w, h = out.size
+    oa = out.convert('RGBA').split()[3] if im['disp_has_alpha'] else None
+    a_cand = [max(cand[0], im['rect'][0]), max(cand[1], im['rect'][1]),
+              min(cand[2], im['rect'][2]), min(cand[3], im['rect'][3])]
+    st = dict(inter=0, covered=0, n_zero=0, cov_zero=0, n_pos=0, cov_pos=0, n_mid=0)
+    if not (a_cand[2] > a_cand[0] and a_cand[3] > a_cand[1]):
+        return st
+    ap, op = alpha.load(), (oa.load() if oa else None)
+    for y in range(a_cand[1], a_cand[3]):
+        for x in range(a_cand[0], a_cand[2]):
+            ix, iy = x - im['rect'][0], y - im['rect'][1]
+            if not (0 <= ix < w and 0 <= iy < h):
+                continue
+            st['inter'] += 1
+            al = ap[ix, iy]
+            cov = True if op is None else (op[ix, iy] > 0)
+            if cov:
+                st['covered'] += 1
+            if al == 0:
+                st['n_zero'] += 1
+                if cov:
+                    st['cov_zero'] += 1
+            else:
+                st['n_pos'] += 1
+                if cov:
+                    st['cov_pos'] += 1
+                if al < 255:
+                    st['n_mid'] += 1
+    return st
+
+
+def section_B():
+    print('\n--- B. N2：预览里带 alpha 的图不再盖住模拟候选框（t8 独立验证）---')
+    mod = load_module(SRC, 'rime_char_overlay_b4_n2')
+    fx = [('t1 的 f1', os.path.join(HERE, '_evidence_r15', 'N2_repro', 'fixtures',
+                                   'f1_alpha_block.png'))] + make_b_fixtures()
+    base = {'layout': 'horizontal_double', 'side': 'center', 'layer': 'above',
+            'scale': 1.0, 'offset_x': 0, 'offset_y': 0, 'render_mode': 'compat'}
+    rows = []
+    has_disp = None
+    for name, path, *_ in fx:
+        if not os.path.exists(path):
+            chk('B00 夹具存在: %s' % name, False, path)
+            continue
+        case = b_case(mod, path, dict(base))
+        has_disp = case['has_disp_fn'] if has_disp is None else has_disp
+        if not case['cand'] or not case['imgs']:
+            chk('B00 %s：预览画出候选框与图片' % name, False,
+                'cand=%s imgs=%d' % (case['cand'], len(case['imgs'])))
+            continue
+        for im in case['imgs']:
+            if 'out' not in im or im['zidx'] <= (case['cand_idx'] or 0):
+                continue
+            st = b_counts(im, case['cand'])
+            rows.append((name, path, im, st))
+    if not rows:
+        chk('B00 至少量到一个「图片在候选框之上且交叠」的预览用例', False, '')
+        return
+
+    n_zero_total = sum(r[3]['n_zero'] for r in rows)
+    inter_total = sum(r[3]['inter'] for r in rows)
+    chk('B01 显示端口径：显示位图带 alpha、合成产物不带 alpha（D2 未被挪动）',
+        bool(has_disp) and all(r[2]['disp_has_alpha'] for r in rows)
+        and not any(r[2]['comp_has_alpha'] for r in rows),
+        'display_has_alpha=%s comp_has_alpha=%s'
+        % ([r[2]['disp_has_alpha'] for r in rows], [r[2]['comp_has_alpha'] for r in rows]))
+    chk('B02 几何前提：交叠区里有图片自身 alpha==0 的像素（否则 B03 恒真）',
+        inter_total > 0 and n_zero_total > 0,
+        '交叠 %d px，其中 α==0 档 %d px' % (inter_total, n_zero_total))
+    chk('B03 ★N2 核心：α==0 的透明档遮盖像素数 == 0（候选框完整透出）',
+        all(r[3]['cov_zero'] == 0 for r in rows),
+        '逐例 α==0 遮盖: %s（合计 %d）'
+        % ([r[3]['cov_zero'] for r in rows], sum(r[3]['cov_zero'] for r in rows)))
+    chk('B04 α>0 档遮盖率 == 100%（图体照旧可见，不误伤）',
+        all(r[3]['cov_pos'] == r[3]['n_pos'] for r in rows),
+        'α>0 遮盖/总数: %s' % [(r[3]['cov_pos'], r[3]['n_pos']) for r in rows])
+    chk('B05 反向断言：显示位图 RGB == _preview_compose() 的 RGB（掩膜只改 alpha，颜色逐位不变）',
+        all(r[2]['sha_disp'] == r[2]['sha_comp'] for r in rows),
+        '逐例 sha: %s' % [(r[2]['sha_disp'], r[2]['sha_comp']) for r in rows])
+    chk('B06 不再整块盖住：遮盖像素数 < 交叠面积，且差值 == α==0 档像素数',
+        all(r[3]['covered'] == r[3]['inter'] - r[3]['n_zero'] for r in rows),
+        '逐例 (covered, inter, α==0): %s'
+        % [(r[3]['covered'], r[3]['inter'], r[3]['n_zero']) for r in rows])
+    print('     [原始数字] %s' % '; '.join(
+        '%s anchor=%s inter=%d covered=%d α=0:%d→盖%d α>0:%d/%d mid=%d'
+        % (r[0], r[2].get('anchor'), r[3]['inter'], r[3]['covered'], r[3]['n_zero'],
+           r[3]['cov_zero'], r[3]['cov_pos'], r[3]['n_pos'], r[3]['n_mid']) for r in rows))
+
+    # ---- B07 就地负控（判别力）：把「装回掩膜」那一步 monkeypatch 掉 ----
+    name0, path0 = rows[0][0], rows[0][1]
+    c2 = b_case(mod, path0, dict(base), flatten_arm=True)
+    neg = None
+    for im in c2['imgs']:
+        if 'out' in im and im['zidx'] > (c2['cand_idx'] or 0):
+            neg = b_counts(im, c2['cand'])
+            break
+    if neg is None:
+        chk('B07 ★判别力：负控（不装掩膜）臂量不到数据', False, '')
+        return
+    chk('B07 ★判别力：把显示端「装回掩膜」monkeypatch 掉（退回纯 RGB）后，B03 判据必须翻红',
+        (neg['cov_zero'] == neg['n_zero']) and neg['n_zero'] > 0,
+        '负控臂 α==0 档: 盖 %d / 共 %d（正臂为 0）; covered=%d inter=%d'
+        % (neg['cov_zero'], neg['n_zero'], neg['covered'], neg['inter']))
+    chk('B08 负控臂颜色也一致（负控只改「装不装掩膜」这一个变量）',
+        neg['inter'] == rows[0][3]['inter'],
+        '负控 inter=%d / 正臂 inter=%d' % (neg['inter'], rows[0][3]['inter']))
+
+
 def main():
-    which = [a.upper() for a in sys.argv[1:]] or ['A']
+    which = [a.upper() for a in sys.argv[1:]] or ['A', 'B']
     print('B_test_indep_batch4.py ｜ 第四轮独立探针 ｜ tempdir=%s' % TMP)
     print('被测源码: %s' % SRC)
     if 'A' in which:
         section_A()
+    if 'B' in which:
+        section_B()
     print('\n=== RESULT: %s（%d 条 FAIL）===' % ('FAIL' if FAILED else 'PASS', len(FAILED)))
     if FAILED:
         for t, d in FAILED:
