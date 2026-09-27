@@ -420,27 +420,27 @@ def test_slider_reuse(tmp):
               and int(wiz.cfg['layers'][0].get('offset_y', 0) or 0) == 0,
               f"top={wiz.cfg.get('offset_y')} l0={wiz.cfg['layers'][0].get('offset_y')}")
 
-        # ---- 翻转：v2.0-R13 起在通用区、统一管所有图层 ----
-        # R13 需求回退（用户「符合，回通用区」）：翻转控件从 ⑫ 图层区搬回通用区，语义与 ③
-        # 一致 = 统一管所有图层。旧断言「切到第 2 层显示该层值（False）」「勾翻转只写 layers[1]」
-        # 的前提（每层独立翻转）被推翻 → 按需求回退改为统一语义断言（不删整段、不改恒真）。
-        check('S22 翻转控件仍复用 var_flip（R13 起挂通用区 chk_flip，不再是图层区勾选框）',
+        # ---- 翻转：R13 起在通用区；N3 起**按当前选中层**调 ----
+        # N3 语义再回退（第四轮，用户「翻转也按当前选中层（一起改）」）：推翻 R13 的「统一管
+        # 所有图层」。旧断言「切到第 2 层显示统一值（True）」「在第 2 层取消 → 全部层一起回」
+        # 的前提被推翻 → 按需求回退改为每层独立断言（不删整段、不改恒真）。
+        check('S22 翻转控件仍复用 var_flip（挂通用区 chk_flip，不再是图层区勾选框）',
               hasattr(wiz, 'var_flip') and hasattr(wiz, 'chk_flip'))
         wiz.var_flip.set(True)
         wiz._on_flip_change()
-        check('S23 勾翻转 → 顶层 flip_h=True（主层权威口径不变）',
+        check('S23 勾翻转（当前选中主层）→ 顶层 flip_h=True（主层权威口径不变）',
               wiz.cfg.get('flip_h') is True, repr(wiz.cfg.get('flip_h')))
         wiz.layer_list.selection_clear(0, 'end')
         wiz.layer_list.selection_set(1)
         wiz._on_layer_select()
-        check('S24 ★R13 统一后：切到第 2 层 → 翻转控件显示统一值（True，不再是各层私有值）',
-              wiz.var_flip.get() is True, repr(wiz.var_flip.get()))
-        wiz.var_flip.set(False)
+        check('S24 ★N3：切到第 2 层 → 翻转控件显示该层自己的值（False，不是主层的 True）',
+              wiz.var_flip.get() is False, repr(wiz.var_flip.get()))
+        wiz.var_flip.set(True)
         wiz._on_flip_change()
-        check('S25 ★R13 统一后：在第 2 层取消翻转 → 全部层一起回到 False',
-              wiz.cfg['layers'][0].get('flip') is False
-              and wiz.cfg['layers'][1].get('flip') is False
-              and wiz.cfg.get('flip_h') is False,
+        check('S25 ★N3：在第 2 层勾上翻转 → 只改第 2 层（主层与顶层 flip_h 仍是 True，不受牵连）',
+              wiz.cfg['layers'][1].get('flip') is True
+              and wiz.cfg['layers'][0].get('flip') is True
+              and wiz.cfg.get('flip_h') is True,
               f"l0={wiz.cfg['layers'][0].get('flip')} l1={wiz.cfg['layers'][1].get('flip')} "
               f"top={wiz.cfg.get('flip_h')}")
 

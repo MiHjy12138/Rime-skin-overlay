@@ -216,16 +216,19 @@ def test_structure(tmp, saved):
               f'y3={y3} y_flip={yf} y4={y4}')
         check('A03 翻转控件在通用区 top_block 里（不是又留在图层区）',
               bool(ws) and _descendant(ws[0], wiz.top_block), '')
-        check('A04 翻转文案写明统一管所有图层',
-              bool(ws) and ('所有图层' in str(ws[0].cget('text'))
-                            or '统一' in str(ws[0].cget('text'))),
+        check('A04 ★翻转文案标出作用对象 = 当前层（第 N 层，不再写「所有图层」）',
+              bool(ws) and ('第' in str(ws[0].cget('text'))
+                            and '层' in str(ws[0].cget('text')))
+              and '所有图层' not in str(ws[0].cget('text')),
               repr(str(ws[0].cget('text')) if ws else ''))
         check('A05 ③ 贴边方向单选仍在（只加翻转，不误删）',
               len([w for w in _all_widgets(wiz.root)
                    if w.winfo_class() == 'Radiobutton'
                    and str(w.cget('variable')) == str(wiz.var_side)]) == 3, '')
-        check('A06 图层区仍有贴边说明行（讲清统一口径）',
-              '统一' in str(wiz.lbl_side_target.cget('text')),
+        check('A06 图层区说明行讲清「贴边在通用区、按当前层调」',
+              ('第' in str(wiz.lbl_side_target.cget('text')))
+              and ('切层' in str(wiz.lbl_side_target.cget('text'))
+                   or '通用区' in str(wiz.lbl_side_target.cget('text'))),
               repr(str(wiz.lbl_side_target.cget('text'))))
     finally:
         _kill(wiz)
@@ -235,25 +238,26 @@ def test_structure(tmp, saved):
 # B. 统一语义：勾/取消 → 全部层同步
 # ==========================================================================
 def test_unified(tmp, saved):
-    section('B. 统一语义：勾/取消 → layers[*].flip 全部同步（预览 + 保存三处一致）')
+    section('B. 每层独立：勾/取消只改当前选中层（主层被选中 → 只改主层）【N3 回退】')
     wiz = _make_wiz(_multi_cfg(tmp), saved)
     try:
         check('B00 前置：夹具 3 层 flip 全 False（否则本段无判别力）',
               _flips(wiz) == [False, False, False], repr(_flips(wiz)))
-        ok = _set_flip(wiz, True)
-        check('B01 ★勾选翻转 → 全部 3 层 flip 同步为 True',
-              ok and _flips(wiz) == [True, True, True], f'点中={ok} flips={_flips(wiz)}')
-        check('B02 ★cfg[flip_h] 同步 True（顶层权威口径不变）',
+        ok = _set_flip(wiz, True)          # 默认选中第 0 层（主层）
+        check('B01 ★选中主层勾翻转 → 只有主层 flip 变 True，其余层不动',
+              ok and _flips(wiz) == [True, False, False], f'点中={ok} flips={_flips(wiz)}')
+        check('B02 ★cfg[flip_h] 同步 True（主层 = 顶层权威）',
               wiz.cfg.get('flip_h') is True, repr(wiz.cfg.get('flip_h')))
         specs = wiz._preview_specs()
-        check('B03 ★预览 spec 里各层 flip 一致（都 True）',
-              len(specs) == 3 and all(bool(s.get('flip')) for s in specs),
+        check('B03 ★预览 spec 里只有主层 flip=True（其余层各自值）',
+              len(specs) == 3
+              and [bool(s.get('flip')) for s in specs] == [True, False, False],
               repr([s.get('flip') for s in specs]))
         ok2 = _set_flip(wiz, False)
-        check('B04 ★取消翻转 → 全部层回到 False（可反复切换）',
+        check('B04 ★取消翻转 → 主层回到 False（可反复切换）',
               ok2 and _flips(wiz) == [False, False, False] and wiz.cfg.get('flip_h') is False,
               f'点中={ok2} flips={_flips(wiz)}')
-        # 预览图像真的镜像（不是只改了状态）
+        # 预览图像真的镜像（不是只改了状态）—— N3：只有当前层镜像
         _set_flip(wiz, False)
         imgs0 = wiz._preview_layer_imgs(wiz._preview_specs())
         _set_flip(wiz, True)
@@ -266,18 +270,18 @@ def test_unified(tmp, saved):
                     continue
                 mirror_ok.append(b.tobytes()
                                  == a.transpose(_PILImage.FLIP_LEFT_RIGHT).tobytes())
-            check('B05 ★预览里每层图像确实左右镜像（不只改状态）',
-                  bool(mirror_ok) and all(mirror_ok), repr(mirror_ok))
+            check('B05 ★预览里只有被改的那层图像左右镜像、其余层不镜像（不只改状态）',
+                  mirror_ok == [True, False, False], repr(mirror_ok))
         except Exception as e:
-            check('B05 ★预览里每层图像确实左右镜像（不只改状态）', False, repr(e))
-        # 保存：cfg 与各层一致
+            check('B05 ★预览里只有被改的那层图像左右镜像、其余层不镜像', False, repr(e))
+        # 保存：顶层取主层值、各层逐层写回
         saved.clear()
         wiz._save_and_start()
         out = dict(saved)
         lay = out.get('layers') or []
-        check('B06 ★保存后 cfg[flip_h] 与 layers[*].flip 四处一致（都 True）',
+        check('B06 ★保存后 cfg[flip_h]=True（主层值）且各层 flip 逐层 = 各自值 [True, False, False]',
               out.get('flip_h') is True and len(lay) == 3
-              and all(bool(x.get('flip')) for x in lay),
+              and [bool(x.get('flip')) for x in lay] == [True, False, False],
               f"top={out.get('flip_h')} layers={[x.get('flip') for x in lay]}")
     finally:
         _kill(wiz)
@@ -292,12 +296,12 @@ def test_main_layer(tmp, saved):
     try:
         _select(wiz, 1)                    # 先选中第 2 层，再勾翻转
         ok = _set_flip(wiz, True)
-        check('C01 ★选中第 2 层时勾翻转 → 主层（第 0 层）也翻转（统一语义）',
-              ok and bool(wiz.cfg['layers'][0].get('flip')) is True
-              and wiz.cfg.get('flip_h') is True,
-              f"l0={wiz.cfg['layers'][0].get('flip')} top={wiz.cfg.get('flip_h')}")
-        check('C02 运行时口径：resolve_layers 主层 flip 跟随顶层 flip_h',
-              bool(R.resolve_layers(wiz.cfg)[0].get('flip')) is True, '')
+        check('C01 ★选中第 2 层时勾翻转 → 只有第 2 层翻、主层不动（N3 按当前层）',
+              ok and _flips(wiz) == [False, True, False]
+              and bool(wiz.cfg.get('flip_h')) is False,
+              f"flips={_flips(wiz)} top={wiz.cfg.get('flip_h')}")
+        check('C02 运行时口径：resolve_layers 主层 flip 跟随顶层 flip_h（仍 False）',
+              bool(R.resolve_layers(wiz.cfg)[0].get('flip')) is False, '')
     finally:
         _kill(wiz)
 
@@ -340,9 +344,15 @@ def test_legacy(tmp, saved):
         _select(wiz, 1)
         check('D03 切层只回显、不写回（切到第 2 层后各层 flip 仍是原值）',
               _flips(wiz) == [False, True, False], repr(_flips(wiz)))
-        ok = _set_flip(wiz, False)       # 用户显式取消 → 统一
-        check('D04 ★用户显式动作（点翻转）→ 全部层统一，老档案随之归一',
-              ok and _flips(wiz) == [False, False, False], repr(_flips(wiz)))
+        # N3 需求回退：旧 D04「用户显式动作 → 全部层统一」的前提被推翻 →
+        # 改成语义可区分的版本：先把主层翻上，再在第 2 层取消 → 只该动第 2 层
+        _select(wiz, 0)
+        _set_flip(wiz, True)
+        _select(wiz, 1)
+        ok = _set_flip(wiz, False)
+        check('D04 ★显式动作只改当前层：第 2 层归 False、主层保持 True'
+              '（N3：不再「一次全层」，老档案不被顺手归一）',
+              ok and _flips(wiz) == [True, False, False], repr(_flips(wiz)))
     finally:
         _kill(wiz)
 
@@ -380,13 +390,13 @@ def test_legacy(tmp, saved):
         _set_flip(wiz3, False)
         wiz3.skin_var.set('R13 翻转皮肤')
         wiz3._apply_skin_to_wizard()      # 真实切皮肤通路
-        check('D07 ★切皮肤后各层 flip 统一到档案主层 flip（True）',
-              _flips(wiz3) == [True, True] and wiz3.cfg.get('flip_h') is True,
+        check('D07 ★切皮肤后各层 flip 保留档案自己的值（N3：不再归一），顶层 flip_h=主层值',
+              _flips(wiz3) == [True, False] and wiz3.cfg.get('flip_h') is True,
               f'flips={_flips(wiz3)} top={wiz3.cfg.get("flip_h")}')
     except Exception as e:
         import traceback
         traceback.print_exc()
-        check('D07 ★切皮肤后各层 flip 统一到档案主层 flip（True）', False, repr(e))
+        check('D07 ★切皮肤后各层 flip 保留档案自己的值（N3：不再归一）', False, repr(e))
     finally:
         _kill(wiz3) if wiz3 is not None else None
         R.SKINS_DIR = real_skins
@@ -396,16 +406,17 @@ def test_legacy(tmp, saved):
 # E. 判别力：改乱后统一入口必须能拉回一致
 # ==========================================================================
 def test_discriminating(tmp, saved):
-    section('E. 判别力：各层 flip 人为改乱 → 统一入口必须拉回一致')
+    section('E. 判别力：非 force 只做「主层保底归一」；打桩写回路径 → 每层独立断言不成立')
     real = getattr(R.ConfigWizard, '_sync_flip_to_all_layers', None)
     if real is None:
-        check('E01 ★判别力：实现提供统一入口 _sync_flip_to_all_layers', False,
+        check('E01 ★判别力：实现提供 _sync_flip_to_all_layers（兼容入口）', False,
               '方法不存在（未实现 R13）')
         return
+    real_set = getattr(R.ConfigWizard, '_layer_set_params', None)
     wiz = None
     try:
         wiz = _make_wiz(_multi_cfg(tmp), saved)
-        _set_flip(wiz, True)
+        _set_flip(wiz, True)              # 选中主层 → 翻上
 
         def _mess_up(w):
             ls = w.cfg.get('layers') or []
@@ -413,29 +424,37 @@ def test_discriminating(tmp, saved):
                 ld['flip'] = bool(k % 2)        # False/True/False 搅乱
             w.cfg['flip_h'] = True
             try:
-                w.var_flip.set(False)
+                w.var_flip.set(False)           # 只动 Tk 变量（模拟「用户切到别的层」）
             except Exception:
                 pass
 
         _mess_up(wiz)
         check('E00 前置：改乱后各层 flip 确实不一致（否则本段无判别力）',
               len(set(_flips(wiz))) > 1, repr(_flips(wiz)))
-        wiz._sync_flip_to_all_layers(force=True)
-        check('E01 ★改乱后调统一入口（force）→ 各层 flip 全部拉回一致',
-              len(set(_flips(wiz))) == 1 and _flips(wiz)[0] is bool(wiz.var_flip.get())
-              and wiz.cfg.get('flip_h') is bool(wiz.var_flip.get()),
-              f'flips={_flips(wiz)} var_flip={wiz.var_flip.get()} '
-              f'top={wiz.cfg.get("flip_h")}')
+        # N3 需求回退：旧 E01「统一入口把各层拉回一致」的前提被推翻 →
+        # 非 force 只做「主层保底归一」，且**只信 cfg['flip_h']、绝不读 var_flip**
+        wiz._sync_flip_to_all_layers()
+        check('E01 ★非 force 归一：只把主层拉回 cfg[flip_h]=True，其余层保持改乱值 '
+              '[True, True, False]（绝不读 var_flip=False）',
+              _flips(wiz) == [True, True, False] and bool(wiz.var_flip.get()) is False,
+              f'flips={_flips(wiz)} var_flip={wiz.var_flip.get()}')
 
-        # 判别力：禁用统一入口 → 走真实点击也拉不回
-        R.ConfigWizard._sync_flip_to_all_layers = lambda self, *a, **k: False
-        _mess_up(wiz)
-        ok = _set_flip(wiz, True)
-        same = len(set(_flips(wiz))) == 1
-        check('E02 ★判别力：禁用统一入口后，点勾选框拉不回一致（断言非恒真）',
-              ok and not same, f'点中={ok} flips={_flips(wiz)}')
+        # 判别力：打桩写回路径 → 在第 2 层点勾选框改不动该层（证明每层独立断言非恒真）
+        _select(wiz, 1)
+        _set_flip(wiz, False)             # 未打桩：第 2 层先归 False（建立可判别的前置）
+        before = _flips(wiz)
+        check('E02 前置：第 2 层已归 False、主层仍 True（可判别）',
+              before == [True, False, False], repr(before))
+        R.ConfigWizard._layer_set_params = lambda self, *a, **k: False
+        _set_flip(wiz, True)
+        after = _flips(wiz)
+        check('E03 ★判别力：打桩写回路径后，在第 2 层点勾选框改不动该层（断言非恒真）',
+              before[1] is False and after[1] is False and bool(wiz.var_flip.get()) is True,
+              f'{before} → {after} var_flip={wiz.var_flip.get()}')
     finally:
         R.ConfigWizard._sync_flip_to_all_layers = real
+        if real_set is not None:
+            R.ConfigWizard._layer_set_params = real_set
         _kill(wiz) if wiz is not None else None
 
 

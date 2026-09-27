@@ -13,19 +13,23 @@
 ================== v2.0-R11 需求回退（本文件已按新需求改写） ==================
 用户第三轮实测原话：「贴边做错了，贴边放回原位，24中间。」并确认语义选择为
 **③ 统一管所有图层**（图层区不再有「选中层贴哪儿」）。
-于是下面这些**旧前提被实测推翻**的断言按「需求回退」方式改写（不删整段、不改恒真）：
-  · A01「通用区不再有 ③ 单选」   → 反转为「通用区恢复 3 个 ③ 单选」
-  · A02「图层区有三个贴边选项」  → 反转为「⑫ 不再有绑定 var_layer_anchor 的单选组」
-  · A03「图层区贴边行带编号 ③」  → 改为「③ 编号回到通用区，且在 ② 与 ④ 之间」
-  · A04「选项文案」             → 判据从图层区单选改为通用区单选
-  · B02/B03「改某层只影响该层」  → 反转为「点 ③ → 全部层与 cfg[side] 一起同步」
-  · C04「其它层不被带偏」        → 反转为「其它层跟着 ③ 一起走」
-  · C07「图层区改主层 → 同步」   → 图层区该入口已撤，改为「③ 反向改 → 各层一起回」
-  · D03「保存后第 2 层不串层」   → 反转为「保存后第 2 层 anchor 与 ③ 一致」
-  · D11（新增）真实切皮肤通路 → 各层统一到档案 ③（统一语义下的「不串层」）
-**R2 修过的那条 bug 的守护断言（C 段）一条未删** —— 主层（第 0 层）贴边必须仍可改，
-只是现在由「③ 一处驱动全部层（含主层）」实现；判别力：若回到 R2 之前那种
-「③ 只刷预览、不写状态」，B02/B03/C01/C02/C04/D03 全部会红（改写前实测 8 FAIL）。
+
+================== v2.0-N3 语义再回退（2026-09-27，第四轮，以此为准） ==================
+用户第四轮实测「多图时不同图片贴边选择会被统一覆盖。无法每个图片单独选择」并两次澄清
+「**只出现一处**，单图时正常用，多图时根据图片数量分开调整每一个」（追加：「翻转也按
+当前选中层」）→ **推翻 R11 的统一语义**，③ 回到「按当前选中层调」= 本文件 R2 时代的原始
+语义（只是写回入口换成了 ④⑤⑥ 那条 `_layer_set_params(i, anchor=…)`）。因此这些断言按
+「需求回退」方式再改一遍（不删整段、不改恒真）：
+  · B02/B03「点一次全层同步」   → 「只写当前层；主层与顶层 side 不被带动」
+  · C01/C02/C03「③ 通路落地」   → 改走**真实点击**（_radio_invoke）守 R2 那条修复
+  · C04「其它层跟着一起同步」    → 反转为「其它层不被带走」
+  · C07「③ 反向改，各层一起回」  → 「只 set 变量不点控件 → 不写回任何层」
+  · C08「③ 通路回显」           → 「真实点击后回显」
+  · D03「保存后第 2 层与 ③ 一致」→ 「保存后第 2 层保持自己的值」
+  · D11「切皮肤各层统一」        → 「切皮肤各层保留档案自己的值」
+**R2 修过的那条 bug 的守护断言（C01/C02/C03）一条未删** —— 主层（第 0 层）贴边必须仍可
+改；判别力：若回到 R2 之前那种「③ 只刷预览、不写状态」，C01/C02/C03 全红（改写前实测
+R2 段 8 FAIL）；若回到 R11 的「写全部层」，B02/B03/C04/D03/D11 全红。
 
 验收段：
   A 结构：③ 回通用区（② 与 ④ 之间）、⑫ 不再有贴边单选、窗口不加高
@@ -211,7 +215,7 @@ def test_ui_move(tmp, saved):
         # R11 需求回退：旧 A01「通用区不再有 ③ 单选」的前提被用户实测推翻 → 反转
         check('A01 ★通用区恢复「③ 贴边方向」单选组（3 个）', len(side_r) == 3,
               f'var_side 单选={side_r}')
-        check('A02 ★⑫ 图层区不再有「选中层贴哪儿」单选组（改为统一管所有图层）',
+        check('A02 ★⑫ 图层区不再有「选中层贴哪儿」单选组（贴边只在通用区一处）',
               len(anc_r) == 0, f'var_layer_anchor 单选={anc_r}')
         y2, y3, y4 = _first_y(wiz, '②'), _first_y(wiz, '③'), _first_y(wiz, '④')
         check('A03 ★③ 编号回到通用区，且落在 ② 候选框类型 与 ④ 缩放 之间',
@@ -229,7 +233,7 @@ def test_ui_move(tmp, saved):
         # 且与 ③ 一样统一管所有图层 → 旧文案「图层区仍有翻转控件（作用于当前选中层）」
         # 已不成立，改为「翻转复用通用区 var_flip（chk_flip）」；var_layer_anchor 仍保留为
         # 当前层 anchor 的回显镜像（R11 起）。
-        check('A07 翻转复用 var_flip（R13 起在通用区 chk_flip、统一管所有图层）',
+        check('A07 翻转复用 var_flip（在通用区 chk_flip，按当前选中层调）',
               hasattr(wiz, 'var_flip') and hasattr(wiz, 'chk_flip')
               and hasattr(wiz, 'var_layer_anchor'))
     finally:
@@ -240,30 +244,36 @@ def test_ui_move(tmp, saved):
 # B. 每图层参数：切层回显 / 改值只影响该层
 # ==========================================================================
 def test_per_layer(tmp, saved):
-    section('B. 统一语义：点 ③ → 全部图层一起变【R11 改写，原「每层独立」】')
+    section('B. 每层独立：点 ③ 只改当前选中层【N3 回退，原「统一语义」】')
     wiz = _make_wiz(_multi_cfg(tmp), saved)
     try:
         _select(wiz, 1)
         check('B01 选中第 2 层 → 回显该层 anchor（var_layer_anchor 现为回显镜像）',
               wiz.var_layer_anchor.get() == 'left_edge', repr(wiz.var_layer_anchor.get()))
-        # R11 需求回退：旧 B02「改选中层只写 layers[1]」的前提被推翻 → 反转为统一同步
+        check('B01b ★选中第 2 层 → ③ 单选组也回显该层（贴左）',
+              wiz.var_side.get() == 'left', repr(wiz.var_side.get()))
+        # N3 需求回退：旧 B02「点一次全层同步」的前提被用户实测推翻 → 反转为「只写当前层」
+        b = [x.get('anchor') for x in wiz.cfg['layers']]
         ok = _radio_invoke(wiz, wiz.var_side, '中')
-        check('B02 ★点 ③「中间」→ 全部层（含第 2 层）anchor 同步 center',
-              ok and [x.get('anchor') for x in wiz.cfg['layers']] == ['center'] * 2,
-              f"点中={ok} anchors={[x.get('anchor') for x in wiz.cfg['layers']]}")
-        check('B03 ★主层与顶层 side 一起同步（不再各管一层）',
-              wiz.cfg['layers'][0].get('anchor') == 'center'
-              and wiz.cfg.get('side') == 'center',
+        a = [x.get('anchor') for x in wiz.cfg['layers']]
+        print(f'    ③ 改第 2 层：anchors {b} → {a}')
+        check('B02 ★点 ③「中间」→ 只有第 2 层 anchor 变 center（主层不动）',
+              ok and b == ['right_edge', 'left_edge'] and a == ['right_edge', 'center'],
+              f'点中={ok} {b} → {a}')
+        check('B03 ★主层与顶层 side 不被带动（仍 right_edge / right）',
+              wiz.cfg['layers'][0].get('anchor') == 'right_edge'
+              and wiz.cfg.get('side') == 'right',
               f"l0={wiz.cfg['layers'][0].get('anchor')} side={wiz.cfg.get('side')}")
-        check('B04 列表项文案跟着更新（贴哪边看得见）',
-              all('居' in wiz.layer_list.get(i) for i in range(2)),
+        check('B04 列表项文案跟着更新（第 2 行写「居」，第 1 行仍「贴右」）',
+              '居' in wiz.layer_list.get(1) and '贴右' in wiz.layer_list.get(0),
               repr([wiz.layer_list.get(i) for i in range(2)]))
         _select(wiz, 0)
-        check('B05 ★切回主层 → 回显主层值（与 ③ 一致）',
-              wiz.var_layer_anchor.get() == 'center', repr(wiz.var_layer_anchor.get()))
-        check('B06 图层区说明行回显当前统一贴边（讲清统一口径）',
-              ('统一' in str(wiz.lbl_side_target.cget('text')))
-              and ('居' in str(wiz.lbl_side_target.cget('text'))),
+        check('B05 ★切回主层 → 回显主层值（贴右）',
+              wiz.var_layer_anchor.get() == 'right_edge' and wiz.var_side.get() == 'right',
+              f'镜像={wiz.var_layer_anchor.get()!r} var_side={wiz.var_side.get()!r}')
+        check('B06 图层区说明行回显当前层贴边（讲清「按层调」）',
+              ('第 1 层' in str(wiz.lbl_side_target.cget('text')))
+              and ('右' in str(wiz.lbl_side_target.cget('text'))),
               repr(str(wiz.lbl_side_target.cget('text'))))
     finally:
         _kill(wiz)
@@ -277,37 +287,38 @@ def test_main_layer_fix(tmp, saved):
     wiz = _make_wiz(_multi_cfg(tmp), saved)
     try:
         _select(wiz, 0)
-        # 旧入口复现：③ 通路（var_side）过去完全落不了地
-        wiz.var_side.set('center')
-        wiz._update_preview()
+        # N3：③ 的写回入口是 _layer_set_params(i, anchor=…) —— 守 R2 那条修复走
+        # **真实点击**通路（旧入口是「只刷预览、不写状态」，走这里必红）
+        ok = _radio_invoke(wiz, wiz.var_side, '中')
         check('C01 ★主层贴边（③ 通路）落到 cfg[side]',
-              wiz.cfg.get('side') == 'center', repr(wiz.cfg.get('side')))
+              ok and wiz.cfg.get('side') == 'center', repr(wiz.cfg.get('side')))
         check('C02 ★主层贴边落到 layers[0].anchor',
               wiz.cfg['layers'][0].get('anchor') == 'center',
               repr(wiz.cfg['layers'][0].get('anchor')))
         check('C03 ★多图层预览里主层跟着走（_preview_specs）',
               len(wiz._preview_specs()) > 1 and wiz._preview_specs()[0]['anchor'] == 'center',
               str([x['anchor'] for x in wiz._preview_specs()]))
-        check('C04 ★其它层跟着 ③ 一起同步 center（R11 统一语义）',
-              wiz.cfg['layers'][1].get('anchor') == 'center',
+        # N3 需求回退：旧 C04「其它层跟着 ③ 一起同步」的前提被推翻 → 反转为「不被带走」
+        check('C04 ★其它层不被主层操作带走（第 2 层仍是 left_edge）',
+              wiz.cfg['layers'][1].get('anchor') == 'left_edge',
               repr(wiz.cfg['layers'][1].get('anchor')))
         check('C05 ★图层区回显跟着走（回显镜像 = 当前层 anchor）',
               wiz.var_layer_anchor.get() == 'center', repr(wiz.var_layer_anchor.get()))
         check('C06 预览画布上确有图片（改动没把预览搞空）',
               len(wiz._preview_specs()) > 1 and _img_xy(wiz) is not None)
-        # R11 需求回退：图层区的贴边单选取已撤（统一收归通用区 ③）→
-        # 旧 C07「图层区改主层」改为「③ 反向改一次，各层一起回到 right_edge」
-        ok = _radio_invoke(wiz, wiz.var_side, '右')
-        check('C07 ★③ 反向改（贴右）→ cfg[side] 与各层一起回到 right_edge',
-              ok and wiz.var_side.get() == 'right' and wiz.cfg.get('side') == 'right'
-              and all(x.get('anchor') == 'right_edge' for x in wiz.cfg['layers']),
-              f"点中={ok} var_side={wiz.var_side.get()} side={wiz.cfg.get('side')} "
-              f"anchors={[x.get('anchor') for x in wiz.cfg['layers']]}")
-        # 再走一次 ③ 通路（变量 + 重绘）：回显要跟上
+        # N3 新增守护：只 set 变量不点控件 → 不写回（与 ④⑤⑥ 同口径：command 才写回）
         wiz.var_side.set('left')
         wiz._update_preview()
-        check('C08 ★③ 通路改回贴左 → 图层区回显 left_edge',
-              wiz.var_layer_anchor.get() == 'left_edge', repr(wiz.var_layer_anchor.get()))
+        check('C07 ★只改 ③ 变量、不点控件 → 不写回（主层仍 center；非 force 不读 Tk 变量）',
+              wiz.cfg.get('side') == 'center'
+              and wiz.cfg['layers'][0].get('anchor') == 'center',
+              f'side={wiz.cfg.get("side")!r} l0={wiz.cfg["layers"][0].get("anchor")!r}')
+        ok2 = _radio_invoke(wiz, wiz.var_side, '左')
+        check('C08 ★真实点击改回贴左 → cfg[side]=left 且图层区回显 left_edge',
+              ok2 and wiz.cfg.get('side') == 'left'
+              and wiz.var_layer_anchor.get() == 'left_edge',
+              f'点中={ok2} side={wiz.cfg.get("side")!r} '
+              f'镜像={wiz.var_layer_anchor.get()!r}')
     finally:
         _kill(wiz)
 
@@ -316,7 +327,7 @@ def test_main_layer_fix(tmp, saved):
 # D. 保存 + 皮肤档案往返
 # ==========================================================================
 def test_roundtrip(tmp, saved):
-    section('D. 保存与皮肤档案往返：各层 anchor 与 ③ 一致、切皮肤不串层【R11 改写】')
+    section('D. 保存与皮肤档案往返：各层 anchor 逐层落盘、切皮肤不归一【N3 改写】')
     real_skins = R.SKINS_DIR
     tmp_skins = os.path.join(tmp, 'skins_r2')
     os.makedirs(tmp_skins, exist_ok=True)
@@ -326,22 +337,24 @@ def test_roundtrip(tmp, saved):
         cfg = _multi_cfg(tmp)
         wiz = _make_wiz(cfg, saved)
         _select(wiz, 0)
-        # R11：③ 已回通用区且统一管所有图层 → 点一次就够，不再逐层设 anchor
+        # N3：③ 按当前选中层调 —— 主层被选中时点 ③ 写顶层 side + layers[0].anchor，
+        # 其余层保持各自值（第 2 层 left_edge 不动）
         _radio_invoke(wiz, wiz.var_side, '中')
         _select(wiz, 1)
         saved.clear()
         wiz._save_and_start()
         out = dict(saved)
         lay = out.get('layers') or []
+        print(f"    保存落盘：side={out.get('side')!r} "
+              f"anchors={[x.get('anchor') for x in lay]}")
         check('D01 ★保存后顶层 side = 主层贴边（center）',
               out.get('side') == 'center', repr(out.get('side')))
         check('D02 ★保存后 layers[0].anchor = center（主层逐层还原）',
               len(lay) > 0 and lay[0].get('anchor') == 'center',
               repr(lay[0].get('anchor') if lay else None))
-        # R11 需求回退：旧 D03 断言「第 2 层保持自己的 left_edge（不串层）」的前提被推翻
-        # → 反转为「各层 anchor 与 ③ 一致」（统一语义下的「不串层」= 不留上个值）
-        check('D03 ★保存后 layers[1].anchor = center（与 ③ 一致，R11 统一语义）',
-              len(lay) > 1 and lay[1].get('anchor') == 'center',
+        # N3 需求回退：旧 D03「各层 anchor 与 ③ 一致」的前提被推翻 → 反转为「保持自己的值」
+        check('D03 ★保存后 layers[1].anchor 保持自己的 left_edge（N3：不被 ③ 统一）',
+              len(lay) > 1 and lay[1].get('anchor') == 'left_edge',
               repr(lay[1].get('anchor') if len(lay) > 1 else None))
         check('D04 保存后顶层 image 指向主层图片',
               os.path.normpath(str(out.get('image', ''))) == os.path.normpath(str(lay[0].get('image', '')))
@@ -403,15 +416,15 @@ def test_roundtrip(tmp, saved):
         _radio_invoke(wiz3, wiz3.var_side, '右')     # 向导先置成「贴右」
         wiz3.skin_var.set('R2 贴边往返皮肤')
         wiz3._apply_skin_to_wizard()
-        check('D11 ★真实切皮肤后各层 anchor 统一到档案 ③(center)，不留上一个值',
-              [x.get('anchor') for x in (wiz3.cfg.get('layers') or [])] == ['center'] * 2
-              and wiz3.var_side.get() == 'center',
+        check('D11 ★真实切皮肤后各层 anchor 保留档案自己的值（N3：不再归一），③ 回显当前层',
+              [x.get('anchor') for x in (wiz3.cfg.get('layers') or [])]
+              == ['center', 'left_edge'] and wiz3.var_side.get() == 'center',
               f"anchors={[x.get('anchor') for x in (wiz3.cfg.get('layers') or [])]} "
               f"var_side={wiz3.var_side.get()}")
     except Exception as e:
         import traceback
         traceback.print_exc()
-        check('D11 ★真实切皮肤后各层 anchor 统一到档案 ③(center)，不留上一个值',
+        check('D11 ★真实切皮肤后各层 anchor 保留档案自己的值（N3：不再归一）',
               False, repr(e))
     finally:
         _kill(wiz3) if wiz3 is not None else None
@@ -480,7 +493,7 @@ def main():
     R.set_autostart = lambda *a, **k: (True, '（测试打桩）')
     try:
         if not gui_ok:
-            for t, cnt in (('A', 7), ('B', 6), ('C', 8), ('D', 11), ('E', 4)):
+            for t, cnt in (('A', 7), ('B', 7), ('C', 8), ('D', 11), ('E', 4)):
                 for i in range(1, cnt + 1):
                     SKIPPED.append(f'{t}{i:02d}')
                     print(f'  [SKIP] {t}{i:02d}  (无桌面环境（GUI 不可用）)')

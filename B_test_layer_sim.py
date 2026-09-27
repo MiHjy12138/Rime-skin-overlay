@@ -221,6 +221,13 @@ def _attach(ov, cand):
 def main():
     print('=== v1.5 图层功能验证：模拟候选框 + below/above 层级语义 ===')
     print('Python', sys.version.split()[0])
+    # 只读约束（HANDOFF-2.1 §8.5，与 t7 对另外 6 条脚本的同款修法）：本脚本会走到
+    # 产品的 [渲染]/[退出]/[候选框] 日志路径，HERE 不改道就会往项目 error.log 追加
+    # （实测每次 +785 B）。改成临时目录后本项目 error.log 增量归零。
+    import tempfile
+    _tmp_here = tempfile.mkdtemp(prefix='layer_sim_')
+    m.HERE = _tmp_here
+    print('临时目录:', _tmp_here)
     import tkinter
     print('tk', tkinter.TkVersion)
     try:
@@ -527,6 +534,11 @@ def main():
         except Exception:
             pass
         time.sleep(0.1)
+        try:
+            import shutil
+            shutil.rmtree(_tmp_here, ignore_errors=True)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

@@ -4677,26 +4677,30 @@ class ConfigWizard:
         tk.Button(row3, text='读取当前Rime配置', command=self._read_rime,
                   font=('Microsoft YaHei', 9)).pack(side='left', padx=8)
 
-        # ③ 贴边方向 + 水平翻转（v2.0-R11/R13：都在通用区，都**统一管所有图层**）
-        #   · R11（用户实测「贴边做错了，贴边放回原位，24中间」）：③ 从 ⑫ 图层区搬回
-        #     通用区原位（② 与 ④ 之间），点一次 = 全部图层的 anchor 一起改；
-        #   · R13（用户追加「符合，回通用区」）：水平翻转同样从 ⑫ 图层区搬回来，
-        #     与 ③ 同一行、同一形态 —— 勾一下 = 全部图层的 flip 一起翻。
-        # 顶层 cfg['side'] / cfg['flip_h'] 仍是主层（第 0 层）的权威（resolve_layers /
-        # save_layers_into_cfg 口径不变），两处统一同步分别由
-        # _sync_side_to_all_layers() / _sync_flip_to_all_layers() 一处收口。
-        # 这里的两个变量：var_side = ③ 的单选值；var_flip = 翻转勾选框的值（都是全图层的 UI 权威）。
+        # ③ 贴边方向 + 水平翻转（v2.0-N3：都在通用区，都**按当前选中图层**调）
+        #   · 位置/形态来历：R11 把 ③ 从 ⑫ 图层区搬回通用区原位（② 与 ④ 之间）；
+        #     R13 把水平翻转搬进同一行 —— 位置与形态（单选组 + 勾选框）用户已确认，N3 不动。
+        #   · 语义来历：R11/R13 曾是「一处统一管所有图层」；用户第四轮实测「多图时不同图片
+        #     贴边选择会被统一覆盖。无法每个图片单独选择」并两次澄清「**只出现一处**，单图时
+        #     正常用，多图时根据图片数量分开调整每一个」→ N3 把两者作用对象改成**当前选中的
+        #     图层**，与 ④缩放 / ⑤水平 / ⑥垂直 完全同一种用法（点一下写回该层、切层回显该层
+        #     值）。用户追加「翻转也按当前选中层（一起改）」，故两条同口径。
+        #   · 顶层 cfg['side'] / cfg['flip_h'] 仍是主层（第 0 层）的权威（resolve_layers /
+        #     save_layers_into_cfg 口径不变）；写回统一走 _layer_set_params(i, anchor=/flip=)，
+        #     非 force 的归一入口只做「主层保底归一」（见 _sync_side_to_all_layers）。
+        # 这里的两个变量：var_side / var_flip = **随选中层回显**的控件值（不再是全层权威）。
         row4 = tk.Frame(left)
         row4.pack(fill='x', pady=1)
-        tk.Label(row4, text='③ 贴边方向（所有图层统一）:',
-                 font=('Microsoft YaHei', 10)).pack(side='left')
+        self.lbl_side_title = tk.Label(row4, text='③ 贴边方向（第 1 层）:',
+                                       font=('Microsoft YaHei', 10))
+        self.lbl_side_title.pack(side='left')
         self.var_side = tk.StringVar(master=self.root, value='right')
         for text, val in [('右侧', 'right'), ('左侧', 'left'), ('中间', 'center')]:
             tk.Radiobutton(row4, text=text, variable=self.var_side, value=val,
                            font=('Microsoft YaHei', 9),
                            command=self._on_side_change).pack(side='left', padx=2)
         self.var_flip = tk.BooleanVar(master=self.root, value=False)
-        self.chk_flip = tk.Checkbutton(row4, text='水平翻转（所有图层统一）',
+        self.chk_flip = tk.Checkbutton(row4, text='水平翻转（第 1 层）',
                                        variable=self.var_flip,
                                        font=('Microsoft YaHei', 9),
                                        command=self._on_flip_change)
@@ -4842,15 +4846,16 @@ class ConfigWizard:
         tk.Button(lay_btns, text='↓ 下移', command=lambda: self._layer_move(1),
                   font=('Microsoft YaHei', 8)).pack(side='left')
 
-        # ③ 贴边方向 / 水平翻转（v2.0-R11 + R13）：都已搬回通用区并**统一管所有图层** ——
-        # 图层区不再有任何「选中层贴哪儿 / 当前层翻转」的控件，只留两行小字说明。
+        # ③ 贴边方向 / 水平翻转（v2.0-R11/R13 搬回通用区；N3 起**按当前选中层**调）——
+        # 图层区不再有任何「选中层贴哪儿 / 当前层翻转」的控件（用户要求「只出现一处」），
+        # 只留两行小字说明「在哪调、调的是哪一层」。
         # var_layer_anchor 自 R11 起不再绑任何单选按钮，保留为**当前选中层 anchor 的回显镜像**
         # （切层时更新；既有回归脚本按它核对「切层回显」）。
         self.lbl_side_target = tk.Label(lay_box, text='', fg='#555',
                                         font=('Microsoft YaHei', 9), justify='left',
                                         wraplength=300)
         self.lbl_side_target.pack(anchor='w')
-        self.lbl_flip_hint = tk.Label(lay_box, text='水平翻转也在通用区统一（③ 那一行）',
+        self.lbl_flip_hint = tk.Label(lay_box, text='水平翻转也在 ③ 那一行，按当前选中层调',
                                       fg='#888', font=('Microsoft YaHei', 8),
                                       justify='left', wraplength=300)
         self.lbl_flip_hint.pack(anchor='w')
@@ -5237,157 +5242,140 @@ class ConfigWizard:
         self._update_preview()
 
     def _on_flip_change(self):
-        """水平翻转（通用区勾选框）：勾一下 = **全部图层**一起翻转（v2.0-R13）。
+        """水平翻转（通用区勾选框）：勾一下 = **当前选中图层**的 flip（v2.0-N3）。
 
-        用户第三轮追加「符合，回通用区」→ 翻转从 ⑫ 图层区搬回通用区，与 ③ 同一形态：
-        一处驱动所有图层的 flip（cfg['flip_h'] 仍是主层权威，各层 layers[*].flip 跟随）。
+        用户第四轮追加「翻转也按当前选中层（一起改）」→ 推翻 R13 的「一处统一管所有图层」：
+        与 ③ 同口径、与 ④⑤⑥ 走同一条写回路径（_layer_set_params）。
+        第 0 层（主层）写顶层 cfg['flip_h']（主层权威），其余层只写该层 ld['flip']。
+        Tk 的 Checkbutton 先改变量、再调 command，所以进到这里时 var_flip 已是新值。
         """
-        self._sync_flip_to_all_layers(force=True)
+        i = self._cur_layer_index()
+        self._layer_set_params(i, flip=bool(self.var_flip.get()))
+        try:
+            self._refresh_layer_row(i)
+        except Exception:
+            pass
         self._update_preview()
 
     def _on_layer_flip(self):
-        """R2/t15 兼容名：翻转的入口（v2.0-R13 起实现在 _on_flip_change，控件已在通用区）"""
+        """R2/t15 兼容名：翻转的入口（实现在 _on_flip_change，控件在通用区 ③ 那一行）"""
         return self._on_flip_change()
 
     def _sync_flip_to_all_layers(self, force=False):
-        """水平翻转的统一同步（v2.0-R13：翻转一处驱动**全部图层**的 flip）。
+        """**主层保底归一**（方法名沿用 R13；「一处统一管所有图层」的语义已于 N3 撤销）。
 
-        语义：通用区翻转勾选框（UI 镜像 var_flip）是全部图层翻转值的权威 ——
-        勾/取消 = cfg['flip_h'] 与 layers[*].flip 一起改，预览随之重绘。
+        v2.0-N3：翻转的作用对象已改为**当前选中图层**（_on_flip_change → _layer_set_params），
+        所以这里只剩「预览 / 落盘前把 layers[0].flip 对齐顶层 cfg['flip_h']」这一件事。
         顶层 cfg['flip_h'] 仍是主层（第 0 层）的权威（resolve_layers / save_layers_into_cfg
         口径不变；运行时 _layer_raw_frame 逐层读 ld['flip']，主层取顶层 flip_h）。
 
-        为什么不做「不一致即推全部层」（与 ③ 的 _sync_side_to_all_layers 不同）：
-        var_flip 是**随选中层回显**的控件值（切层时 _on_layer_select 会把它设成该层的值），
-        所以「var_flip 与 cfg['flip_h'] 不一致」既可能是用户改了翻转、也可能只是刚切到
-        一个历史 flip 不同的层 —— 后者若触发全层同步，就会在用户没动翻转时静默改写档案。
-        因此这里把「推给全部层」严格留给 **force=True** 的显式动作：
-          · 点翻转勾选框（_on_flip_change）；
-          · 保存 / 存皮肤（写盘前必须各层一致）；
-          · 切皮肤（用户显式换整套配置）。
-        非 force 只做**主层保底归一**：把 layers[0].flip 对齐 cfg['flip_h']（R2 时代
-        「翻转天然有联动」的那条通路不回归），不动其它层的历史值。
-
-        老档案策略（明确口径）：历史上各层 flip 不一致的档案，打开向导 / 切层 / 重绘预览
-        都**原样保留**（不静默改写用户档案）；只有在上面列出的显式动作里才归一到主层值，
-        且写盘只发生在用户真的点保存/存皮肤时。
-
-        返回值 = 本轮是否做了「全部层」同步（测试用来验判别力）。
+        两条硬约束（R13 的坑 + N3 的纪律）：
+          · **只信 cfg['flip_h']，绝不读 Tk 变量 var_flip** —— var_flip 是「随选中层回显」
+            的控件值，切到第 2 层后它等于第 2 层的值；若拿它来归一，重绘预览就会在用户
+            没动翻转时静默改写主层（这正是 R13 给 force 分档要躲的那件事）。
+          · **不写其它层**：历史上各层 flip 不一致的档案，打开 / 切层 / 重绘预览都原样保留；
+            写盘只发生在用户真的点保存 / 存皮肤时，且落盘值就是各层自己的值。
+        force 参数保留仅为签名兼容（老调用点仍在传）—— 不再有「推给全部层」这回事。
+        返回值 = 本轮是否改了主层（测试用来验判别力）。
         """
         try:
             layers = self._layers()
             if not layers:
                 return False
-            if force:
-                want = bool(self.var_flip.get())
-                self.cfg['flip_h'] = want
-                for ld in layers:
-                    ld['flip'] = want
-                return True
             want = bool(self.cfg.get('flip_h', False))
             if bool(layers[0].get('flip')) != want:
                 layers[0]['flip'] = want
+                return True
             return False
         except Exception:
             return False
 
     def _sync_side_to_all_layers(self, force=False):
-        """③ 贴边方向的统一同步（v2.0-R11：③ 一处驱动**全部图层**的 anchor）。
+        """**主层保底归一**（方法名沿用 R11；「一处统一管所有图层」的语义已于 N3 撤销）。
 
-        语义：通用区 ③（UI 镜像 var_side）是全部图层锚点的唯一权威 —— 点一次 =
-        cfg['side'] 与 layers[*].anchor 一起改，图层列表文案与预览随之刷新。
-        顶层 cfg['side'] 仍是主层锚点的权威（resolve_layers / save_layers_into_cfg 口径不变）。
+        v2.0-N3：③ 的作用对象已改为**当前选中图层**（_on_side_change → _layer_set_params），
+        这里只剩「预览 / 落盘前把 layers[0].anchor 对齐顶层 cfg['side']」这一件事 ——
+        R2 修过的那条 bug（多图层时主层贴边改不动：旧入口只刷预览、既不写 cfg['side']、
+        也不写 layers[0].anchor）在 ③ 的显式动作路径里由 _layer_set_params 继续兜住；
+        本方法的调用点仍是预览前 / 保存前两个通路（R2 同款）。
 
-        什么时候推给所有层（而不是只保底主层）：
-          · force=True：保存 / 存皮肤 / 切皮肤 / 点 ③ 这些**显式动作**，必须保证各层一致；
-          · ③ 的值与 cfg['side'] 不一致：说明用户刚改了 ③（Tk 的 Radiobutton 先改变量、
-            再调 command，所以进到这里时已是「改过」状态）→ 推给所有层；
-          · 其余情况（打开向导 / 切层 / 普通重绘）只做**主层保底归一** —— 不静默改写老档案里
-            其它层的历史 anchor（R2 时代的多层档案仍能原样读出来看）。
-        返回值 = 本轮是否做了「全部层」同步（测试用来验判别力）。
-
-        与 R2 的关系：R2 修过的 bug（多图层时主层贴边改不动：旧入口只刷预览、既不写
-        cfg['side'] 也不写 layers[0].anchor）在本方法里继续成立 —— 主层永远跟着 ③ 走，
-        只不过现在其余层也一起走；调用点仍是预览前 / 保存前两个通路（R2 同款）。
+        两条硬约束（与 flip 侧同款）：
+          · **只信 cfg['side']，绝不读 Tk 变量 var_side** —— var_side 随选中层回显，切到
+            第 2 层后它等于第 2 层的值；拿它归一会静默改写主层。
+          · **不写其它层**：老档案里其它层的历史 anchor 原样保留（第四轮用户要的就是
+            「每张图各自贴边」，不能被任何隐式动作统一掉）。
+        force 参数保留仅为签名兼容（老调用点仍在传）；返回值 = 本轮是否改了主层。
         """
         try:
             layers = self._layers()
             if not layers:
                 return False
-            side = None
-            w = getattr(self, 'var_side', None)
-            if w is not None:
-                v = str(w.get() or '')
-                if v in ('left', 'right', 'center'):
-                    side = v
-            if side is None:
-                side = self.cfg.get('side')
-            if side not in ('left', 'right', 'center'):
-                side = 'right'
-            anc = anchor_from_side(side)
-            spread = bool(force) or (self.cfg.get('side') != side)
-            self.cfg['side'] = side
-            if spread:
-                for i, ld in enumerate(layers):
-                    if ld.get('anchor') != anc:
-                        ld['anchor'] = anc
-                        self._refresh_layer_row(i)
-            elif layers[0].get('anchor') != anc:
+            anc = anchor_from_side(self.cfg.get('side'))
+            changed = False
+            if layers[0].get('anchor') != anc:
                 layers[0]['anchor'] = anc
-                self._refresh_layer_row(0)
+                changed = True
             self._mirror_layer_anchor(layers)
-            return spread
+            return changed
         except Exception:
             return False
 
     def _sync_side_to_layer0(self):
-        """R2 兼容名：③ 的「预览前归一」入口（v2.0-R11 起实现搬进 _sync_side_to_all_layers）。
+        """R2 兼容名：③ 的「预览前归一」入口（= _sync_side_to_all_layers 的主层保底归一）。
 
-        保留这个名字是因为 R2 起的两个调用点（_update_preview_impl 与保存前）按它写；
-        非 force 调用 = 「用户改了 ③ 才推全部层，否则只保底主层」的原行为。
+        调用点：_update_preview_impl（画之前）与保存前。v2.0-N3 起**不写全层**。
         """
         return self._sync_side_to_all_layers()
 
     def _on_side_change(self):
-        """③ 贴边方向（通用区）的单选 command：一次改动驱动**全部图层**的 anchor。
+        """③ 贴边方向（通用区）的单选 command：写**当前选中图层**的锚点（v2.0-N3）。
 
-        v2.0-R11：用户实测「贴边做错了，贴边放回原位，24中间」→ 控件回通用区、语义统一。
-        force=True 表示「点一下 = 所有层都改」（不依赖 var_side 与 cfg['side'] 的差集判断，
-        点同值也算一次显式动作，代价只是重刷列表文案）。
+        用户第四轮实测「多图时不同图片贴边选择会被统一覆盖。无法每个图片单独选择」，
+        并明确「只出现一处，单图时正常用，多图时根据图片数量分开调整每一个」→ 与
+        ④缩放 / ⑤水平 / ⑥垂直 完全同一种用法：选中哪层就调哪层，其余层一个都不动。
+        Tk 的 Radiobutton 先改变量、再调 command，所以进到这里时 var_side 已是新值。
         """
-        self._sync_side_to_all_layers(force=True)
+        i = self._cur_layer_index()
+        self._layer_set_params(i, anchor=anchor_from_side(self.var_side.get()))
+        try:
+            self._refresh_layer_row(i)
+        except Exception:
+            pass
+        self._mirror_layer_anchor()
         self._update_preview()
 
     def _mirror_layer_anchor(self, layers=None):
-        """刷新图层区的「当前层锚点镜像」（var_layer_anchor）与统一说明行。
+        """刷新图层区的「当前层锚点镜像」（var_layer_anchor）与说明行 / 两个控件文案。
 
-        v2.0-R11：var_layer_anchor 不再绑单选按钮（贴边方向已收归通用区 ③ 统一），
-        它保留为**当前选中层 anchor 的回显镜像** —— 既有回归脚本按它核对「切层回显」。
+        v2.0-R11 起 var_layer_anchor 不再绑任何单选按钮；它保留为**当前选中层 anchor 的
+        回显镜像**（既有回归脚本按它核对「切层回显」）。v2.0-N3：口径统一走
+        _layer_anchor_at（第 0 层取顶层 side 的映射，与 resolve_layers 一致）。
         """
         try:
             layers = layers if layers is not None else self._layers()
             i = int(getattr(self, '_layer_sel', 0) or 0)
             if not (0 <= i < len(layers)):
                 i = 0
-            cur = str(layers[i].get('anchor') or 'right_edge') if layers else 'right_edge'
+            cur = self._layer_anchor_at(i) if layers else 'right_edge'
             if str(self.var_layer_anchor.get()) != cur:
                 self.var_layer_anchor.set(cur)
         except Exception:
             pass
         self._update_side_hint()
+        self._sync_side_widget_titles()
 
     def _update_side_hint(self):
-        """图层区那行小字：讲清「贴边方向由通用区 ③ 统一管所有图层」并回显当前统一值"""
+        """图层区那行小字：讲清「贴边与翻转在通用区、选中哪层调哪层」并回显该层值
+
+        文案长度受右栏高度约束（wraplength=300，R2 记账约 +16px/行）—— 保持两行内；
+        阈值由 B_test_n3_side_per_layer.py 的 K 段（三态高度）守着。
+        """
         try:
-            side = 'right'
-            w = getattr(self, 'var_side', None)
-            if w is not None:
-                v = str(w.get() or '')
-                if v in ('left', 'right', 'center'):
-                    side = v
-            word = {'left': '贴左', 'right': '贴右', 'center': '居中'}.get(side, '贴右')
+            i = int(getattr(self, '_layer_sel', 0) or 0)
+            word = {'left_edge': '贴左', 'right_edge': '贴右',
+                    'center': '居中'}.get(self._layer_anchor_at(i), '贴右')
             self.lbl_side_target.config(
-                text=f'③ 贴边方向统一 = {word}（在通用区改）')
+                text=f'③ 贴边方向（第 {i + 1} 层）= {word}（切层自动切值）')
         except Exception:
             pass
 
@@ -5430,13 +5418,43 @@ class ConfigWizard:
         except Exception:
             return 1.0, 0, 0, False
 
-    def _layer_set_params(self, i, scale=None, offset_x=None, offset_y=None, flip=None):
-        """把参数写进第 i 层。第 0 层写顶层兼容字段（层内 offset 归零，防 F-V3 双计）。"""
+    def _layer_anchor_at(self, i):
+        """第 i 层的锚点（v2.0-N3）—— 第 0 层取顶层 side 的映射，其余层取各自 anchor。
+
+        口径与 resolve_layers 一致（顶层 side 是主层权威）：切层回显、回显镜像、保底归一
+        都用它，避免三处各写一套换算。
+        """
+        try:
+            layers = self._layers()
+            if not layers:
+                return 'right_edge'
+            i = max(0, min(int(i), len(layers) - 1))
+            if i == 0:
+                return anchor_from_side(self.cfg.get('side'))
+            return str(layers[i].get('anchor') or 'right_edge')
+        except Exception:
+            return 'right_edge'
+
+    def _layer_set_params(self, i, scale=None, offset_x=None, offset_y=None, flip=None,
+                          anchor=None):
+        """把参数写进第 i 层。第 0 层写顶层兼容字段（层内 offset 归零，防 F-V3 双计）。
+
+        v2.0-N3：新增 `anchor` —— ③ 贴边方向与 ④⑤⑥/翻转 走**同一条写回路径**
+        （用户要求「与 ④缩放 / ⑤水平 / ⑥垂直 完全同一种用法」）：
+          · 第 0 层（主层）：写顶层 cfg['side']（主层权威），层内 anchor 同步；
+          · 其余层：只写该层 ld['anchor']，**不碰顶层、也不碰别的层**。
+        非法锚点值直接忽略（不写坏档案）。
+        """
         layers = self._layers()
         if not layers:
             return False
         i = max(0, min(int(i), len(layers) - 1))
         ld = layers[i]
+        anc = None
+        if anchor is not None:
+            a = str(anchor).strip().lower()
+            if a in LAYER_ANCHORS:
+                anc = a
         if i == 0:
             if scale is not None:
                 self.cfg['scale'] = round(float(scale), 2)
@@ -5450,6 +5468,9 @@ class ConfigWizard:
             if flip is not None:
                 self.cfg['flip_h'] = bool(flip)
                 ld['flip'] = bool(flip)
+            if anc is not None:
+                self.cfg['side'] = side_from_anchor(anc)
+                ld['anchor'] = anchor_from_side(self.cfg['side'])
         else:
             if scale is not None:
                 ld['scale'] = round(min(2.0, max(0.2, float(scale))), 2)
@@ -5459,30 +5480,58 @@ class ConfigWizard:
                 ld['offset_y'] = int(offset_y)
             if flip is not None:
                 ld['flip'] = bool(flip)
+            if anc is not None:
+                ld['anchor'] = anc
         return True
 
     def _sync_slider_to_layer(self):
-        """把上方 ④⑤⑥ + 翻转 切到当前选中图层的值（点选层时调用，不触发写回）"""
+        """把上方 ③/④⑤⑥/翻转 切到当前选中图层的值（点选层时调用，不触发写回）
+
+        v2.0-N3：③ 贴边方向也纳入这套回显（用户要求「与 ④缩放 / ⑤水平 / ⑥垂直 同一种
+        用法」）—— 切到第 i 层时单选组回显该层锚点，标题同步写「第 i+1 层」。
+        Tk 的 var.set() 不触发 command，所以这里只是回显、不会写回。
+        """
         try:
             i = self._cur_layer_index()
             sc, ox, oy, fl = self._layer_get_params(i)
+            anc_i = self._layer_anchor_at(i)
             self._layer_loading = True
             self.var_scale.set(sc)
             self.var_offx.set(ox)
             self.var_offy.set(oy)
             self.var_flip.set(fl)
+            self.var_side.set(side_from_anchor(anc_i))
             try:
                 self.lbl_scale.config(text=f'{sc:.1f}x')
                 self.lbl_offx.config(text=f'{ox}px')
                 self.lbl_offy.config(text=f'{oy}px')
                 self.lbl_slider_target.config(
                     text=f'④ 缩放（第 {i + 1} 层）:')
+                self._sync_side_widget_titles(i)
             except Exception:
                 pass
         except Exception:
             pass
         finally:
             self._layer_loading = False
+
+    def _sync_side_widget_titles(self, i=None):
+        """③ 与翻转两个控件的文案标出「作用于第几层」（v2.0-N3）。
+
+        用户第四轮要求两个控件都按当前选中层调 —— 文案必须跟着走，否则用户无从判断
+        点的是哪一层（与「④ 缩放（第 N 层）」同一套设计语言）。
+        """
+        try:
+            i = self._cur_layer_index() if i is None else int(i)
+            n = i + 1
+            lbl = getattr(self, 'lbl_side_title', None)
+            if lbl is not None:
+                lbl.config(text=f'③ 贴边方向（第 {n} 层）:')
+            chk = getattr(self, 'chk_flip', None)
+            if chk is not None:
+                chk.config(text=f'水平翻转（第 {n} 层）')
+        except Exception:
+            pass
 
     def _is_alpha_mode(self):
         """内部渲染模式是不是「增强」。
@@ -5701,9 +5750,11 @@ class ConfigWizard:
                 i = 0
             ld = dict(layers[i])
             try:
-                # v2.0-R11：贴边方向已收归通用区 ③ 统一（点一次全部层同步），所以这里直接
-                # 用该层自己的 anchor（主层由 resolve_layers 取顶层 side，口径不变），
-                # 不再需要 R2 那套「主层读 var_side / 其余层读图层区控件」的分支。
+                # v2.0-N3：贴边方向与翻转都是「当前选中图层」的参数（点一下即写回该层），
+                # 所以这里直接用该层自己的 anchor（主层由 resolve_layers 取顶层 side，口径
+                # 不变），不再需要 R2 那套「主层读 var_side / 其余层读图层区控件」的分支。
+                # 注意：下面的 scale/flip/offset 读的是 UI 值 —— 它们与持久值同步（拖动/点击
+                # 即 _layer_set_params 写回），而**断言不能只看预览**（会掩盖"没写回"）。
                 ld['scale'] = round(float(self.var_scale.get()), 2)
                 ld['flip'] = bool(self.var_flip.get())
                 ld['offset_x'] = int(self.var_offx.get())
@@ -6019,17 +6070,19 @@ class ConfigWizard:
     def _layer_hint(self, i):
         # 文案长度有讲究：本行是右栏（高级设置）的高度瓶颈之一，wraplength=300，
         # 多折一行就把窗口需求高度顶上去（R2 实测 +16px）。控制在两行内。
+        # v2.0-N3：措辞从「③ 统一管所有图层」改为「选中哪层调哪层」（事实变了，不是缩文案）。
         if i == 0:
-            return ('第 1 层是主图：贴哪边 / 翻不翻转由上方 ③ 那一行统一（所有图层一起改）；'
+            return ('第 1 层是主图：贴哪边 / 翻不翻转由上方 ③ 那一行调（按当前选中层）；'
                     '大小与位置用上方 ④⑤⑥ 调。')
-        return ('这一层跟着候选框走：贴哪边与翻转同样由上方 ③ 那一行统一；'
+        return ('这一层跟着候选框走：贴哪边与翻转用上方 ③ 那一行调（按当前选中层）；'
                 '大小/位置用 ④⑤⑥ 调；勾「随候选框变宽往外让」后按比例再外让。')
 
     def _on_layer_select(self, _e=None):
-        """选中某层 → 上方 ④⑤⑥/翻转 与图层区参数一起切到该层（v2.0-t15 点选即同步）。
+        """选中某层 → 上方 ③/④⑤⑥/翻转 与图层区参数一起切到该层（v2.0-t15 点选即同步）。
 
         切换只回显、不写回（_layer_loading 挡住回调），所以「切走再切回」仍是各层原值 ——
         这就是层间短时记忆：参数一直存在 cfg['layers'][i] / 顶层字段里，不是在 UI 里临时存。
+        v2.0-N3：③ 贴边方向也纳入同一套回显（用户要求与 ④⑤⑥ 同一种用法）。
         """
         try:
             sel = self.layer_list.curselection()
@@ -6042,16 +6095,18 @@ class ConfigWizard:
             self._layer_sel = i
             ld = layers[i]
             self._layer_loading = True
-            # v2.0-R2/R11：③ 已回通用区统一管所有图层 —— var_layer_anchor 只是「当前层
-            # anchor 的回显镜像」（不再有绑定它的单选按钮）；主层取顶层 side 的映射，
-            # 其余层取各自 anchor（统一同步后它们本就同值，这里保留回显口径不变）。
-            self.var_layer_anchor.set(anchor_from_side(self.cfg.get('side')) if i == 0
-                                      else ld.get('anchor', 'right_edge'))
+            # v2.0-N3：③/翻转 都按当前选中层回显 —— var_layer_anchor 只是「当前层 anchor 的
+            # 回显镜像」（不再有绑定它的单选按钮）；口径统一走 _layer_anchor_at
+            # （第 0 层取顶层 side 的映射，其余层取各自 anchor）。
+            anc_i = self._layer_anchor_at(i)
+            self.var_layer_anchor.set(anc_i)
+            self.var_side.set(side_from_anchor(anc_i))
             try:
                 self._update_side_hint()
+                self._sync_side_widget_titles(i)
             except Exception:
                 pass
-            # ④⑤⑥ + 翻转：切到该层的值（第 0 层取顶层兼容字段）
+            # ③/④⑤⑥ + 翻转：切到该层的值（第 0 层取顶层兼容字段）
             sc, ox, oy, fl = self._layer_get_params(i)
             self.var_scale.set(sc)
             self.var_offx.set(ox)
@@ -6115,11 +6170,20 @@ class ConfigWizard:
                            ('所有文件', '*.*')], parent=self.root)
             if not path:
                 return
-            # v2.0-R11：新层的贴边方向也跟随 ③ 的统一值（不再默认「贴到主图另一侧」——
-            # 统一语义下所有层同一边；想左右夹持可用 ⑤水平偏移 微调）。
-            anc = anchor_from_side(self.var_side.get())
+            # v2.0-N3：新层的 anchor 与 flip 都取**主层当前值**（对称、最小惊讶 —— 新层加进来
+            # 与主层一致，不与预览冲突）。三代行为供对照：R11 之前默认「贴到主图另一侧」；
+            # R11 起跟随 ③ 的统一值；N3 起跟随主层当前值。只影响新建层，不碰老档案。
             z = max([int(x.get('z', 0) or 0) for x in layers] or [0]) + 1
-            layers.append(normalize_layer({'image': path, 'anchor': anc, 'z': z}))
+            if layers:
+                main_anc = str(layers[0].get('anchor') or anchor_from_side(self.cfg.get('side')))
+                if main_anc not in LAYER_ANCHORS:
+                    main_anc = anchor_from_side(self.cfg.get('side'))
+                main_flip = bool(self.cfg.get('flip_h', False))
+            else:
+                main_anc = anchor_from_side(self.cfg.get('side'))
+                main_flip = bool(self.cfg.get('flip_h', False))
+            layers.append(normalize_layer({'image': path, 'anchor': main_anc,
+                                           'flip': main_flip, 'z': z}))
             self.cfg['layers'] = layers
             self._layer_sel = len(layers) - 1
             self._layer_sync_from_cfg()
@@ -6200,9 +6264,11 @@ class ConfigWizard:
         self.cfg.update(cfg)
         self.var_layout.set(cfg.get('layout', 'horizontal_double'))
         self.var_side.set(cfg.get('side', 'right'))
-        # v2.0-R11：切皮肤后**所有图层** anchor 统一到档案顶层 side（统一语义下的「不串层」：
-        # 只按新皮肤的 ③ 走，不残留上一个皮肤 / 向导里的贴边值）
-        self._sync_side_to_all_layers(force=True)
+        # v2.0-N3：切皮肤**不再**把各层 anchor 统一到档案顶层 side —— 各层保留新档案自己的
+        # anchor（用户要的就是「每张图各自贴边」，档案里各层不一致就是不一致）。
+        # 这里只做**主层保底归一**（layers[0].anchor 对齐新档案顶层 side）；var_side 的回显
+        # 由随后的 _layer_sync_from_cfg() → _on_layer_select() 按当前选中层刷新。
+        self._sync_side_to_all_layers()
         self.var_layer.set(cfg.get('layer', 'above'))
         self.var_scale.set(cfg.get('scale', 1.0))
         self.var_offx.set(cfg.get('offset_x', 0))
@@ -6213,9 +6279,9 @@ class ConfigWizard:
         self.var_feather.set(bool(cfg.get('feather_enabled', False)))
         self.var_feather_r.set(int(cfg.get('feather_radius', 24) or 0))
         self.var_flip.set(bool(cfg.get('flip_h', False)))
-        # v2.0-R13：切皮肤后**所有图层** flip 统一到档案主层 flip（与贴边同一口径：
-        # 只按新皮肤的翻转走，不残留上一个皮肤 / 向导里的值；写盘仍只发生在用户点保存时）
-        self._sync_flip_to_all_layers(force=True)
+        # v2.0-N3：切皮肤同样**不再**把各层 flip 统一到档案主层 flip（与贴边同一口径：
+        # 各层保留新档案自己的值；写盘仍只发生在用户点保存/存皮肤时）。
+        self._sync_flip_to_all_layers()
         # 渲染模式：皮肤档案显式声明才改（缺键保持全局开关，与 _sync_render_mode 同语义）
         if 'render_mode' in cfg:
             try:
@@ -6267,27 +6333,26 @@ class ConfigWizard:
         tcfg['layout'] = self.var_layout.get()
         tcfg['layer'] = self.var_layer.get()
         try:
-            # ④⑤⑥/翻转 属于「当前选中图层」：先落回那一层（同 _save_and_start 的口径），
+            # ③/④⑤⑥/翻转 都属于「当前选中图层」：先落回那一层（同 _save_and_start 的口径），
             # 顶层兼容字段只由主层决定，避免把第 N 层的值当成主图参数存进档案
             _lyr = self._layers()
             i = self._cur_layer_index()
             self._layer_set_params(i, scale=float(self.var_scale.get()),
                                    offset_x=int(self.var_offx.get()),
                                    offset_y=int(self.var_offy.get()),
-                                   flip=bool(self.var_flip.get()))
-            tcfg['side'] = self.var_side.get()
+                                   flip=bool(self.var_flip.get()),
+                                   anchor=anchor_from_side(self.var_side.get()))
             _lyr0 = self._layers()
             if _lyr0:
-                # v2.0-R11：档案里**各层** anchor 与 ③ 保持一致（统一语义；切皮肤不串层）
-                _anc = anchor_from_side(tcfg['side'])
-                for _ld in _lyr0:
-                    _ld['anchor'] = _anc
-                tcfg['side'] = side_from_anchor(_anc)
-                # v2.0-R13：翻转也统一到主层值（存盘前展开到全部层，档案可自解释）
-                _flip = bool(self.var_flip.get())
-                for _ld in _lyr0:
-                    _ld['flip'] = _flip
-                tcfg['flip_h'] = _flip
+                # v2.0-N3：档案里各层 anchor/flip **保持各自的值**（不再统一到某一层）——
+                # 用户要的就是「每张图各自贴边 / 各自翻转」。
+                # 顶层键一律取**主层值**（第 5 个串层点）：否则「选中第 2 层（贴左 + 翻转）后
+                # 存皮肤」会把顶层 side/flip_h 写成第 2 层的值，下次读档主层就被带偏。
+                self._sync_side_to_all_layers()      # 主层保底归一：layers[0].anchor ← cfg['side']
+                self._sync_flip_to_all_layers()      # 同上：layers[0].flip ← cfg['flip_h']
+                _lyr0 = self._layers()
+                tcfg['side'] = side_from_anchor(_lyr0[0].get('anchor'))
+                tcfg['flip_h'] = bool(_lyr0[0].get('flip'))
                 _lyr0[0]['image'] = tcfg.get('image') or _lyr0[0].get('image')
             save_layers_into_cfg(tcfg, _lyr0)     # ② 套层：多图层一起进档案
         except Exception as _e:
@@ -6652,8 +6717,10 @@ class ConfigWizard:
             self._preview_busy = False
 
     def _update_preview_impl(self):
-        # v2.0-R2/R13：画之前先把 ③ 主层贴边与翻转归一
-        # （贴边：var_side → cfg['side'] → layers[0].anchor；翻转：保底 layers[0].flip ← cfg['flip_h']）
+        # v2.0-N3：画之前只做「主层保底归一」（两个入口都只信 cfg，不读 Tk 变量、不写全层）：
+        #   贴边：layers[0].anchor ← anchor_from_side(cfg['side'])
+        #   翻转：layers[0].flip   ← cfg['flip_h']
+        # 各层自己的 anchor/flip 一律保持用户设的值（这正是 N3 要的「每张图各自调」）。
         self._sync_side_to_layer0()
         self._sync_flip_to_all_layers()
         cv = self.canvas
@@ -6915,25 +6982,29 @@ class ConfigWizard:
     def _save_and_start(self):
         self.cfg['layout'] = self.var_layout.get()
         self.cfg['layer'] = self.var_layer.get()
-        # ④⑤⑥/翻转 现在是「当前选中图层」的滑条（v2.0-t15）：先把当前值落回那一层，
+        # ③/④⑤⑥/翻转 现在都是「当前选中图层」的参数（v2.0-t15 + N3）：先把当前值落回那一层，
         # 再由 save_layers_into_cfg 把主层的值同步到顶层兼容字段。
         # 不能像以前那样无条件用 var_scale/var_offx/var_offy 覆盖顶层 —— 否则选中第 2 层
-        # 时保存会把第 2 层的缩放写进主图（实测 R01：0.9 被写成 1.0）。
+        # 时保存会把第 2 层的缩放写进主图（实测 R01：0.9 被写成 1.0）；N3 下 side/flip_h 同理。
         try:
             self._layer_set_params(self._cur_layer_index(),
                                    scale=float(self.var_scale.get()),
                                    offset_x=int(self.var_offx.get()),
                                    offset_y=int(self.var_offy.get()),
-                                   flip=bool(self.var_flip.get()))
-            # v2.0-R2/R11：③ 归一（var_side → cfg['side'] → **全部图层** anchor）——
-            # 与预览/切层同一个入口，保存出来的 side 与各层 anchor 永远与界面一致
-            self._sync_side_to_all_layers(force=True)
-            # v2.0-R13：翻转同样在写盘前归一（cfg['flip_h'] → **全部图层** flip）
-            self._sync_flip_to_all_layers(force=True)
+                                   flip=bool(self.var_flip.get()),
+                                   anchor=anchor_from_side(self.var_side.get()))
+            # v2.0-N3：两个归一入口都只做**主层保底归一**（不写全层）：
+            # 各层 anchor/flip 保持用户各自设的值，落盘时逐层写回。
+            self._sync_side_to_all_layers()
+            self._sync_flip_to_all_layers()
             _lyr0 = self._layers()
             if _lyr0:
+                # 第 5 个串层点：顶层键一律取**主层值**（不取 var_side / var_flip —— 那两个是
+                # 当前选中层的值）。否则「选中第 2 层保存」会把主层贴边与翻转一起改掉。
                 self.cfg['side'] = side_from_anchor(_lyr0[0].get('anchor'))
+                self.cfg['flip_h'] = bool(_lyr0[0].get('flip'))
                 self.var_side.set(self.cfg['side'])
+                self.var_flip.set(bool(self.cfg['flip_h']))
         except Exception as _e:
             try:
                 _write_log(f'[向导] 保存图层参数失败: {_e}')
