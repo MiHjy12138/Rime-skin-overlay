@@ -4754,6 +4754,13 @@ class ConfigWizard:
         self.lbl_scale = tk.Label(self.cell_r0, text='1.0x', fg='#888',
                                   font=('Microsoft YaHei', 9), width=4)
         self.lbl_scale.pack(side='left')
+        # 第六轮（R19）· 先生看图后原话：「把框中的字（『（第 1 层）』）换个位置，
+        #   夹在当前的位置滑条不够整齐。」——它原来夹在「④ 缩放」与冒号之间，把 ④ 的
+        #   滑条整根推右，和 ⑤⑥ 的滑条对不齐（实测左端差 68px）。追问确认的落点：
+        #   **④ 行行末**（滑条与数值之后），文案「当前第 N 层」，单图层灰、多图层醒目橙。
+        self.lbl_scale_layer = tk.Label(self.cell_r0, text='当前第 1 层', fg='#888',
+                                        font=('Microsoft YaHei', 9))
+        self.lbl_scale_layer.pack(side='left', padx=(6, 0))
         self.lbl_offx_title = tk.Label(self.cell_r1, text='⑤ 水平:',
                                        font=('Microsoft YaHei', 10))
         self.lbl_offx_title.pack(side='left')
@@ -4853,16 +4860,47 @@ class ConfigWizard:
                                     length=110, command=lambda _: self._update_preview(),
                                     font=('Microsoft YaHei', 8))
         self.scl_feather.pack(side='left', padx=2)
-        # v2.0-R1：真 alpha 以前只做在 ⑪ 单选里，用户要的是「放后面的开关」→ 加在 ⑩ 后面。
+        # 第六轮（T1）· 先生两轮确认后的版型原话：
+        #   ①「按图把真羽化换个位置，和 ⑧⑨⑩ 同一列，点选框放字后面。」
+        #   ②「11 增强（真羽化）…下一行…方框（和 9、10 对齐）后面跟 11 的说明」
+        #   ③「把说明里真羽化的部分挪下来直接显示，原本的位置直接显示 ⑩ 自己的说明，简化一下。」
+        # ⇒ ⑩ 自己那句常驻在 ⑩ 控件行下面；⑪ 独立成「标题行 + 控件行」两步，
+        #    方框与 ⑨⑩ 的方框左边缘对齐，⑪ 的说明紧随方框（同一行）。
+        #   · 「点选框放字后面」= 标题字在第一行、方框落在它下一行 —— Tk 的 Checkbutton
+        #     只能「框在字前」，所以标题用 Label、控件行单独起一个 Frame。
+        #   · 常驻说明与「? 说明」弹窗（_feather_help_text）分头存放：弹窗正文一字未改
+        #     （仍读 lbl_feather_hint / lbl_render_hint），常驻句是本轮新增的两条 Label。
+        # ⑩ 自己那句说明：先生原话「原本的位置直接显示 ⑩ 自己的说明」——它的原位就是
+        # 标题行右侧（「? 说明」按钮那儿），**不新起一行**：⑩ 卡片每多一行 ≈17px，
+        # 直接顶破 probe_t5 的两条版型线（见下面 ⑪ 标题行的注释）。
+        self.lbl_feather_line = tk.Label(
+            row_fe_head, text='边缘半透明：远看虚，近看有点点', fg='#888',
+            font=('Microsoft YaHei', 8), justify='left')
+        self.lbl_feather_line.pack(side='left', padx=(8, 0))
+        # v2.0-R1：真 alpha 以前只做在 ⑪ 单选里，用户要的是「放后面的开关」。
         # v2.0-R10：⑪ 单选已删（用户实测「有增强按钮后渲染模式部分就可以取了」），
         # 本开关成为**唯一入口**；内部状态与提示文案都收口到 _update_render_hint()。
-        # 第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
-        # （本段两处「⑪」（R1 / R10 历史说明）都按这一条理解；本开关文案已写成「⑪ 增强（真羽化）」）
+        # 第五轮（R16/R17/R18）把 ⑪ 编号还给了「增强（真羽化）」开关；单选组的删除仍然成立。
+        # 第六轮（T1）：从 ⑩ 控件行末尾挪出来（见上），控件身份一律不变 ——
+        # chk_alpha_feather / var_alpha_feather 的名字、绑定变量与 command
+        # （_on_alpha_feather_toggle）一字未改，点选、置灰、联动与重绘照旧。
+        self.lbl_alpha_feather = tk.Label(adv, text='⑪ 增强（真羽化）:',
+                                          font=('Microsoft YaHei', 10))
+        # 不加上边距：⑧⑨⑩⑪ 四段同列是先生本轮明确要求，⑩ 这一列已经是最高列，
+        # 这里每 4px 都直接吃 probe_t5 的 A03（三列极差）/F02（展开窗高）两条线。
+        self.lbl_alpha_feather.pack(anchor='w')
+        row_alpha = tk.Frame(adv)
+        row_alpha.pack(anchor='w')
+        self.row_alpha = row_alpha          # 量测用（⑪ 控件行需求宽）
         self.var_alpha_feather = tk.BooleanVar(master=self.root, value=False)
         self.chk_alpha_feather = tk.Checkbutton(
-            row_fe, text='⑪ 增强（真羽化）', variable=self.var_alpha_feather,
+            row_alpha, text='启用', variable=self.var_alpha_feather,
             font=('Microsoft YaHei', 9), command=self._on_alpha_feather_toggle)
-        self.chk_alpha_feather.pack(side='left', padx=(8, 0))
+        self.chk_alpha_feather.pack(side='left')
+        self.lbl_alpha_feather_line = tk.Label(
+            row_alpha, text='真半透明、边缘更柔，透明处能点穿', fg='#888',
+            font=('Microsoft YaHei', 8), justify='left')
+        self.lbl_alpha_feather_line.pack(side='left', padx=(6, 0))
         # v2.0-R16：**不再 pack**（常驻说明撤版面）—— 只作为说明正文的存放点，由
         # _sync_feather_widgets / _update_render_hint 写、由「? 说明」弹窗读。
         self.lbl_feather_hint = tk.Label(
@@ -5633,8 +5671,8 @@ class ConfigWizard:
                 self.lbl_scale.config(text=f'{sc:.1f}x')
                 self.lbl_offx.config(text=f'{ox}px')
                 self.lbl_offy.config(text=f'{oy}px')
-                self.lbl_slider_target.config(
-                    text=f'④ 缩放（第 {i + 1} 层）:')
+                self.lbl_slider_target.config(text='④ 缩放:')
+                self._update_scale_layer_label(i)
                 self._sync_side_widget_titles(i)
             except Exception:
                 pass
@@ -5642,6 +5680,25 @@ class ConfigWizard:
             pass
         finally:
             self._layer_loading = False
+
+    def _update_scale_layer_label(self, i=None):
+        """④ 行末的层号（第六轮 R19）：文案「当前第 N 层」，单图层灰、多图层醒目橙。
+
+        先生原话「放上面（当前第 X 层），单图层时灰，多图层变明显」——「上面」经追问
+        确认落在 ④ 行**行末**（放行首会重演「把 ④ 的滑条推右」的老毛病，正是本轮要修的）。
+        配色只用界面里既有的两个色：#888（次要信息）/ #e67e22（需要用户注意的提醒），
+        不引入新色。取层数走 _layers()，与 ⑫ 图层列表同一份数据，不另缓存。
+        """
+        try:
+            i = self._cur_layer_index() if i is None else int(i)
+            lbl = getattr(self, 'lbl_scale_layer', None)
+            if lbl is None:
+                return None
+            multi = len(self._layers()) > 1
+            lbl.config(text=f'当前第 {i + 1} 层', fg=('#e67e22' if multi else '#888'))
+        except Exception:
+            pass
+        return None
 
     def _sync_side_widget_titles(self, i=None):
         """③ 与翻转两个控件的文案标出「作用于第几层」（v2.0-N3）。
@@ -6153,8 +6210,14 @@ class ConfigWizard:
             self._photo_refs.clear()
         except Exception:
             pass
-        off = os.path.basename(path) if not suffix else f'{os.path.basename(path)}{suffix}'
-        self.lbl_img.config(text=off, fg='#2e7d32' if suffix else '#333')
+        # 第六轮（R19）· 先生原话：「导入图片后绿字过长，会拉长窗口，简短点：已导入、
+        #   已预处理 等其他语句。」⇒ ① 右侧只报**状态**，不再回显文件名 —— 长文件名会把
+        #   这一行撑宽、顺带顶大窗口。文件名在 ⑫ 图层列表第 1 行照旧看得到
+        #   （本方法末尾的 _refresh_layer_row(0) 就在做这件事）。
+        #   · suffix 由调用方给**纯状态词**（'已预处理' 等），不再自带括号。
+        #   · 无 suffix = 刚选好图 → '已导入'；两者都是状态反馈，统一用绿色。
+        txt = suffix if suffix else '已导入'
+        self.lbl_img.config(text=txt, fg='#2e7d32')
         self.btn_prep.config(state='normal')
         self._refresh_anim_state()   # 动图检测：n_frames>1 才亮出「预览动画」按钮
         try:
@@ -6213,7 +6276,7 @@ class ConfigWizard:
             if not dlg.result_path:
                 return                      # 用户取消：一个路径都不许动
             if i == 0:
-                self._set_main_image(dlg.result_path, '（已预处理）')
+                self._set_main_image(dlg.result_path, '已预处理')
                 return
             if ld is not None:
                 ld['image'] = dlg.result_path
@@ -6335,7 +6398,8 @@ class ConfigWizard:
                 self.lbl_scale.config(text=f'{sc:.1f}x')
                 self.lbl_offx.config(text=f'{ox}px')
                 self.lbl_offy.config(text=f'{oy}px')
-                self.lbl_slider_target.config(text=f'④ 缩放（第 {i + 1} 层）:')
+                self.lbl_slider_target.config(text='④ 缩放:')
+                self._update_scale_layer_label(i)
                 self.lbl_slider_hint.config(
                     text=(f'↑ ④⑤⑥ 调的是第 {i + 1} 层'
                           + ('（主图）' if i == 0 else f'（{os.path.basename(ld.get("image") or "")}）')
@@ -6512,7 +6576,10 @@ class ConfigWizard:
             except Exception:
                 pass
         img = cfg.get('image', '')
-        self.lbl_img.config(text=os.path.basename(img) + f'（皮肤: {name}）', fg='#2e7d32')
+        # 第六轮（R19）：与 ① 的「已导入 / 已预处理」同一口径 —— 只报状态，
+        # 不再回显「文件名（皮肤: 名）」那种长串（长名会把这一行撑宽、顶大窗口）。
+        self.lbl_img.config(text=('已套用皮肤' if img else '未选择'),
+                            fg=('#2e7d32' if img else '#888'))
         self.btn_prep.config(state='normal' if img else 'disabled')
         self._layer_sync_from_cfg()      # ② 套层：切皮肤后图层列表跟着换（含各层参数）
         self._update_preview()
