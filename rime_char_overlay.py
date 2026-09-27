@@ -46,6 +46,7 @@ v2.0-①b 真 alpha 分层窗实装（升级一，第三步）：
   真渐变（圆角/羽化边缘不再硬边）、含品红的图不再被抠穿、透明区点击穿透。
   推送时机：动图跟 _anim_tick 每帧推；静态图只在首次显示/移动/缩放/换图/特效变化推一次。
   向导 ⑪ 渲染模式可一键切换（兼容/增强）；alpha 下不放 Label 贴图，交互事件照旧挂 Tk 窗。
+  （第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立）
 
 v2.0-② 套层皮肤（升级二，多图层）：
   一个皮肤 = 多个图片图层（默认 1 层 = 老行为）。皮肤档案升级为
@@ -60,7 +61,7 @@ v2.0-② 套层皮肤（升级二，多图层）：
   顶层旧字段（image/side/scale/offset_x/offset_y/flip_h/圆角/羽化）始终是第 0 层（主层）
   的权威值，layers[0] 只存额外量 —— 老代码读顶层键、老版本程序读该档案都不会跑偏。
   向导 ⑫ 图层区：图层列表 + 每层可选中调参（贴左/贴右/居中、左右上下微调、这层大小、
-  水平翻转、随候选框变宽往外让 %），预览画布多层绘制（_draw_candidate 层级关系不破）。
+  水平翻转、居中时离框中心 %），预览画布多层绘制（_draw_candidate 层级关系不破）。
 """
 import sys, os, json, time, threading, re, queue, collections
 import tkinter as tk
@@ -657,7 +658,12 @@ def plan_layer_layout(layers, sizes, rect, gap=DEFAULT_LAYER_GAP, main_off=(0, 0
       left_edge  → 候选框左边缘外侧：left - 层宽 - gap
       right_edge → 候选框右边缘外侧：right + gap
       center     → 水平居中于候选框：(cw - 层宽) / 2
-    follow_width_ratio（可选）额外按候选框宽度比例把该层继续向外推（左右同步拉开/收拢）。
+    follow_width_ratio（可选，**v2.0-R18-1 起只对 center 生效**）：
+      · center      → 图中心 = 候选框中心 + 框宽 × 百分比（离框中心多远，百分比越大推得越远）
+      · left/right  → 一律忽略（等价 0，坐标公式与 ratio=0 逐位相同）
+      先生第五轮定调：「留着，改说法，且变更一下，仅限于贴边方向为中间时使用，固定在待选框的
+      某个百分比距离。」字段名与取值范围**不动**（老档案兼容）；左/右老档案里存了非零比例的，
+      改后行为 = 被忽略。
     单图层 + ratio=0 时逐位退化为 v1.6 的 _calc_target 公式（兼容硬要求）。
     """
     left, top, right, bottom = _rect_tuple(rect)
@@ -681,16 +687,15 @@ def plan_layer_layout(layers, sizes, rect, gap=DEFAULT_LAYER_GAP, main_off=(0, 0
         if i == 0:
             ox += mo_x
             oy += mo_y
+        ratio = _as_float(d.get('follow_width_ratio'), 0.0)
         if anc == 'left_edge':
             lx = left - lw - gap + ox
+            # R18-1：左/右贴边忽略 follow_width_ratio（老档案里的非零值 = 被忽略）
         elif anc == 'center':
-            lx = left + (cw - lw) // 2 + ox
+            lx = left + (cw - lw) // 2 + int(round(cw * ratio)) + ox
         else:
             lx = right + gap + ox
-        ratio = _as_float(d.get('follow_width_ratio'), 0.0)
-        if ratio:
-            spread = int(round(cw * ratio))
-            lx += -spread if anc == 'left_edge' else spread
+            # R18-1：右贴边忽略 follow_width_ratio（老档案里的非零值 = 被忽略）
         ly = top + (ch - lh) // 2 + oy
         boxes.append((i, lx, ly, lw, lh))
     if not boxes:
@@ -2053,6 +2058,7 @@ DEFAULT_RENDER_MODE = 'compat'
 # 向导里的中文标签（不把 compat/alpha 术语摆给用户看）：(模式值, 显示文案)
 # v2.0-R10：⑪ 单选组已删 —— 这对标签现在只供提示文案（_update_render_hint）取中文名，
 # 不再是控件选项；保留常量以免动到既有测试/档案口径。
+# 第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
 RENDER_MODE_CHOICES = (('compat', '兼容（默认）'), ('alpha', '增强（真·半透明）'))
 
 # ---- 分层窗（真 alpha）所需的 GDI/USER32 常量与结构（v2.0-①b，对齐 spike_layered_alpha.py）----
@@ -4620,22 +4626,9 @@ class ConfigWizard:
         self.lbl_keyhint = tk.Label(self.top_area, text='', fg='#e67e22', font=('Microsoft YaHei', 9), justify='left')
         self.lbl_keyhint.pack(anchor='w', pady=(0, 2))
 
-        # ① 图片选择（整行）
-        row1 = tk.Frame(self.top_area)
-        row1.pack(fill='x', pady=3)
-        tk.Label(row1, text='① 图片:', font=('Microsoft YaHei', 10)).pack(side='left')
-        self.btn_img = tk.Button(row1, text='选择图片...', command=self._pick_image,
-                                 font=('Microsoft YaHei', 10))
-        self.btn_img.pack(side='left', padx=6)
-        self.btn_prep = tk.Button(row1, text='图片预处理', command=self._preprocess_image,
-                                  font=('Microsoft YaHei', 10), state='disabled')
-        self.btn_prep.pack(side='left', padx=2)
-        # 动图预览（按需播放，不点就是静态首帧 —— 不卡 UI）
-        self.btn_anim = tk.Button(row1, text='▶ 预览动画', command=self._toggle_anim_preview,
-                                  font=('Microsoft YaHei', 10), state='disabled')
-        self.btn_anim.pack(side='left', padx=2)
-        self.lbl_img = tk.Label(row1, text='未选择', fg='#888', font=('Microsoft YaHei', 9))
-        self.lbl_img.pack(side='left')
+        # ① 图片选择：v2.0-R16 从顶部固定区**搬进下面的两列网格**（左列第 1 行，
+        # 与右列 ④ 缩放 同一行）—— 先生原话「④⑤⑥ 可以分别放在 ①②③ 右侧并竖向对齐」。
+        # 顶部固定区只剩两行提示；① 与 ②③ 一样进滚动主体（同属通用区，不再被拆开）。
 
         # ==== 底部固定按钮行（grid 第 2 行：永远拿满需求高度，不会溢出窗口）====
         self.btn_row = tk.Frame(frm)
@@ -4658,23 +4651,61 @@ class ConfigWizard:
         # 只有 ~315px → 窗口需求高度从 1038 降到 ~840。
         body = self._build_scroll_body(frm)
 
-        # ---- 上半块：② / ④⑤⑥ / ⑦ 预览 ----
+        # ---- 上半块：①②③ ‖ ④⑤⑥ 两列三行（R16 版型重构）+ ⑦ 预览 ----
+        # v2.0-R16（先生第五轮原话）：「版型不好看，重构且继续往小压缩：④⑤⑥ 可以分别放在
+        #   ①②③ 右侧并竖向对齐。」—— 原来 ② / ③ / ④⑤⑥ 各占一行（共 4 行，④⑤⑥ 三条挤在
+        #   最后一行的同一条线上）；现在改成 2 列 × 3 行：④ 与 ① 同行、⑤ 与 ② 同行、
+        #   ⑥ 与 ③ 同行。行高 = 「左格内容 vs 右格滑条」的较高者，两格都 sticky='w'
+        #   （不带 n/s）⇒ grid 把每格在行内**垂直居中** ⇒ 行内中线天然对齐（≤3px 判据）。
+        #   · 高度不增反降：三行行高被右格滑条定死，滑条换成 width=10 + 去掉高亮边
+        #     （43 → 34px）；① 行从顶部固定区搬进网格后，顶部区也少一行。
+        #   · N3 口径不动：③ 与水平翻转仍在**同一行**（左列第 3 行），仍按当前选中层回显/写回。
         self.top_block = tk.Frame(body)
         self.top_block.pack(fill='x', pady=(2, 0))
-        left = self.top_block      # 沿用原变量名：下面 ②~⑦ 的构建代码一行不用改
+        left = self.top_block      # 沿用原变量名：下面 ⑦ 预览与图例的构建代码不用改
 
-        # ② 候选框类型（读取 Rime 配置按钮放这一行）
-        row3 = tk.Frame(left)
-        row3.pack(fill='x', pady=1)
-        tk.Label(row3, text='② 候选框类型:', font=('Microsoft YaHei', 10)).pack(side='left')
+        self.row_grid = tk.Frame(left)
+        self.row_grid.pack(fill='x')
+        self.cell_l0 = tk.Frame(self.row_grid)
+        self.cell_l0.grid(row=0, column=0, sticky='w', pady=1)
+        self.cell_r0 = tk.Frame(self.row_grid)
+        self.cell_r0.grid(row=0, column=1, sticky='w', padx=(18, 0), pady=1)
+        self.cell_l1 = tk.Frame(self.row_grid)
+        self.cell_l1.grid(row=1, column=0, sticky='w', pady=1)
+        self.cell_r1 = tk.Frame(self.row_grid)
+        self.cell_r1.grid(row=1, column=1, sticky='w', padx=(18, 0), pady=1)
+        self.cell_l2 = tk.Frame(self.row_grid)
+        self.cell_l2.grid(row=2, column=0, sticky='w', pady=1)
+        self.cell_r2 = tk.Frame(self.row_grid)
+        self.cell_r2.grid(row=2, column=1, sticky='w', padx=(18, 0), pady=1)
+
+        # ① 图片（左列第 1 行；v2.0-R16 从顶部固定区搬来，与 ④ 缩放 同行）
+        tk.Label(self.cell_l0, text='① 图片:', font=('Microsoft YaHei', 10)).pack(side='left')
+        self.btn_img = tk.Button(self.cell_l0, text='选择图片...', command=self._pick_image,
+                                 font=('Microsoft YaHei', 10))
+        self.btn_img.pack(side='left', padx=6)
+        self.btn_prep = tk.Button(self.cell_l0, text='图片预处理', command=self._preprocess_image,
+                                  font=('Microsoft YaHei', 10), state='disabled')
+        self.btn_prep.pack(side='left', padx=2)
+        # 动图预览（按需播放，不点就是静态首帧 —— 不卡 UI）
+        self.btn_anim = tk.Button(self.cell_l0, text='▶ 预览动画', command=self._toggle_anim_preview,
+                                  font=('Microsoft YaHei', 10), state='disabled')
+        self.btn_anim.pack(side='left', padx=2)
+        self.lbl_img = tk.Label(self.cell_l0, text='未选择', fg='#888', font=('Microsoft YaHei', 9))
+        self.lbl_img.pack(side='left')
+
+        # ② 候选框类型（左列第 2 行；读取 Rime 配置按钮放这一行）
+        self.lbl_layout_title = tk.Label(self.cell_l1, text='② 候选框类型:',
+                                         font=('Microsoft YaHei', 10))
+        self.lbl_layout_title.pack(side='left')
         self.var_layout = tk.StringVar(master=self.root, value='horizontal_double')
         for text, val in [('单行', 'horizontal_single'),
                           ('双行', 'horizontal_double'),
                           ('竖排', 'vertical')]:
-            tk.Radiobutton(row3, text=text, variable=self.var_layout, value=val,
+            tk.Radiobutton(self.cell_l1, text=text, variable=self.var_layout, value=val,
                            font=('Microsoft YaHei', 9),
                            command=self._update_preview).pack(side='left', padx=2)
-        tk.Button(row3, text='读取当前Rime配置', command=self._read_rime,
+        tk.Button(self.cell_l1, text='读取当前Rime配置', command=self._read_rime,
                   font=('Microsoft YaHei', 9)).pack(side='left', padx=8)
 
         # ③ 贴边方向 + 水平翻转（v2.0-N3：都在通用区，都**按当前选中图层**调）
@@ -4685,59 +4716,69 @@ class ConfigWizard:
         #     正常用，多图时根据图片数量分开调整每一个」→ N3 把两者作用对象改成**当前选中的
         #     图层**，与 ④缩放 / ⑤水平 / ⑥垂直 完全同一种用法（点一下写回该层、切层回显该层
         #     值）。用户追加「翻转也按当前选中层（一起改）」，故两条同口径。
+        #   · R16 只动行内位置（③ 行从「独立一行」变成网格左列第 3 行），③ 与翻转**仍同一行**。
         #   · 顶层 cfg['side'] / cfg['flip_h'] 仍是主层（第 0 层）的权威（resolve_layers /
         #     save_layers_into_cfg 口径不变）；写回统一走 _layer_set_params(i, anchor=/flip=)，
         #     非 force 的归一入口只做「主层保底归一」（见 _sync_side_to_all_layers）。
         # 这里的两个变量：var_side / var_flip = **随选中层回显**的控件值（不再是全层权威）。
-        row4 = tk.Frame(left)
-        row4.pack(fill='x', pady=1)
-        self.lbl_side_title = tk.Label(row4, text='③ 贴边方向（第 1 层）:',
+        self.lbl_side_title = tk.Label(self.cell_l2, text='③ 贴边方向（第 1 层）:',
                                        font=('Microsoft YaHei', 10))
         self.lbl_side_title.pack(side='left')
         self.var_side = tk.StringVar(master=self.root, value='right')
         for text, val in [('右侧', 'right'), ('左侧', 'left'), ('中间', 'center')]:
-            tk.Radiobutton(row4, text=text, variable=self.var_side, value=val,
+            tk.Radiobutton(self.cell_l2, text=text, variable=self.var_side, value=val,
                            font=('Microsoft YaHei', 9),
                            command=self._on_side_change).pack(side='left', padx=2)
         self.var_flip = tk.BooleanVar(master=self.root, value=False)
-        self.chk_flip = tk.Checkbutton(row4, text='水平翻转（第 1 层）',
+        self.chk_flip = tk.Checkbutton(self.cell_l2, text='水平翻转（第 1 层）',
                                        variable=self.var_flip,
                                        font=('Microsoft YaHei', 9),
                                        command=self._on_flip_change)
         self.chk_flip.pack(side='left', padx=(12, 0))
 
-        # ④⑤⑥ 缩放 / 水平 / 垂直（合一行，紧凑）
+        # ④⑤⑥ 缩放 / 水平 / 垂直（右列三行：④ 行与 ① 对齐 / ⑤ 行与 ② 对齐 / ⑥ 行与 ③ 对齐）
         # v2.0-t15：这三条滑条 = **当前选中图层**的缩放/水平/垂直（图层区不再重复一套），
-        # 选中哪层就自动切换到哪层的值（_on_layer_select），拖动即写入该层（_on_main_slider）
-        row5 = tk.Frame(left)
-        row5.pack(fill='x', pady=1)
-        self.lbl_slider_target = tk.Label(row5, text='④ 缩放:', font=('Microsoft YaHei', 10))
+        # 选中哪层就自动切换到哪层的值（_on_layer_select），拖动即写入该层（_on_main_slider）。
+        # v2.0-R16：滑条 width 15→10 + 去掉高亮边框（43 → 34px）—— 三行行高由它决定，
+        # 收瘦它 = 三行一起变矮（先生「继续往小压缩」）；滑条与数值标签仍紧贴其右侧同格。
+        self.lbl_slider_target = tk.Label(self.cell_r0, text='④ 缩放:',
+                                          font=('Microsoft YaHei', 10))
         self.lbl_slider_target.pack(side='left')
         self.var_scale = tk.DoubleVar(master=self.root, value=1.0)
-        tk.Scale(row5, from_=0.2, to=2.0, resolution=0.1, orient='horizontal',
-                 variable=self.var_scale, length=140, sliderlength=13,
-                 command=self._on_main_slider,
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
-        self.lbl_scale = tk.Label(row5, text='1.0x', fg='#888', font=('Microsoft YaHei', 9),
-                                  width=4)
+        self.scl_scale = tk.Scale(self.cell_r0, from_=0.2, to=2.0, resolution=0.1,
+                                  orient='horizontal', variable=self.var_scale,
+                                  length=140, sliderlength=13, width=10,
+                                  highlightthickness=0, command=self._on_main_slider,
+                                  font=('Microsoft YaHei', 8))
+        self.scl_scale.pack(side='left', padx=2)
+        self.lbl_scale = tk.Label(self.cell_r0, text='1.0x', fg='#888',
+                                  font=('Microsoft YaHei', 9), width=4)
         self.lbl_scale.pack(side='left')
-        tk.Label(row5, text='⑤ 水平:', font=('Microsoft YaHei', 10)).pack(side='left', padx=(8, 0))
+        self.lbl_offx_title = tk.Label(self.cell_r1, text='⑤ 水平:',
+                                       font=('Microsoft YaHei', 10))
+        self.lbl_offx_title.pack(side='left')
         self.var_offx = tk.IntVar(master=self.root, value=0)
-        tk.Scale(row5, from_=-200, to=200, orient='horizontal',
-                 variable=self.var_offx, length=140, sliderlength=13,
-                 command=self._on_main_slider,
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
-        self.lbl_offx = tk.Label(row5, text='0px', fg='#888', font=('Microsoft YaHei', 9),
-                                 width=5)
+        self.scl_offx = tk.Scale(self.cell_r1, from_=-200, to=200, orient='horizontal',
+                                 variable=self.var_offx, length=140, sliderlength=13,
+                                 width=10, highlightthickness=0,
+                                 command=self._on_main_slider,
+                                 font=('Microsoft YaHei', 8))
+        self.scl_offx.pack(side='left', padx=2)
+        self.lbl_offx = tk.Label(self.cell_r1, text='0px', fg='#888',
+                                 font=('Microsoft YaHei', 9), width=5)
         self.lbl_offx.pack(side='left')
-        tk.Label(row5, text='⑥ 垂直:', font=('Microsoft YaHei', 10)).pack(side='left', padx=(8, 0))
+        self.lbl_offy_title = tk.Label(self.cell_r2, text='⑥ 垂直:',
+                                       font=('Microsoft YaHei', 10))
+        self.lbl_offy_title.pack(side='left')
         self.var_offy = tk.IntVar(master=self.root, value=0)
-        tk.Scale(row5, from_=-150, to=150, orient='horizontal',
-                 variable=self.var_offy, length=140, sliderlength=13,
-                 command=self._on_main_slider,
-                 font=('Microsoft YaHei', 8)).pack(side='left', padx=2)
-        self.lbl_offy = tk.Label(row5, text='0px', fg='#888', font=('Microsoft YaHei', 9),
-                                 width=5)
+        self.scl_offy = tk.Scale(self.cell_r2, from_=-150, to=150, orient='horizontal',
+                                 variable=self.var_offy, length=140, sliderlength=13,
+                                 width=10, highlightthickness=0,
+                                 command=self._on_main_slider,
+                                 font=('Microsoft YaHei', 8))
+        self.scl_offy.pack(side='left', padx=2)
+        self.lbl_offy = tk.Label(self.cell_r2, text='0px', fg='#888',
+                                 font=('Microsoft YaHei', 9), width=5)
         self.lbl_offy.pack(side='left')
         self.lbl_slider_hint = tk.Label(left, text='', fg='#888',
                                         font=('Microsoft YaHei', 8), justify='left')
@@ -4783,9 +4824,24 @@ class ConfigWizard:
 
         # ⑩ 点阵羽化（用 4×4 有序抖动把边缘 alpha 近似成渐变）+ R1「增强（真羽化）」开关
         adv = cols[col_of['feather']]
-        tk.Label(adv, text='⑩ 点阵羽化:', font=('Microsoft YaHei', 10)).pack(anchor='w')
+        # v2.0-R16：⑩ 标题行右侧加「? 说明」入口 —— 先生原话「点阵羽化的说明太长，可以做个
+        #   说明按钮，单击或者鼠标放上去出说明。」原来常驻在 ⑩ 下面那两段小字（
+        #   lbl_feather_hint / lbl_render_hint）**不再 pack**，改由这个按钮弹出 Toplevel 提示；
+        #   两个 Label 保留为「说明正文的唯一存放点」（测试与回显仍按属性名读文案），
+        #   弹出内容由 _feather_help_text() 统一给出，保证「弹出来的」与「控件里存的」同一句。
+        row_fe_head = tk.Frame(adv)
+        row_fe_head.pack(anchor='w')
+        self.row_fe_head = row_fe_head      # 量测用（⑩ 标题行需求宽）
+        tk.Label(row_fe_head, text='⑩ 点阵羽化:', font=('Microsoft YaHei', 10)).pack(side='left')
+        self.btn_feather_help = tk.Button(row_fe_head, text='? 说明', font=('Microsoft YaHei', 8),
+                                          relief='groove', bd=1, padx=6, pady=0,
+                                          cursor='hand2', command=self._toggle_feather_tip)
+        self.btn_feather_help.pack(side='left', padx=(6, 0))
+        self.btn_feather_help.bind('<Enter>', lambda _e: self._show_feather_tip())
+        self.btn_feather_help.bind('<Leave>', lambda _e: self._hide_feather_tip())
         row_fe = tk.Frame(adv)
         row_fe.pack(anchor='w')
+        self.row_fe = row_fe                # 量测用（⑩ 控件行需求宽）
         self.var_feather = tk.BooleanVar(master=self.root, value=False)
         self.chk_feather = tk.Checkbutton(row_fe, text='启用', variable=self.var_feather,
                                           font=('Microsoft YaHei', 9),
@@ -4800,18 +4856,22 @@ class ConfigWizard:
         # v2.0-R1：真 alpha 以前只做在 ⑪ 单选里，用户要的是「放后面的开关」→ 加在 ⑩ 后面。
         # v2.0-R10：⑪ 单选已删（用户实测「有增强按钮后渲染模式部分就可以取了」），
         # 本开关成为**唯一入口**；内部状态与提示文案都收口到 _update_render_hint()。
+        # 第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
+        # （本段两处「⑪」（R1 / R10 历史说明）都按这一条理解；本开关文案已写成「⑪ 增强（真羽化）」）
         self.var_alpha_feather = tk.BooleanVar(master=self.root, value=False)
         self.chk_alpha_feather = tk.Checkbutton(
-            row_fe, text='增强（真羽化）', variable=self.var_alpha_feather,
+            row_fe, text='⑪ 增强（真羽化）', variable=self.var_alpha_feather,
             font=('Microsoft YaHei', 9), command=self._on_alpha_feather_toggle)
         self.chk_alpha_feather.pack(side='left', padx=(8, 0))
+        # v2.0-R16：**不再 pack**（常驻说明撤版面）—— 只作为说明正文的存放点，由
+        # _sync_feather_widgets / _update_render_hint 写、由「? 说明」弹窗读。
         self.lbl_feather_hint = tk.Label(
-            adv, text='带宽 px；点阵羽化是兼容模式下的近似（远看半透明，近看有细点阵）',
-            fg='#888', font=('Microsoft YaHei', 8))
-        self.lbl_feather_hint.pack(anchor='w', pady=(0, 4))
+            adv, text='', fg='#888', font=('Microsoft YaHei', 8), justify='left',
+            wraplength=360)
 
         # 渲染模式（v2.0-① → v2.0-R10 收口）：兼容 = v1.6 老路径；增强 = 真 alpha 分层窗（真·半透明）。
-        # R10：删掉 ⑪「渲染模式」单选组（Label + Radiobutton + 排版），入口只剩 ⑩ 旁那个开关；
+        # R10：删掉 ⑪「渲染模式」单选组（Label + Radiobutton + 排版），入口只剩 ⑩ 行末那个开关；
+        # 第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
         # var_render 保留为**内部状态**（由该开关驱动、供 cfg['render_mode'] 读写），
         # _update_render_hint 仍是唯一收口：开关 → 提示文案 + 预览重绘，回显时同步给开关。
         _cur_render = resolve_render_mode(self.cfg)
@@ -4819,16 +4879,25 @@ class ConfigWizard:
             _cur_render = resolve_render_mode({'render_mode':
                                                getattr(self.overlay, 'render_mode', _cur_render)})
         self.var_render = tk.StringVar(master=self.root, value=_cur_render)
+        # v2.0-R16：同样**不再 pack**（与 lbl_feather_hint 一起改由「? 说明」弹出）。
         self.lbl_render_hint = tk.Label(adv, text='', fg='#888', font=('Microsoft YaHei', 8),
-                                        justify='left', wraplength=320)
-        self.lbl_render_hint.pack(anchor='w', pady=(0, 4))
+                                        justify='left', wraplength=360)
         self._update_render_hint()
+        # 主窗销毁时一并收掉提示窗（不留孤儿 Toplevel）
+        try:
+            self.root.bind('<Destroy>', self._on_root_destroy_cleanup, add='+')
+        except Exception:
+            pass
 
         # ⑫ 图层（v2.0-② 套层皮肤）：一个皮肤 = 多个图片图层，各层可锚到候选框左/右/中间
+        # v2.0-R16：盒内上下内边距 4→1（−6px）、与上卡的间距 4→2（−2px）—— ⑫ 是最高列
+        #   （高度瓶颈），它矮 8px 就是**内容需求高**矮 8px（803 → 795，收回旧判据「≤800」），
+        #   窗口需求高也跟着再降 8px（899 → 891）。这一刀是为了给 R16 新加的那行
+        #   「仅「中间」时可用」小字腾地方，不让「继续往小压缩」被新增说明抵消掉。
         adv = cols[col_of['lay']]
         lay_box = tk.LabelFrame(adv, text='🧩 ⑫ 图层（可叠多张）',
-                                font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=4)
-        lay_box.pack(fill='x', pady=(4, 0))
+                                font=('Microsoft YaHei', 9), fg='#555', padx=6, pady=1)
+        lay_box.pack(fill='x', pady=(2, 0))
         self.layer_list = tk.Listbox(lay_box, height=4, width=27,
                                      font=('Microsoft YaHei', 9), exportselection=False)
         self.layer_list.pack(anchor='w')
@@ -4851,30 +4920,42 @@ class ConfigWizard:
         # 只留两行小字说明「在哪调、调的是哪一层」。
         # var_layer_anchor 自 R11 起不再绑任何单选按钮，保留为**当前选中层 anchor 的回显镜像**
         # （切层时更新；既有回归脚本按它核对「切层回显」）。
+        # v2.0-R16：四条小字逐条改成大白话短句（先生「看不懂，说简单点」）；③ 与「第 N 层」
+        # 这两个定位关键字保留（既有回归脚本按它们找控件）。
         self.lbl_side_target = tk.Label(lay_box, text='', fg='#555',
                                         font=('Microsoft YaHei', 9), justify='left',
                                         wraplength=300)
         self.lbl_side_target.pack(anchor='w')
-        self.lbl_flip_hint = tk.Label(lay_box, text='水平翻转也在 ③ 那一行，按当前选中层调',
+        self.lbl_flip_hint = tk.Label(lay_box, text='翻转也在 ③ 那一行，跟选中层走',
                                       fg='#888', font=('Microsoft YaHei', 8),
                                       justify='left', wraplength=300)
         self.lbl_flip_hint.pack(anchor='w')
         self.var_layer_anchor = tk.StringVar(master=self.root, value='right_edge')
         # v2.0-t15：缩放/水平/垂直 不再在本区重复一套 —— 复用上方 ④⑤⑥（选中哪层就调哪层）
-        tk.Label(lay_box, text='↖ 这一层的大小/位置用上方 ④缩放 ⑤水平 ⑥垂直 调',
+        tk.Label(lay_box, text='大小和位置用上方 ④⑤⑥ 调',
                  fg='#888', font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(1, 0))
         row_lr = tk.Frame(lay_box)
         row_lr.pack(anchor='w', pady=(1, 0))
+        # v2.0-R18-1（先生定调）：控件名与说明都讲实话 —— 它管的是「居中时把图推离框中心多远」，
+        # 百分比越大推得越远；只在 ③=中间 时参与计算，其它贴边**灰着不能点**（不是藏起来）。
         self.var_lay_follow = tk.BooleanVar(master=self.root, value=False)
-        tk.Checkbutton(row_lr, text='随候选框变宽往外让', variable=self.var_lay_follow,
-                       font=('Microsoft YaHei', 8),
-                       command=self._on_layer_param_change).pack(side='left')
+        self.chk_lay_follow = tk.Checkbutton(row_lr, text='居中时离框中心',
+                                             variable=self.var_lay_follow,
+                                             font=('Microsoft YaHei', 8),
+                                             command=self._on_layer_param_change)
+        self.chk_lay_follow.pack(side='left')
         self.var_lay_follow_r = tk.IntVar(master=self.root, value=30)
-        tk.Scale(row_lr, from_=0, to=60, orient='horizontal', length=70, sliderlength=12,
-                 variable=self.var_lay_follow_r,
-                 command=lambda _v: self._on_layer_param_change(),
-                 font=('Microsoft YaHei', 8)).pack(side='left')
+        self.scl_lay_follow = tk.Scale(row_lr, from_=0, to=60, orient='horizontal',
+                                       length=70, sliderlength=12,
+                                       variable=self.var_lay_follow_r,
+                                       command=lambda _v: self._on_layer_param_change(),
+                                       font=('Microsoft YaHei', 8))
+        self.scl_lay_follow.pack(side='left')
         tk.Label(row_lr, text='%', font=('Microsoft YaHei', 8)).pack(side='left')
+        self.lbl_follow_hint = tk.Label(lay_box, text='仅「中间」时可用；百分比越大推得越远',
+                                        fg='#888', font=('Microsoft YaHei', 8),
+                                        justify='left', wraplength=300)
+        self.lbl_follow_hint.pack(anchor='w')
         self.lbl_layer_hint2 = tk.Label(lay_box, text='', fg='#888',
                                         font=('Microsoft YaHei', 8), justify='left',
                                         wraplength=300)
@@ -4940,6 +5021,10 @@ class ConfigWizard:
         除数取 380 而不是先写的 330：⑩/⑪ 那张卡实测最宽 385px，列宽要按最宽卡算，
         窄屏才不会把内容顶出窗口。实测：1080p（1920）→ 3 列；1366 → 3；1024 → 2；
         900 → 2；800 → 1（此时窗口宽度改由 640px 的预览块决定）。
+        v2.0-R16 实测（见 _evidence_r16/T1_impl/probe_after_r16.log）：本函数口径依旧 3 列成立；
+        窗口需求宽 折叠 807 / 展开 900（改前 830 / 1025），没有变宽。
+        第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
+        （上面那处「⑩/⑪」是 R4 的手工平衡表历史说明，按这一条理解）
         """
         try:
             w = int(screen_work_area_width(self.root))
@@ -4954,6 +5039,8 @@ class ConfigWizard:
 
         卡片→列用一张手工平衡表（各卡片实测高度：⑫≈315 / ⑩⑪≈190 / ⑬≈170 /
         ⑧≈80 / ⑨≈72 / ⑭≈56）：
+        第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
+        （上面那处「⑩⑪」是 R4 的手工平衡表历史说明，按这一条理解）
           · 3 列 → 列高 ≈ [315, 270, 298]，最高列只有 315（原来是整列竖排 901）
           · 2 列 → 列高 ≈ [440, 443]，仍然平衡
           · 1 列 → 退化成原来的自然竖排顺序
@@ -4976,20 +5063,23 @@ class ConfigWizard:
         head = tk.Frame(self.adv_area)
         head.pack(fill='x')
         # v2.0-R15（用户第四轮原话「折叠按钮做大点；默认折叠状态。」）：
-        #   ① 标题按钮做成**整行大按钮**：font 11 bold + padx=14/pady=6 内边距 +
-        #      relief='groove' 可见按钮外观 + fill='x'/expand=True 占满整行 →
-        #      可点区域从 R12 的 271×26px（7046 px²）变成整行，点哪儿都能展开/折叠。
-        #   ② 初态改折叠：`_adv_collapsed = True`（见本函数末尾），向导打开就是矮的那版。
+        #   ① 标题按钮做成大按钮，② 初态改折叠：`_adv_collapsed = True`（见本函数末尾）。
+        # v2.0-R17（先生第五轮原话「按钮部分太长，图片右边的小字没必要，按钮也太长了。
+        #   按照"图标 高级设置（点击折叠）"来做，按钮覆盖到字末即可。」）：
+        #   · 去掉 `fill='x', expand=True` —— 按钮不再撑满整行，宽度 = 文案需求宽度
+        #     （折叠/展开两态实测见 _evidence_r16/T1_impl/probe_after_r16.log）。
+        #   · 删掉 `lbl_adv_hint`（「（折叠只是收起来，设置不会丢）」），向导里不再有它。
+        #   · 文案形态 = 「图标 + 高级设置（点击折叠/展开）」；▾/▸ 是形态的一部分，
+        #     也给 B_test_r12_collapse 的 A03b/A04（折叠态要有 ▸ 与「展开」）留着判别点。
+        #   · 高度/内边距（43px 高、padx=14/pady=6）保持不变 —— N1 修的「小屏点得到」
+        #     靠的是按钮行本身在窗内（_fit_window_height 的 grid 第 2 行），不是撑满整行。
         self.btn_adv_toggle = tk.Button(head, text='', font=('Microsoft YaHei', 11, 'bold'),
                                         anchor='w', relief='groove', bd=2,
                                         padx=14, pady=6, bg='#eef2f7', fg='#333',
                                         activebackground='#dde6f0', activeforeground='#000',
                                         cursor='hand2', justify='left',
                                         command=self._toggle_adv_collapse)
-        self.btn_adv_toggle.pack(side='left', fill='x', expand=True)
-        self.lbl_adv_hint = tk.Label(head, text='（折叠只是收起来，设置不会丢）',
-                                     fg='#999', font=('Microsoft YaHei', 8))
-        self.lbl_adv_hint.pack(side='left', padx=(8, 0))
+        self.btn_adv_toggle.pack(side='left')
         self.adv_body = tk.Frame(self.adv_area, padx=8, pady=6)
         self.adv_body.pack(fill='x')
         cols = []
@@ -4999,8 +5089,12 @@ class ConfigWizard:
             cols.append(f)
         self.adv_cols = cols
         if n >= 3:
-            col_of = {'lay': 0, 'feather': 1, 'layer': 1,
-                      'skin': 2, 'fx': 2, 'start': 2}
+            # v2.0-R16 重排：⑩ 卡片按「说明搬进弹窗」瘦身后只剩标题行 + 控件行（高度约 70），
+            # 原表把它和⑧放一列（列高 148）会让三列高低差 >160px（B_test_r4_layout D04 判据
+            # 要求 ≤80）。把 ⑨ 特效（约 72）从第 3 列挪到第 2 列后：列高 ≈ [293, 220, 226]
+            # —— 高低差 ≈73 ≤80，最高列仍是 ⑫（309→293，见 _layer_hint 收成一行）。
+            col_of = {'lay': 0, 'feather': 1, 'layer': 1, 'fx': 1,
+                      'skin': 2, 'start': 2}
         else:
             col_of = {k: i % n for i, k in enumerate(
                 ('layer', 'fx', 'feather', 'lay', 'skin', 'start'))}
@@ -5040,8 +5134,8 @@ class ConfigWizard:
             pass
         try:
             self.btn_adv_toggle.config(
-                text=('▸ ⚙ 高级设置（⑧~⑭，点这里展开）' if collapsed
-                      else '▾ ⚙ 高级设置（⑧~⑭ 横排多列，点这里折叠）'))
+                text=('▸ ⚙ 高级设置（点击展开）' if collapsed
+                      else '▾ ⚙ 高级设置（点击折叠）'))
         except Exception:
             pass
 
@@ -5369,13 +5463,40 @@ class ConfigWizard:
 
         文案长度受右栏高度约束（wraplength=300，R2 记账约 +16px/行）—— 保持两行内；
         阈值由 B_test_n3_side_per_layer.py 的 K 段（三态高度）守着。
+        v2.0-R16：改大白话短句，但仍保留「③」与「第 N 层」两个定位关键字
+        （B_test_r13_flip / B_test_r2_layer_side / B_test_n3_side_per_layer 按它们找控件）。
+        顺带在这里同步「随候选框变宽」那套控件的可用态 —— 本方法是「当前选中层变了」的
+        统一出口（构造收尾 / 切层 / ③ 改动都走它）。
         """
         try:
             i = int(getattr(self, '_layer_sel', 0) or 0)
             word = {'left_edge': '贴左', 'right_edge': '贴右',
                     'center': '居中'}.get(self._layer_anchor_at(i), '贴右')
             self.lbl_side_target.config(
-                text=f'③ 贴边方向（第 {i + 1} 层）= {word}（切层自动切值）')
+                text=f'③ 贴边（第 {i + 1} 层）= {word}，切层自动变')
+        except Exception:
+            pass
+        self._sync_follow_widget_state()
+
+    def _sync_follow_widget_state(self):
+        """「居中时离框中心」控件随当前选中层可用/置灰（v2.0-R18-1）。
+
+        先生定调：「仅限于贴边方向为中间时使用」—— 该层 anchor != center 时勾选框与滑条
+        `state='disabled'`（灰着不能点，**不是藏起来**），旁边那行小字写明「仅「中间」时可用」；
+        anchor == center 时恢复可用。字段与取值范围不动（老档案原样读得进、存得下）。
+        """
+        try:
+            chk = getattr(self, 'chk_lay_follow', None)
+            scl = getattr(self, 'scl_lay_follow', None)
+            if chk is None and scl is None:
+                return
+            i = int(getattr(self, '_layer_sel', 0) or 0)
+            usable = (self._layer_anchor_at(i) == 'center')
+            st = 'normal' if usable else 'disabled'
+            if chk is not None:
+                chk.config(state=st)
+            if scl is not None:
+                scl.config(state=st)
         except Exception:
             pass
 
@@ -5536,8 +5657,9 @@ class ConfigWizard:
     def _is_alpha_mode(self):
         """内部渲染模式是不是「增强」。
 
-        v2.0-R10：入口只剩 ⑩ 旁「增强（真羽化）」开关；var_render 是该开关的内部状态
+        v2.0-R10：入口只剩 ⑩ 行末的「⑪ 增强（真羽化）」开关；var_render 是该开关的内部状态
         （写回 cfg 时仍读它，口径与 R1/R7 一致）。
+        第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
         """
         try:
             return resolve_render_mode({'render_mode': self.var_render.get()}) == 'alpha'
@@ -5545,10 +5667,12 @@ class ConfigWizard:
             return False
 
     def _on_alpha_feather_toggle(self):
-        """⑩ 旁「增强（真羽化）」开关：勾/取消 = 切内部渲染模式，随即刷新提示并立刻重绘预览。
+        """⑪ 增强（真羽化）开关（⑩ 行末）：勾/取消 = 切内部渲染模式，随即刷新提示并立刻重绘预览。
 
         v2.0-R10：⑪ 单选已删，本开关是**唯一入口**（Tk 的 set() 不触发 command，
         所以这里与 _update_render_hint 之间没有递归）。
+        第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
+        （本行「⑪ 单选已删」是 R10 历史说明，按这一条理解）
         """
         try:
             want = bool(self.var_alpha_feather.get())
@@ -5560,13 +5684,110 @@ class ConfigWizard:
             pass
         self._update_render_hint()
 
+    # ---------- v2.0-R16 ⑩「? 说明」入口：单击 / 悬停出提示（Toplevel，非模态） ----------
+    def _feather_help_text(self):
+        """⑩ 说明入口的正文（v2.0-R16）。
+
+        先生原话「点阵羽化的说明太长，可以做个说明按钮，单击或者鼠标放上去出说明。」
+        原来常驻在 ⑩ 下面的两段小字撤出版面后，正文统一由这里给出（≤2 行、纯大白话）；
+        `lbl_feather_hint` / `lbl_render_hint` 两个 Label 保留为「正文的存放点」并写同一句
+        （_sync_feather_widgets / _update_render_hint 写），保证「弹出来的」与「控件里存的」
+        永远一致，既有回归脚本按属性名读文案也照旧成立。
+        """
+        if self._is_alpha_mode():
+            return ('⑪ 增强（真羽化）已开：真半透明，边缘更柔和（不再是点阵近似）。\n'
+                    '透明的地方鼠标会穿透过去，拖动图片请抓实心部分。')
+        return ('⑩ 点阵羽化：把边缘近似成半透明 —— 远看虚，近看有点点。\n'
+                '想边缘真柔和，勾 ⑪ 增强（真羽化）：真半透明，还能点穿。')
+
+    def _show_feather_tip(self, _e=None):
+        """弹出说明（悬停 <Enter> 与单击都走这里）。已弹出时只刷新正文，幂等。"""
+        try:
+            txt = self._feather_help_text()
+            tip = getattr(self, '_feather_tip', None)
+            alive = False
+            try:
+                alive = tip is not None and int(tip.winfo_exists()) == 1
+            except Exception:
+                alive = False
+            if not alive:
+                tip = tk.Toplevel(self.root)
+                tip.overrideredirect(True)          # 无边框工具窗；**不用 messagebox**（非模态）
+                try:
+                    tip.attributes('-topmost', True)
+                except Exception:
+                    pass
+                lbl = tk.Label(tip, text=txt, justify='left', bg='#ffffe0', fg='#333',
+                               font=('Microsoft YaHei', 9), wraplength=360,
+                               relief='solid', bd=1, padx=8, pady=6)
+                lbl.pack()
+                lbl.bind('<Button-1>', lambda _e: self._hide_feather_tip())
+                tip.bind('<Button-1>', lambda _e: self._hide_feather_tip())
+                self._feather_tip = tip
+                self._feather_tip_lbl = lbl
+            else:
+                try:
+                    self._feather_tip_lbl.config(text=txt)
+                except Exception:
+                    pass
+            btn = getattr(self, 'btn_feather_help', None)
+            if btn is not None:
+                self.root.update_idletasks()
+                x = int(btn.winfo_rootx())
+                y = int(btn.winfo_rooty()) + int(btn.winfo_height()) + 2
+                tip.geometry(f'+{x}+{y}')
+            tip.deiconify()
+            tip.lift()
+        except Exception:
+            pass
+        return None
+
+    def _hide_feather_tip(self, _e=None):
+        """收起并**销毁**提示窗（不留孤儿 Toplevel）。幂等。"""
+        tip = getattr(self, '_feather_tip', None)
+        self._feather_tip = None
+        self._feather_tip_lbl = None
+        if tip is None:
+            return None
+        try:
+            tip.destroy()
+        except Exception:
+            pass
+        return None
+
+    def _toggle_feather_tip(self):
+        """单击入口：没弹出就弹，弹出着就收（先生「单击或者鼠标放上去出说明」的单击那半）。"""
+        tip = getattr(self, '_feather_tip', None)
+        alive = False
+        try:
+            alive = tip is not None and int(tip.winfo_exists()) == 1
+        except Exception:
+            alive = False
+        if alive:
+            self._hide_feather_tip()
+        else:
+            self._show_feather_tip()
+        return None
+
+    def _on_root_destroy_cleanup(self, event=None):
+        """主窗销毁时一并收掉提示窗（Tk 的级联销毁之外再显式收一次，绝不剩孤儿窗口）。"""
+        try:
+            if event is not None and getattr(event, 'widget', None) is not self.root:
+                return None
+        except Exception:
+            pass
+        self._hide_feather_tip()
+        return None
+
     def _sync_feather_widgets(self):
-        """⑩ 旁开关回显 + 「点阵羽化」勾选框的可编辑性（增强模式下置灰）。
+        """⑪ 增强（真羽化）开关（⑩ 行末）回显 + 「点阵羽化」勾选框的可编辑性（增强模式下置灰）。
 
         v2.0-R1：增强模式走分层窗的逐像素 alpha，「点阵羽化」（compat 的 4×4 抖动近似）
         已不参与渲染 —— 所以勾选框锁定在勾选态并置灰，提示行写明「点阵 = 兼容模式的近似」；
         切回兼容模式恢复用户原来的勾选（self._feather_prev 记忆）。
         带宽滑条仍可拖：增强模式下它调的就是真羽化的过渡带宽度（拖到 0 = 不羽化）。
+        v2.0-R16：正文改由 _feather_help_text() 统一给（大白话、≤2 行），存进
+        lbl_feather_hint（该 Label 已不 pack，只作存放点 + 供「? 说明」弹窗读）。
         """
         alpha = self._is_alpha_mode()
         try:
@@ -5590,11 +5811,8 @@ class ConfigWizard:
         except Exception:
             pass
         try:
-            self.lbl_feather_hint.config(
-                text=('带宽 px；增强模式 = 逐像素真羽化（点阵近似已被替代，勾选已锁定）'
-                      if alpha else
-                      '带宽 px；点阵羽化是兼容模式下的近似（要逐像素真羽化请勾右边「增强」）'),
-                fg='#2e7d32' if alpha else '#888')
+            self.lbl_feather_hint.config(text=self._feather_help_text(),
+                                         fg='#2e7d32' if alpha else '#888')
         except Exception:
             pass
 
@@ -5611,25 +5829,17 @@ class ConfigWizard:
     def _update_render_hint(self):
         """渲染模式提示（大白话，不摆 compat/alpha 术语）。
 
-        v2.0-R1：这里同时是「⑪ 渲染模式 ↔ ⑩ 旁「增强（真羽化）」开关」双向联动的收口。
-        v2.0-R10：⑪ 单选已删 —— 现在只有 ⑩ 旁开关一个入口，本方法负责「开关 → 提示文案 +
+        v2.0-R1：这里同时是「⑪ 渲染模式 ↔ ⑩ 行末「增强（真羽化）」开关」双向联动的收口。
+        v2.0-R10：⑪ 单选已删 —— 现在只有 ⑩ 行末那个开关一个入口，本方法负责「开关 → 提示文案 +
         立刻重绘预览」，并在从老配置/皮肤档案回显时把内部状态同步到开关（_sync_feather_widgets）。
-        文案不再引用 ⑪，但仍要讲清「点阵羽化 = 兼容模式下的近似」。
+        v2.0-R16：⑪ 的正文改由 _feather_help_text() 统一给（大白话、≤2 行），不再常驻在 ⑩ 下面；
+        本方法只把同一句写进 lbl_render_hint（该 Label 已不 pack，只作正文存放点 + 供弹窗读），
+        保证「弹出来的」与「控件里存的」永远同一句、引用开关时口径统一写「⑪ 增强（真羽化）」。
         """
+        # 第五轮（R16/R17/R18）把 ⑪ 编号还给了 ⑩ 行末的「增强（真羽化）」开关；单选组的删除仍然成立
+        # （本段开头那两处「⑪」（R1 / R10 历史说明）都按这一条理解）
         try:
-            names = dict(RENDER_MODE_CHOICES)
-            if self._is_alpha_mode():
-                txt = ('💡 %s（已开）：支持真·半透明（羽化/圆角边缘更柔和、'
-                       '图里含品红也不再被抠穿）。\n'
-                       '透明区域会点击穿透（不挡鼠标，点击落到下面的窗口）；'
-                       '拖动请抓图片不透明部分。'
-                       % names.get('alpha', '增强（真羽化）'))
-            else:
-                txt = ('💡 %s（未勾，默认）：与旧版显示方式完全一致，最稳；\n'
-                       '圆角/羽化的边缘是硬边（近看有点阵/毛边）—— 点阵羽化是兼容模式下的近似，'
-                       '要逐像素真羽化请勾 ⑩ 旁的「增强（真羽化）」。'
-                       % names.get('compat', '兼容'))
-            self.lbl_render_hint.configure(text=txt)
+            self.lbl_render_hint.configure(text=self._feather_help_text())
         except Exception:
             pass
         self._sync_feather_widgets()
@@ -5710,7 +5920,7 @@ class ConfigWizard:
         """向导里的特效参数（与 config 同名字段，可直接喂给 apply_display_effects）
 
         v2.0-R1：增强（真羽化）模式下羽化恒定开启且走逐像素真羽化（true_alpha）——
-        与「⑩ 旁开关勾上 = 点阵被真羽化替代」的 UI 口径一致，保存与预览也不打架。
+        与「⑪ 增强（真羽化）勾上 = 点阵被真羽化替代」的 UI 口径一致，保存与预览也不打架。
         """
         try:
             alpha = self._is_alpha_mode()
@@ -6071,11 +6281,12 @@ class ConfigWizard:
         # 文案长度有讲究：本行是右栏（高级设置）的高度瓶颈之一，wraplength=300，
         # 多折一行就把窗口需求高度顶上去（R2 实测 +16px）。控制在两行内。
         # v2.0-N3：措辞从「③ 统一管所有图层」改为「选中哪层调哪层」（事实变了，不是缩文案）。
+        # v2.0-R16：改大白话短句，并**收成一行**（26 字 ≈ 286px < wraplength 300）——
+        # 本行是右栏高度瓶颈之一，改前两态分别占 38px（i=0）/ 54px（i>0），现在都只要 22px，
+        # ⑫ 卡片随之矮 16px（B_test_r4_layout D02「内容需求高 ≤800」靠这一刀收回 795）。
         if i == 0:
-            return ('第 1 层是主图：贴哪边 / 翻不翻转由上方 ③ 那一行调（按当前选中层）；'
-                    '大小与位置用上方 ④⑤⑥ 调。')
-        return ('这一层跟着候选框走：贴哪边与翻转用上方 ③ 那一行调（按当前选中层）；'
-                '大小/位置用 ④⑤⑥ 调；勾「随候选框变宽往外让」后按比例再外让。')
+            return '第 1 层是主图：③ 贴边、翻转、④⑤⑥ 按选中层调'
+        return '这层跟着候选框走：③ 贴边、翻转、④⑤⑥ 按选中层调'
 
     def _on_layer_select(self, _e=None):
         """选中某层 → 上方 ③/④⑤⑥/翻转 与图层区参数一起切到该层（v2.0-t15 点选即同步）。
@@ -6135,11 +6346,14 @@ class ConfigWizard:
         self._update_preview()
 
     def _on_layer_param_change(self, *_a):
-        """图层区自有控件（「随候选框变宽往外让」比例）写回当前选中层。
+        """图层区自有控件（「居中时离框中心」百分比）写回当前选中层。
 
         v2.0-R11：贴边方向的单选取控件已搬回通用区（③ 统一管所有图层），本方法不再碰
         anchor；缩放/水平/垂直/翻转由上方 ④⑤⑥ 与翻转勾选框负责 —— 单一入口，
         避免两套控件互相覆盖。
+        v2.0-R18-1：字段名与取值范围不变（`follow_width_ratio` 0~0.6），但只有该层
+        `anchor == 'center'` 时 plan_layer_layout 才会用到它；其它贴边下该值存着也是
+        「被忽略」（控件同时置灰，见 _sync_follow_widget_state）。
         """
         if getattr(self, '_layer_loading', False):
             return
