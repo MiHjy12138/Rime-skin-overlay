@@ -4956,10 +4956,17 @@ class ConfigWizard:
                                         fg='#888', font=('Microsoft YaHei', 8),
                                         justify='left', wraplength=300)
         self.lbl_follow_hint.pack(anchor='w')
+        # 第五轮 R16 后续（T5）· 先生看过截图后确认：该行与上面三行说的是同一件事
+        #   （「③ 贴边（第 N 层）= 贴右，切层自动变」/「翻转也在 ③ 那一行，跟选中层走」/
+        #   「大小和位置用上方 ④⑤⑥ 调」已把「在哪调、调哪一层」讲完）⇒ **撤版面**。
+        #   做法与 R16 处理 lbl_feather_hint / lbl_render_hint 完全同一套：
+        #     · 对象保留为**状态载体**（既有脚本按属性名读它，删控件会连带一片红）；
+        #     · _layer_hint(i) 保留、_on_layer_select / _on_layer_param_change 里的
+        #       config 调用保留（换层/改参数仍写它），**只是不再 pack**。
+        #   收益：⑫ 卡片矮 24px（291 → 267），三列极差 73 → 49，展开态窗口需求高 875 → 851。
         self.lbl_layer_hint2 = tk.Label(lay_box, text='', fg='#888',
                                         font=('Microsoft YaHei', 8), justify='left',
                                         wraplength=300)
-        self.lbl_layer_hint2.pack(anchor='w', pady=(2, 0))
         self._update_side_hint()
         self._layer_sync_from_cfg()
 
@@ -6278,12 +6285,13 @@ class ConfigWizard:
             pass
 
     def _layer_hint(self, i):
-        # 文案长度有讲究：本行是右栏（高级设置）的高度瓶颈之一，wraplength=300，
-        # 多折一行就把窗口需求高度顶上去（R2 实测 +16px）。控制在两行内。
+        # 第五轮 R16 后续（T5）：本行已**撤版面**（不再 pack，见 _build_ui 里 lbl_layer_hint2 的
+        # 说明）—— 函数保留为状态载体，_on_layer_select / _on_layer_param_change 仍照旧写它，
+        # 既有脚本按属性名读文案时不至于 AttributeError。
+        # 历史约束（撤版面之前有效，留档）：本行曾是右栏高度瓶颈之一，wraplength=300，
+        # 多折一行就把窗口需求高度顶上去（R2 实测 +16px）—— 故 R16 把它压到一行 22px。
         # v2.0-N3：措辞从「③ 统一管所有图层」改为「选中哪层调哪层」（事实变了，不是缩文案）。
-        # v2.0-R16：改大白话短句，并**收成一行**（26 字 ≈ 286px < wraplength 300）——
-        # 本行是右栏高度瓶颈之一，改前两态分别占 38px（i=0）/ 54px（i>0），现在都只要 22px，
-        # ⑫ 卡片随之矮 16px（B_test_r4_layout D02「内容需求高 ≤800」靠这一刀收回 795）。
+        # v2.0-R16：改大白话短句，并**收成一行**（26 字 ≈ 286px < wraplength 300）。
         if i == 0:
             return '第 1 层是主图：③ 贴边、翻转、④⑤⑥ 按选中层调'
         return '这层跟着候选框走：③ 贴边、翻转、④⑤⑥ 按选中层调'
